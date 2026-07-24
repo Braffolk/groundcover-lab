@@ -18,6 +18,7 @@ Rules:
 - TypeScript everywhere — no JS anywhere. All tooling, scripts, and configs are TypeScript (run via tsx); no `.js`/`.mjs` files in the repo.
 - All tooling runs and is explorable in the browser: experiment browser, single-experiment runner, A/B comparison view with an exactly-shared camera, benchmark runner and results viewer. Every view (experiment, camera pose, params, seed, time) is encoded in the URL, so any state is a shareable, reproducible link.
 - Experiments MAY consume the raw mesh binary directly and invent their own completely unique/novel ways of storing and representing single plants. Designing smart formats is not the project goal, but for some experiments it is legitimately part of the technique.
+- Placement is standardized: harness-owned "stands" (placement setups — species mix, densities, scales, region) fully determine every plant instance; experiments are pure renderers of the selected stand and never define placement. A/B and bench numbers are only comparable within one stand + seed.
 
 This task requires out of the box brilliant graphical engineering thinking - proxies, approximations, barely known trigonometry hacks etc.
 

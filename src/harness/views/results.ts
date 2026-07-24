@@ -70,10 +70,9 @@ export async function resultsView(root: HTMLElement): Promise<View> {
     const visible = rows.filter((row) => {
       if (!comparableOnly || !base || row === base) return true
       return (
+        row.r.experiment.stand === base.r.experiment.stand &&
         row.r.experiment.spline === base.r.experiment.spline &&
         row.r.experiment.seed === base.r.experiment.seed &&
-        row.r.experiment.coverage?.radius === base.r.experiment.coverage?.radius &&
-        row.r.experiment.coverage?.densityScale === base.r.experiment.coverage?.densityScale &&
         row.r.meta.canvas.join() === base.r.meta.canvas.join() &&
         row.r.meta.timestampQuery === base.r.meta.timestampQuery
       )
@@ -95,6 +94,7 @@ export async function resultsView(root: HTMLElement): Promise<View> {
 
     const heads: [SortKey | null, string][] = [
       ['name', 'experiment'],
+      [null, 'stand'],
       [null, 'adapter'],
       [null, 'spline'],
       ['date', 'date'],
@@ -116,7 +116,8 @@ export async function resultsView(root: HTMLElement): Promise<View> {
       const cls = row.name === baseline ? 'baseline' : ''
       parts.push(
         `<tr class="${cls}" data-name="${row.name}">` +
-          `<td>${row.r.experiment.id}<br><span class="hint mono">p-${row.r.meta.paramsHash} seed ${row.r.experiment.seed}${row.r.experiment.coverage ? ` r${row.r.experiment.coverage.radius} d${row.r.experiment.coverage.densityScale}` : ''}</span></td>` +
+          `<td>${row.r.experiment.id}<br><span class="hint mono">p-${row.r.meta.paramsHash} seed ${row.r.experiment.seed}</span></td>` +
+          `<td>${row.r.experiment.stand ?? '-'}</td>` +
           `<td>${row.r.meta.adapterSlug}${row.r.meta.timestampQuery ? '' : ' <span class="delta worse">no-ts</span>'}</td>` +
           `<td>${row.r.experiment.spline}</td>` +
           `<td>${row.r.meta.date.slice(0, 16).replace('T', ' ')}</td>` +
@@ -131,7 +132,7 @@ export async function resultsView(root: HTMLElement): Promise<View> {
           .map(([label, s]) => `${label}: p50 ${s.p50.toFixed(3)} · p95 ${s.p95.toFixed(3)} · p99 ${s.p99.toFixed(3)}`)
           .join('<br>')
         parts.push(
-          `<tr class="baseline"><td colspan="8" class="mono" style="text-align:left">${passes}<br>params ${JSON.stringify(row.r.experiment.params)}</td></tr>`,
+          `<tr class="baseline"><td colspan="9" class="mono" style="text-align:left">${passes}<br>params ${JSON.stringify(row.r.experiment.params)}</td></tr>`,
         )
       }
     }
@@ -168,7 +169,7 @@ export async function resultsView(root: HTMLElement): Promise<View> {
     comparableOnly = comparableToggle.checked
     render()
   })
-  const lbl = el('label', 'hint', ' comparable to baseline only (same spline/seed/coverage/canvas/timing class)')
+  const lbl = el('label', 'hint', ' comparable to baseline only (same stand/spline/seed/canvas/timing class)')
   lbl.htmlFor = 'cmp'
   controls.append(comparableToggle, lbl)
   container.insertBefore(controls, table)

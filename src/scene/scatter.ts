@@ -1,17 +1,18 @@
 import { fround } from '../util/math.ts'
 import type { VramScope } from '../gpu/resources.ts'
 import { asU32, hash2, hash4, hashF32 } from './hash.ts'
-import type { SpeciesDesc } from './species.ts'
+import type { Stand, StandSpecies } from './stands.ts'
 import type { Terrain } from './terrain.ts'
 
 /**
  * Deterministic plant placement — bit-identical twin of
- * src/wgsl/scatter.wgsl. Placement is a pure function of
- * (seed, cell, species, slot index): there is no global plant array at ANY
- * plant count, which is what makes 100 plants and 1 billion cost the same to
- * set up. Buffer-based experiments materialize regions with `region()` /
- * `instanceBuffer()`; procedural experiments evaluate scatter_candidate() in
- * shader and land every plant in exactly the same spot.
+ * src/wgsl/scatter.wgsl. A Scatter is bound to one stand + seed; placement is
+ * then a pure function of (stand entry index, cell, slot index): there is no
+ * global plant array at ANY plant count, which is what makes 100 plants and
+ * 1 billion cost the same to set up. Buffer-based renderers materialize
+ * regions with `region()`/`instanceBuffer()`; procedural renderers evaluate
+ * scatter_candidate() in shader and land every plant in exactly the same
+ * spot.
  */
 
 export const SCATTER_CELL_SIZE = 4
@@ -27,10 +28,11 @@ export interface ScatterPoint {
   yaw: number
   scale: number
   phase: number
-  species: number
+  /** Index into the stand's species list (and the GPU stand table). */
+  entry: number
 }
 
-/** Instance packing: 8 floats — [x, y, z, yaw, scale, speciesIndex, phase, 0]. */
+/** Instance packing: 8 floats — [x, y, z, yaw, scale, entryIndex, phase, 0]. */
 export const SCATTER_INSTANCE_FLOATS = 8
 
 export interface Aabb2 {
@@ -44,20 +46,34 @@ export class Scatter {
   constructor(
     private terrain: Terrain,
     readonly seed: number,
+    readonly stand: Stand,
   ) {}
 
-  /** All existing plants of `species` in cell (cx, cz). Mirror of scatter_candidate(). */
-  cell(species: SpeciesDesc, cx: number, cz: number, densityScale: number): ScatterPoint[] {
-    const density = Math.min(Math.max(species.density * densityScale, 0), SCATTER_MAX_DENSITY)
-    const threshold = density / SCATTER_MAX_DENSITY
+  /** The stand's full region as an aabb — the default extent everywhere. */
+  standRegion(): Aabb2 {
+    const r = this.stand.radius
+    return { minX: -r, minZ: -r, maxX: r, maxZ: r }
+  }
+
+  private entry(entryIndex: number): StandSpecies {
+    const e = this.stand.species[entryIndex]
+    if (!e) throw new Error(`stand "${this.stand.id}" has no species entry ${entryIndex}`)
+    return e
+  }
+
+  /** All plants of stand entry `entryIndex` in cell (cx, cz). Mirror of scatter_candidate(). */
+  cell(entryIndex: number, cx: number, cz: number): ScatterPoint[] {
+    const e = this.entry(entryIndex)
+    const threshold = Math.min(e.density, SCATTER_MAX_DENSITY) / SCATTER_MAX_DENSITY
     const out: ScatterPoint[] = []
     for (let i = 0; i < SCATTER_MAX_PER_CELL; i++) {
-      const h = hash4(this.seed, asU32(cx), asU32(cz), ((species.index << 16) ^ i) >>> 0)
+      const h = hash4(this.seed, asU32(cx), asU32(cz), ((entryIndex << 16) ^ i) >>> 0)
       if (hashF32(hash2(h, 0)) >= threshold) continue
       const ox = hashF32(hash2(h, 1))
       const oz = hashF32(hash2(h, 2))
       const x = fround(fround(cx + ox) * SCATTER_CELL_SIZE)
       const z = fround(fround(cz + oz) * SCATTER_CELL_SIZE)
+      const t = hashF32(hash2(h, 4))
       out.push({
         x,
         y: this.terrain.height(x, z),
@@ -65,19 +81,16 @@ export class Scatter {
         yaw: fround(hashF32(hash2(h, 3)) * TWO_PI),
         // mix() as specified: a*(1-t)+b*t. May differ from a driver's fma by
         // 1 ulp of plant scale — visually irrelevant, noted for honesty.
-        scale: fround(
-          fround(species.scaleMin * fround(1 - hashF32(hash2(h, 4)))) +
-            fround(species.scaleMax * hashF32(hash2(h, 4))),
-        ),
+        scale: fround(fround(e.scaleMin * fround(1 - t)) + fround(e.scaleMax * t)),
         phase: fround(hashF32(hash2(h, 5)) * TWO_PI),
-        species: species.index,
+        entry: entryIndex,
       })
     }
     return out
   }
 
-  /** All existing plants of `species` whose cells overlap the region. */
-  region(species: SpeciesDesc, aabb: Aabb2, densityScale: number): ScatterPoint[] {
+  /** All plants of stand entry `entryIndex` in cells overlapping the region. */
+  region(entryIndex: number, aabb: Aabb2 = this.standRegion()): ScatterPoint[] {
     const c0x = Math.floor(aabb.minX / SCATTER_CELL_SIZE)
     const c0z = Math.floor(aabb.minZ / SCATTER_CELL_SIZE)
     const c1x = Math.floor(aabb.maxX / SCATTER_CELL_SIZE)
@@ -85,32 +98,32 @@ export class Scatter {
     const out: ScatterPoint[] = []
     for (let cz = c0z; cz <= c1z; cz++) {
       for (let cx = c0x; cx <= c1x; cx++) {
-        out.push(...this.cell(species, cx, cz, densityScale))
+        out.push(...this.cell(entryIndex, cx, cz))
       }
     }
     return out
   }
 
-  /** Materialize a region as a packed STORAGE|VERTEX instance buffer. */
+  /** Materialize one stand entry as a packed STORAGE|VERTEX instance buffer. */
   instanceBuffer(
     scope: VramScope,
     queue: GPUQueue,
-    species: SpeciesDesc,
-    aabb: Aabb2,
-    densityScale: number,
+    entryIndex: number,
+    aabb: Aabb2 = this.standRegion(),
   ): { buffer: GPUBuffer; count: number } {
-    const points = this.region(species, aabb, densityScale)
+    const speciesId = this.entry(entryIndex).species
+    const points = this.region(entryIndex, aabb)
     const data = new Float32Array(Math.max(points.length, 1) * SCATTER_INSTANCE_FLOATS)
     points.forEach((pt, i) => {
-      data.set([pt.x, pt.y, pt.z, pt.yaw, pt.scale, pt.species, pt.phase, 0], i * SCATTER_INSTANCE_FLOATS)
+      data.set([pt.x, pt.y, pt.z, pt.yaw, pt.scale, pt.entry, pt.phase, 0], i * SCATTER_INSTANCE_FLOATS)
     })
     const buffer = scope.createBuffer(
       {
-        label: `scatter/${species.id}`,
+        label: `scatter/${this.stand.id}/${entryIndex}-${speciesId}`,
         size: data.byteLength,
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
       },
-      { species: species.id, tag: 'scatter-instances' },
+      { species: speciesId, tag: 'scatter-instances' },
     )
     queue.writeBuffer(buffer, 0, data)
     return { buffer, count: points.length }

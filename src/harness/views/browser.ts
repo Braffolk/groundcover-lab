@@ -54,12 +54,25 @@ export async function browserView(root: HTMLElement): Promise<View> {
   if (entries.length === 0) {
     browser.appendChild(el('div', 'hint', 'No experiments yet — run `npm run new -- <slug>` to scaffold one.'))
   }
+  // Stand renderers first; references (which ignore the stand) get their own row.
+  const renderers = entries.filter((e) => e.manifest?.status !== 'reference')
+  const references = entries.filter((e) => e.manifest?.status === 'reference')
   const grid = el('div', 'cards')
   browser.appendChild(grid)
-  for (const entry of entries) {
+  for (const entry of renderers) {
     const ui = experimentCard(entry, toggleSelect)
     grid.appendChild(ui.card)
     if (entry.manifest) cardsById.set(entry.id, ui)
+  }
+  if (references.length > 0) {
+    browser.appendChild(el('h2', undefined, 'references — ignore the stand'))
+    const refGrid = el('div', 'cards')
+    browser.appendChild(refGrid)
+    for (const entry of references) {
+      const ui = experimentCard(entry, toggleSelect)
+      refGrid.appendChild(ui.card)
+      if (entry.manifest) cardsById.set(entry.id, ui)
+    }
   }
 
   const meshes = meshCatalog.list()

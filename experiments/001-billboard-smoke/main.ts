@@ -1,27 +1,25 @@
 import shaderSrc from './shaders/main.wgsl'
-import { speciesById, type Experiment, type ExperimentContext, type FrameInfo, type ViewTargets } from '@harness'
+import type { Experiment, ExperimentContext, FrameInfo, ViewTargets } from '@harness'
 import type { PARAMS } from './manifest.ts'
 
 /**
- * Template experiment: camera-facing billboard blades fed by the shared
- * scatter service. Not a serious technique — a working skeleton showing every
- * harness facility (scatter, frame group, wind, timed passes, VRAM scope,
- * params, shader hot reload). Replace the technique, keep the wiring.
+ * Template experiment: renders the ACTIVE STAND — every species entry, at the
+ * stand's exact placement — as camera-facing billboard blades. Not a serious
+ * technique; a working skeleton showing the wiring: stand-driven scatter,
+ * frame group, wind, timed passes, VRAM scope, render-only params, shader hot
+ * reload. Replace the technique, keep the contract.
  */
 export function create(ctx: ExperimentContext<typeof PARAMS>): Experiment {
   const { device } = ctx
-  const species = speciesById('grass-blade')
-  // Honor the shared workload: cover ctx.coverage.radius at the shared
-  // density scale (times this experiment's own density param).
-  const r = ctx.coverage.radius
-  const region = { minX: -r, minZ: -r, maxX: r, maxZ: r }
-  const densityScale = (): number => ctx.params.density * ctx.coverage.densityScale
 
-  let instances = ctx.scene.scatter.instanceBuffer(ctx.res, device.queue, species, region, densityScale())
+  // One instance buffer per stand entry — the stand defines what exists.
+  const entries = ctx.stand.species.map((_, entryIndex) =>
+    ctx.scene.scatter.instanceBuffer(ctx.res, device.queue, entryIndex),
+  )
 
   const paramsBuffer = ctx.res.createBuffer(
     { label: `${ctx.id}/params`, size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST },
-    { species: species.id },
+    { tag: 'params' },
   )
 
   const bglLayout = device.createBindGroupLayout({
@@ -31,19 +29,16 @@ export function create(ctx: ExperimentContext<typeof PARAMS>): Experiment {
       { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform' } },
     ],
   })
-
-  let bindGroup!: GPUBindGroup
-  const makeBindGroup = (): void => {
-    bindGroup = device.createBindGroup({
-      label: `${ctx.id}/bindings`,
+  const bindGroups = entries.map((entry, i) =>
+    device.createBindGroup({
+      label: `${ctx.id}/entry-${i}`,
       layout: bglLayout,
       entries: [
-        { binding: 0, resource: { buffer: instances.buffer } },
+        { binding: 0, resource: { buffer: entry.buffer } },
         { binding: 1, resource: { buffer: paramsBuffer } },
       ],
-    })
-  }
-  makeBindGroup()
+    }),
+  )
 
   let pipeline!: GPURenderPipeline
   const build = (): void => {
@@ -67,8 +62,7 @@ export function create(ctx: ExperimentContext<typeof PARAMS>): Experiment {
 
   return {
     update(_frame: FrameInfo): void {
-      uniforms[0] = ctx.params.height
-      uniforms[1] = ctx.params.sway
+      uniforms[0] = ctx.params.widthRatio
       device.queue.writeBuffer(paramsBuffer, 0, uniforms)
     },
 
@@ -83,17 +77,12 @@ export function create(ctx: ExperimentContext<typeof PARAMS>): Experiment {
       })
       pass.setPipeline(pipeline)
       pass.setBindGroup(0, ctx.frame.bindGroup)
-      pass.setBindGroup(1, bindGroup)
-      pass.draw(6, instances.count)
+      entries.forEach((entry, i) => {
+        if (entry.count === 0) return
+        pass.setBindGroup(1, bindGroups[i]!)
+        pass.draw(6, entry.count)
+      })
       pass.end()
-    },
-
-    onParamsChanged(keys: ReadonlySet<string>): void {
-      if (keys.has('density')) {
-        instances.buffer.destroy()
-        instances = ctx.scene.scatter.instanceBuffer(ctx.res, device.queue, species, region, densityScale())
-        makeBindGroup()
-      }
     },
 
     dispose(): void {

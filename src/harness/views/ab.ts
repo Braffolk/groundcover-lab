@@ -9,14 +9,13 @@ import { findExperiment } from '../registry.ts'
 import {
   button,
   copyToClipboard,
-  coverageControls,
   el,
-  estimatePlants,
-  formatCount,
-  readCoverage,
   readSeed,
+  readStand,
   resolveCam,
   setupCameraSync,
+  standPicker,
+  standSummary,
   topbar,
   type View,
 } from './shared.ts'
@@ -40,11 +39,23 @@ export async function abView(root: HTMLElement, state: HashState): Promise<View>
   try {
     const [entryA, entryB] = await Promise.all([findExperiment(idA), findExperiment(idB)])
     const seed = readSeed(state.q)
-    const coverage = readCoverage(state.q)
+    const stand = readStand(state.q)
+
+    // Surface renderers that do not cover part of the stand.
+    const warnings: string[] = []
+    for (const [side, entry] of [['A', entryA], ['B', entryB]] as const) {
+      if (entry.manifest!.status === 'reference') {
+        warnings.push(`${side} is a reference — it ignores the stand`)
+        continue
+      }
+      const missing = stand.species.filter((e) => !entry.manifest!.species.includes(e.species))
+      if (missing.length > 0) warnings.push(`${side} does not render: ${missing.map((e) => e.species).join(', ')}`)
+    }
 
     page.appendChild(
       topbar(`A/B — timings contended, bench solo for truth`, [
-        el('span', 'hint', `seed ${seed} · ±${coverage.radius}m · density ×${coverage.densityScale}`),
+        el('span', 'hint', `${stand.id} · seed ${seed}`),
+        ...warnings.map((w) => el('span', 'hint', w)),
       ]),
     )
     const content = el('div', 'content')
@@ -57,7 +68,7 @@ export async function abView(root: HTMLElement, state: HashState): Promise<View>
     const app = await LabApp.create({
       canvas,
       seed,
-      coverage,
+      stand,
       experiments: [
         { entry: entryA, ns: 'a', query: state.q },
         { entry: entryB, ns: 'b', query: state.q },
@@ -151,9 +162,7 @@ export async function abView(root: HTMLElement, state: HashState): Promise<View>
       gpuTimingAvailable: app.gpu.hasTimestamps,
       contended: true,
       extraLines: () => {
-        const lines = [
-          `coverage ±${coverage.radius}m · ×${coverage.densityScale} · A ~${formatCount(estimatePlants(entryA.manifest!.species, coverage))} · B ~${formatCount(estimatePlants(entryB.manifest!.species, coverage))} plants`,
-        ]
+        const lines = [standSummary(stand)]
         if (compositor.mode === 'flicker') lines.push(`showing ${compositor.side === 0 ? 'A' : 'B'} — Space to swap`)
         if (compositor.mode === 'diff' && compositor.lastDiff) {
           const d = compositor.lastDiff
@@ -195,7 +204,7 @@ export async function abView(root: HTMLElement, state: HashState): Promise<View>
       button('copy link', () => {
         void copyToClipboard(location.href).then(() => overlay.toast('link copied'))
       }),
-      ...coverageControls(coverage),
+      standPicker(stand),
     )
     viewer.appendChild(toolbar)
     setMode(compositor.mode)

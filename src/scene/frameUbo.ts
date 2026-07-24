@@ -43,7 +43,7 @@ export class FrameGroup {
     device: GPUDevice,
     scope: VramScope,
     private terrain: Terrain,
-    speciesBuffer: GPUBuffer,
+    standBuffer: GPUBuffer,
   ) {
     this.buffer = scope.createBuffer(
       { label: 'scene/frame-ubo', size: FLOATS * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST },
@@ -66,7 +66,7 @@ export class FrameGroup {
         { binding: 0, resource: { buffer: this.buffer } },
         { binding: 1, resource: terrain.texture.createView() },
         { binding: 2, resource: device.createSampler({ label: 'scene/linear', magFilter: 'linear', minFilter: 'linear' }) },
-        { binding: 3, resource: { buffer: speciesBuffer } },
+        { binding: 3, resource: { buffer: standBuffer } },
       ],
     })
   }

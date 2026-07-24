@@ -3,14 +3,14 @@
 #include "src/wgsl/lighting.wgsl"
 
 // Instance layout: two vec4 per plant — see SCATTER_INSTANCE_FLOATS.
-// [x, y, z, yaw] [scale, speciesIndex, phase, 0]
+// [x, y, z, yaw] [scale, standEntryIndex, phase, 0]
 @group(1) @binding(0) var<storage, read> instances: array<vec4f>;
 
 struct Params {
-  height: f32,
-  sway: f32,
+  width_ratio: f32,
   _pad0: f32,
   _pad1: f32,
+  _pad2: f32,
 }
 @group(1) @binding(1) var<uniform> params: Params;
 
@@ -28,7 +28,7 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
   let base = d0.xyz;
   let yaw = d0.w;
   let scale = d1.x;
-  let sp = species_table[u32(d1.y)];
+  let entry = stand_table[u32(d1.y)];
   let phase = d1.z;
 
   var corners = array<vec2f, 6>(
@@ -43,18 +43,23 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
   let fwd = normalize(to_cam.xz + vec2f(1e-5, 0.0));
   let right = vec2f(-fwd.y, fwd.x);
 
-  let h = params.height * sp.height_scale * scale;
-  let w = h * 0.22;
-  // Camera-inside-plant rule: collapse the blade as the camera enters it.
+  let h = entry.height_scale * scale;
+  let w = h * params.width_ratio;
+  // Camera-inside-plant rule: collapse the billboard as the camera enters it.
   let fade = clamp((dist - 0.25) / 0.4, 0.0, 1.0);
 
   var world = base + vec3f(right.x * c.x * w, c.y * h, right.y * c.x * w) * fade;
-  world += wind_sway(base, frame.time, sp.sway * params.sway, phase) * c.y;
+  world += wind_sway(base, frame.time, entry.sway, phase) * c.y;
 
   var out: VOut;
   out.pos = frame.view_proj * vec4f(world, 1.0);
+  // Crude species-distinct tinting, varied per plant via the yaw hash.
   let tint = 0.8 + 0.4 * fract(yaw * 0.63661977);
-  out.color = vec3f(0.16, 0.31, 0.09) * tint;
+  let species = u32(entry.species_index);
+  var albedo = vec3f(0.16, 0.31, 0.09);        // grass-blade green
+  if (species == 0u) { albedo = vec3f(0.28, 0.30, 0.12); } // calamagrostis straw
+  if (species == 2u) { albedo = vec3f(0.10, 0.20, 0.07); } // moss dark
+  out.color = albedo * tint;
   out.world = world;
   out.uv = c;
   return out;

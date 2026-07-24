@@ -22,19 +22,22 @@ struct Frame {
   frame_index: f32,
 }
 
-struct Species {
-  density: f32,      // plants per m^2 at density scale 1 (max 8)
+// One row per species entry of the ACTIVE STAND (src/scene/stands.ts) —
+// the standardized placement setup every renderer draws. Indexed by the
+// stand entry index carried in scatter instance data.
+struct StandEntry {
+  density: f32,       // plants per m^2 (max 8)
   scale_min: f32,
   scale_max: f32,
-  sway: f32,         // 0 = rigid (moss), 1 = full wind response
-  height_scale: f32,
+  sway: f32,          // 0 = rigid (moss), 1 = full wind response
+  height_scale: f32,  // nominal plant height (m) from the species catalog
+  species_index: f32, // global species catalog index (mesh identity)
   _pad0: f32,
   _pad1: f32,
-  _pad2: f32,
 }
 
 @group(0) @binding(0) var<uniform> frame: Frame;
 // rgba16float: r = height (m), g = normal.x, b = normal.z, a unused.
 @group(0) @binding(1) var terrain_heightmap: texture_2d<f32>;
 @group(0) @binding(2) var linear_sampler: sampler;
-@group(0) @binding(3) var<storage, read> species_table: array<Species>;
+@group(0) @binding(3) var<storage, read> stand_table: array<StandEntry>;

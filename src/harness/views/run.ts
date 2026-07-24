@@ -10,15 +10,14 @@ import { findExperiment } from '../registry.ts'
 import {
   button,
   copyToClipboard,
-  coverageControls,
   currentBookmarkName,
   el,
-  estimatePlants,
-  formatCount,
-  readCoverage,
   readSeed,
+  readStand,
   resolveCam,
   setupCameraSync,
+  standPicker,
+  standSummary,
   topbar,
   type View,
 } from './shared.ts'
@@ -38,11 +37,12 @@ export async function runView(root: HTMLElement, state: HashState): Promise<View
     const entry = await findExperiment(id)
     const manifest = entry.manifest!
     const seed = readSeed(state.q)
-    const coverage = readCoverage(state.q)
+    const stand = readStand(state.q)
+    const isReference = manifest.status === 'reference'
 
     page.appendChild(
       topbar(manifest.title, [
-        el('span', 'hint', `seed ${seed}`),
+        el('span', 'hint', isReference ? 'reference — ignores the stand' : `${stand.id} · seed ${seed}`),
         el('span', 'hint', 'drag=look · WASD/QE=fly · Tab=orbit · 1-4 cams · Shift+N save cam'),
       ]),
     )
@@ -58,7 +58,7 @@ export async function runView(root: HTMLElement, state: HashState): Promise<View
     const app = await LabApp.create({
       canvas,
       seed,
-      coverage,
+      stand,
       experiments: [{ entry, ns: 'p', query: state.q }],
       onError: (m) => overlay.toast(m, 'error'),
       onShaderMessage: (m) =>
@@ -90,9 +90,7 @@ export async function runView(root: HTMLElement, state: HashState): Promise<View
       stats: app.stats,
       vram: () => app.vramReport(),
       gpuTimingAvailable: app.gpu.hasTimestamps,
-      extraLines: () => [
-        `coverage ±${coverage.radius}m · density ×${coverage.densityScale} · ~${formatCount(estimatePlants(manifest.species, coverage))} plants`,
-      ],
+      extraLines: () => [isReference ? 'reference — ignores the stand' : standSummary(stand)],
     })
     cleanups.push(() => hud.dispose())
 
@@ -137,13 +135,9 @@ export async function runView(root: HTMLElement, state: HashState): Promise<View
           .catch((err: unknown) => overlay.toast(String(err), 'error'))
       }),
       button('bench', () => {
-        location.hash = buildHash(['bench', id], {
-          seed: String(seed),
-          radius: String(coverage.radius),
-          dscale: String(coverage.densityScale),
-        })
+        location.hash = buildHash(['bench', id], { seed: String(seed), stand: stand.id })
       }),
-      ...coverageControls(coverage),
+      standPicker(stand),
     )
     viewer.appendChild(toolbar)
 

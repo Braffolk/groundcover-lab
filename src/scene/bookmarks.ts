@@ -10,9 +10,9 @@ import type { Terrain } from './terrain.ts'
 export function standardBookmarks(terrain: Terrain): Record<string, CameraPose> {
   const h = (x: number, z: number): number => terrain.height(x, z)
   return {
-    // Near-horizontal through the grass toward the origin — the classic
-    // impostor killer. (yaw = atan2(-x, z) faces the origin.)
-    grazing: { x: 8, y: h(8, 8) + 0.45, z: 8, yaw: -Math.PI / 4, pitch: -0.04, fov: 60 },
+    // Skimming the canopy top toward the origin — the classic impostor
+    // killer. (Calamagrostis stands ~1.2m; yaw = atan2(-x, z) faces origin.)
+    grazing: { x: 8, y: h(8, 8) + 1.35, z: 8, yaw: -Math.PI / 4, pitch: -0.06, fov: 60 },
     topdown: { x: 0, y: 42, z: 0.01, yaw: 0, pitch: -1.55, fov: 60 },
     // Camera inside foliage — checks the fade-out rule.
     'inside-plant': { x: 0.2, y: h(0.2, 0.2) + 0.55, z: 0.2, yaw: -Math.PI / 4, pitch: 0.12, fov: 70 },

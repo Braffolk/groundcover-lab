@@ -49,9 +49,9 @@ fn vs_main(
   var world = vec3f(local.x + tile_center.x, local.y + ground, local.z + tile_center.y);
 
   // Wind: tips sway, roots stay — weight by normalized height in the tile.
-  let sp = species_table[0u];
+  // Reference is stand-independent: fixed calamagrostis sway response.
   let weight = clamp(local.y / params.top_h, 0.0, 1.0);
-  world += wind_sway(world, frame.time, sp.sway * params.sway, f32(ii) * 2.39996) * weight * weight;
+  world += wind_sway(world, frame.time, 0.6 * params.sway, f32(ii) * 2.39996) * weight * weight;
 
   var out: VOut;
   out.pos = frame.view_proj * vec4f(world, 1.0);

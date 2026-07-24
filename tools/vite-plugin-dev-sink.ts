@@ -68,14 +68,15 @@ export function devSink(): Plugin {
           }
           if (route === '/__bench' && req.method === 'POST') {
             const body = JSON.parse((await readBody(req)).toString('utf8')) as {
-              experiment?: { id?: string }
+              experiment?: { id?: string; stand?: string }
               meta?: { paramsHash?: string; adapterSlug?: string; date?: string }
             }
             const exp = segment(body.experiment?.id ?? null, 'experiment id')
+            const stand = segment(body.experiment?.stand ?? null, 'stand id')
             const hash = segment(body.meta?.paramsHash ?? null, 'params hash')
             const adapter = segment(body.meta?.adapterSlug ?? null, 'adapter slug')
             const date = (body.meta?.date ?? new Date().toISOString()).replace(/[:.]/g, '-')
-            const name = `${exp}__p-${hash}__${adapter}__${segment(date, 'date')}.json`
+            const name = `${exp}__${stand}__p-${hash}__${adapter}__${segment(date, 'date')}.json`
             const saved = write('results', name, JSON.stringify(body, null, 2))
             json(res, 200, { saved })
             return

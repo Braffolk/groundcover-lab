@@ -17,14 +17,14 @@ Forbidden: `src/**`, other experiments, `package.json`, any shared file. If the 
 - The harness owns device/canvas/camera/terrain/scatter/wind and draws the terrain+sky base pass. You append compute/render passes via `ctx.timing.renderPass/computePass` (auto-timed) with `loadOp: 'load'` against the provided color/depth targets.
 - Allocate GPU memory only via `ctx.res` (the VRAM tracker) — pass `{ species }` so the 25MB/species budget bar in the HUD is meaningful. The budget is a strong default, not an absolute: stay within it in ~95% of cases; a genuinely novel method may exceed it when the results justify it — document the why and the actual numbers in `NOTES.md`.
 - Determinism: randomness only via the shared PCG hash (`@harness`), animation only from `frame.time`. Never `Math.random`/`Date.now` in render paths. The A/B diff view will expose you.
-- Plant placement must come from the shared scatter service (TS buffers or the bit-identical WGSL twin `src/wgsl/scatter.wgsl`) so all experiments place every plant identically.
-- **Honor `ctx.coverage`** ({ radius, densityScale }, from URL `radius`/`dscale`): render all plants of your species within ±radius meters of the origin at species density × densityScale. This is the fairness contract — it's what lets an A/B say "render 100M plants in both" and mean it. Estimated plant count shows in the HUD.
+- **Experiments are RENDERERS of a stand, never placers.** The active stand (`ctx.stand`, URL `stand=<id>`, default `default`) is the harness-owned placement setup: which species, densities, scale ranges, sway, region. Stand + seed fully determines every plant instance via `ctx.scene.scatter` (TS buffers) or the bit-identical WGSL twin (`src/wgsl/scatter.wgsl` + `stand_table`). Render exactly the stand's plants — all its species entries, at their exact positions/scales. Your params may only affect HOW it is drawn, never what/where grows. Stands live in `src/scene/stands.ts` (shared code — don't touch); A/B and bench results are only comparable within one stand + seed.
+- The only sanctioned exception is `status: 'reference'` (e.g. 000-ground-truth): stand-independent visual baselines, shown in a separate browser row and clearly labeled. Don't add more without a reason as good as "the raw mesh is a community tile and physically cannot follow per-plant placement".
 - You MAY read the raw source mesh (`ctx` mesh catalog, GCMESH1) and invent any novel baked representation. Put baked artifacts in `mesh/baked/<your-id>/` via the bake flow; format is entirely yours.
 
 ## Comparing & claiming results
 
-- Compare: `#/ab/<idA>/<idB>?cam=grazing&seed=42` (wipe/side-by-side/flicker/diff). A/B timings are contended — never quote them.
-- Bench before claiming numbers: `#/bench/<id>?spline=orbit-low` at a standard cam/spline. Results auto-save to `results/`; link the JSON filenames in your `NOTES.md`.
+- Compare: `#/ab/<idA>/<idB>?stand=default&cam=grazing&seed=42` (wipe/flicker/diff) — both sides render the SAME stand by construction. A/B timings are contended — never quote them.
+- Bench before claiming numbers: `#/bench/<id>?stand=default&spline=orbit-low` at a standard cam/spline. Results record the stand and are only comparable within one; they auto-save to `results/` — link the JSON filenames in your `NOTES.md`. Scale tests use the `scaling-100m` stand, not custom placement.
 - `NOTES.md` required sections: Idea / VRAM budget math / Bake / Status / Findings.
 - Standard cameras (keys 1–4): `grazing` (impostor killer), `topdown`, `inside-plant` (fade check), `far-horizon` (scaling check).
 

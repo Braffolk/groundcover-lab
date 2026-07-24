@@ -7,7 +7,6 @@
 export {
   HARNESS_API,
   defineExperiment,
-  type Coverage,
   type Experiment,
   type ExperimentContext,
   type ExperimentManifest,
@@ -41,6 +40,7 @@ export {
   type ScatterPoint,
 } from '../scene/scatter.ts'
 export { SPECIES, speciesById, type SpeciesDesc } from '../scene/species.ts'
+export { STANDS, standById, standPlantCounts, type Stand, type StandSpecies } from '../scene/stands.ts'
 export { Terrain } from '../scene/terrain.ts'
 export { windGust, windSway, type WindParams } from '../scene/wind.ts'
 export { parsePose, serializePose, type CameraPose } from '../scene/camera.ts'

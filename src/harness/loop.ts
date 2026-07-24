@@ -10,12 +10,12 @@ import { CameraController, poseMatrices, type CameraPose } from '../scene/camera
 import { BasePass } from '../scene/basePass.ts'
 import { FrameGroup } from '../scene/frameUbo.ts'
 import { Scatter } from '../scene/scatter.ts'
-import { createSpeciesBuffer, SPECIES } from '../scene/species.ts'
+import { SPECIES } from '../scene/species.ts'
+import { createStandBuffer, type Stand } from '../scene/stands.ts'
 import { builtinSplines } from '../scene/spline.ts'
 import { Terrain } from '../scene/terrain.ts'
 import { WIND_DEFAULTS } from '../scene/wind.ts'
 import type {
-  Coverage,
   Experiment,
   ExperimentContext,
   FrameInfo,
@@ -54,7 +54,8 @@ export interface Compositor {
 export interface LabAppOptions {
   canvas: HTMLCanvasElement
   seed: number
-  coverage: Coverage
+  /** The placement setup every view on this page renders. */
+  stand: Stand
   experiments: { entry: RegistryEntry; ns: 'p' | 'a' | 'b'; query: URLSearchParams }[]
   onError: (message: string) => void
   onShaderMessage: (msg: ShaderMessage) => void
@@ -111,10 +112,10 @@ export class LabApp {
 
     const sceneScope = tracker.scope('scene')
     const terrain = Terrain.generate(sceneScope, device.queue)
-    const speciesBuffer = createSpeciesBuffer(sceneScope, device.queue)
-    const frameGroup = new FrameGroup(device, sceneScope, terrain, speciesBuffer)
+    const standBuffer = createStandBuffer(sceneScope, device.queue, opts.stand)
+    const frameGroup = new FrameGroup(device, sceneScope, terrain, standBuffer)
     const basePass = new BasePass(device, shaders, frameGroup.layout, gpu.format, DEPTH_FORMAT)
-    const scatter = new Scatter(terrain, opts.seed)
+    const scatter = new Scatter(terrain, opts.seed, opts.stand)
     const scene: SceneServices = {
       terrain,
       scatter,
@@ -165,7 +166,7 @@ export class LabApp {
       timing: new ScopedTimer(this.timer, name === 'solo' ? '' : `${name}/`),
       params,
       seed: this.opts.seed,
-      coverage: this.opts.coverage,
+      stand: this.opts.stand,
       meshes: meshCatalog,
       size: () => ({ width: app.width, height: app.height }),
     }

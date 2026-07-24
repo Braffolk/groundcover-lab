@@ -1,8 +1,6 @@
 import { parsePose, type CameraPose } from '../../scene/camera.ts'
-import { SPECIES } from '../../scene/species.ts'
-import { SCATTER_MAX_DENSITY } from '../../scene/scatter.ts'
+import { standById, standPlantCounts, STANDS, type Stand } from '../../scene/stands.ts'
 import { updateQuery } from '../../url/state.ts'
-import type { Coverage } from '../registry.ts'
 
 export interface View {
   dispose(): void
@@ -45,26 +43,16 @@ export function readSeed(q: URLSearchParams): number {
   return Number.isFinite(v) && v > 0 ? Math.floor(v) : 42
 }
 
-/** Workload from URL: `radius` (m, half-size) and `dscale` (density multiplier). */
-export function readCoverage(q: URLSearchParams): Coverage {
-  // Number(null) is 0 — treat absent params as absent, not zero.
-  const radius = q.has('radius') ? Number(q.get('radius')) : NaN
-  const dscale = q.has('dscale') ? Number(q.get('dscale')) : NaN
-  return {
-    radius: Number.isFinite(radius) && radius > 0 ? Math.min(radius, 8192) : 128,
-    densityScale: Number.isFinite(dscale) && dscale >= 0 ? Math.min(dscale, 64) : 1,
+/** The active stand from the URL (`stand=<id>`); unknown/absent → 'default'. */
+export function readStand(q: URLSearchParams): Stand {
+  const id = q.get('stand')
+  if (id === null) return standById('default')
+  try {
+    return standById(id)
+  } catch {
+    console.warn(`unknown stand "${id}" — falling back to default`)
+    return standById('default')
   }
-}
-
-/** Estimated plant count for a species set under a coverage (scatter clamps at 8/m²). */
-export function estimatePlants(speciesIds: string[], coverage: Coverage): number {
-  const area = (coverage.radius * 2) ** 2
-  let total = 0
-  for (const id of speciesIds) {
-    const s = SPECIES.find((s) => s.id === id)
-    if (s) total += Math.min(s.density * coverage.densityScale, SCATTER_MAX_DENSITY) * area
-  }
-  return total
 }
 
 export function formatCount(n: number): string {
@@ -74,28 +62,32 @@ export function formatCount(n: number): string {
   return `${Math.round(n)}`
 }
 
+/** One-line stand summary for HUDs/topbars. */
+export function standSummary(stand: Stand): string {
+  const counts = standPlantCounts(stand)
+  const per = counts.bySpecies.map((s) => `${formatCount(s.count)} ${s.species}`).join(' · ')
+  return `stand ${stand.id} · ±${stand.radius}m · ~${formatCount(counts.total)} plants (${per})`
+}
+
 /**
- * Toolbar inputs for the shared workload — writing them reloads the route so
- * every experiment on the page rebuilds against the new coverage.
+ * Toolbar stand picker — switching reloads the route so every experiment on
+ * the page rebuilds against the newly selected placement setup.
  */
-export function coverageControls(coverage: Coverage): HTMLElement[] {
-  const make = (labelText: string, value: number, key: 'radius' | 'dscale', step: number): HTMLElement => {
-    const label = el('label', undefined, labelText)
-    const input = el('input')
-    input.type = 'number'
-    input.min = '0'
-    input.step = String(step)
-    input.value = String(value)
-    input.addEventListener('change', () => {
-      const v = Number(input.value)
-      if (!Number.isFinite(v) || v < 0) return
-      updateQuery({ [key]: String(v) })
-      location.reload()
-    })
-    label.appendChild(input)
-    return label
+export function standPicker(current: Stand): HTMLElement {
+  const label = el('label', undefined, 'stand')
+  const select = el('select')
+  for (const stand of STANDS) {
+    const option = el('option', undefined, `${stand.id} (~${formatCount(standPlantCounts(stand).total)})`)
+    option.value = stand.id
+    option.selected = stand.id === current.id
+    select.appendChild(option)
   }
-  return [make('radius m', coverage.radius, 'radius', 16), make('density ×', coverage.densityScale, 'dscale', 0.25)]
+  select.addEventListener('change', () => {
+    updateQuery({ stand: select.value === 'default' ? null : select.value })
+    location.reload()
+  })
+  label.appendChild(select)
+  return label
 }
 
 /** `cam` param: a bookmark name or a serialized pose. */
