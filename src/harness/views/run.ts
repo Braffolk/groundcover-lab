@@ -115,12 +115,12 @@ export async function runView(root: HTMLElement, state: HashState): Promise<View
         void copyToClipboard(location.href).then(() => overlay.toast('link copied'))
       }),
       button('thumbnail', () => {
-        void captureViewPng(app)
+        void captureViewPng(app, 0, 640)
           .then((blob) => uploadCapture(id, blob))
           .then((saved) => overlay.toast(`saved ${saved} — shows on the browser card`))
           .catch(() => {
             overlay.toast('dev server sink unavailable — downloading instead', 'warn')
-            void captureViewPng(app).then((b) => downloadBlob(b, `${id}-thumbnail.png`))
+            void captureViewPng(app, 0, 640).then((b) => downloadBlob(b, `${id}-thumbnail.png`))
           })
       }),
       button('golden @cam', () => {

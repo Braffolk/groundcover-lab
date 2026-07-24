@@ -3,8 +3,9 @@ import type { LabApp } from './loop.ts'
 /**
  * Deterministic frame capture — reads back the offscreen color target (NOT
  * the canvas, whose buffer is cleared after presentation) and encodes a PNG.
+ * `maxWidth` downscales (thumbnails); omit for full resolution (goldens).
  */
-export async function captureViewPng(app: LabApp, viewIndex = 0): Promise<Blob> {
+export async function captureViewPng(app: LabApp, viewIndex = 0, maxWidth?: number): Promise<Blob> {
   const view = app.views[viewIndex]
   if (!view) throw new Error('no view to capture')
   const { device } = app.gpu
@@ -41,6 +42,14 @@ export async function captureViewPng(app: LabApp, viewIndex = 0): Promise<Blob> 
 
   const canvas = new OffscreenCanvas(width, height)
   canvas.getContext('2d')!.putImageData(image, 0, 0)
+  if (maxWidth !== undefined && width > maxWidth) {
+    const scale = maxWidth / width
+    const scaled = new OffscreenCanvas(Math.round(width * scale), Math.round(height * scale))
+    const ctx2d = scaled.getContext('2d')!
+    ctx2d.imageSmoothingQuality = 'high'
+    ctx2d.drawImage(canvas, 0, 0, scaled.width, scaled.height)
+    return scaled.convertToBlob({ type: 'image/png' })
+  }
   return canvas.convertToBlob({ type: 'image/png' })
 }
 

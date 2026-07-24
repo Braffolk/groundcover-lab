@@ -21,6 +21,14 @@ Forbidden: `src/**`, other experiments, `package.json`, any shared file. If the 
 - The only sanctioned exception is `status: 'reference'` (e.g. 000-ground-truth): stand-independent visual baselines, shown in a separate browser row and clearly labeled. Don't add more without a reason as good as "the raw mesh is a community tile and physically cannot follow per-plant placement".
 - You MAY read the raw source mesh (`ctx` mesh catalog, GCMESH1) and invent any novel baked representation. Put baked artifacts in `mesh/baked/<your-id>/` via the bake flow; format is entirely yours.
 
+## WGSL gotchas
+
+- WGSL reserves many innocent-looking identifiers as future keywords — `meta`, `ref`, `common`, `filter`, `standard`, `premerge`, `auto` among them. If `createShaderModule` fails with "'X' is a reserved keyword", just rename (e.g. `meta` → `atlas_info`). Prefer descriptive names over generic ones from the start.
+
+## Taste rules (from the project owner)
+
+- **Dithering/stochastic alpha is a last resort, not a default.** In ~90% of cases it adds nothing but fuzziness — soft silhouettes, screen-door texture, temporal shimmer that a static screenshot hides. It also HURTS performance in real scenes: dithered coverage punches holes in the depth buffer, so early-z/hi-z stops rejecting the layers behind it and overdraw explodes exactly where groundcover is deepest (grazing angles) — a hard-edged surface writes solid depth and becomes an occluder instead. Prefer hard alpha-test edges, correct depth-tested opaque geometry, or honest coverage falloff. If your technique genuinely needs stochastic coverage (e.g. it IS the distance-collapse mechanism), justify it in NOTES.md and check it in motion, not just at rest.
+
 ## Comparing & claiming results
 
 - Compare: `#/ab/<idA>/<idB>?stand=default&cam=grazing&seed=42` (wipe/flicker/diff) — both sides render the SAME stand by construction. A/B timings are contended — never quote them.
