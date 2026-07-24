@@ -12,7 +12,7 @@
 
 struct FillU {
   cell0: vec2i,        // window origin in scatter-cell coords
-  side: u32,           // window side in cells
+  side: u32,           // window side in cells (== dispatch.x; informational)
   seed: u32,
   mask_origin: vec2i,  // direct bitmask origin in 8m-cluster coords
   mask_side: u32,      // bitmask side (16)

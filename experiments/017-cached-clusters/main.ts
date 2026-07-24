@@ -11,8 +11,8 @@ import {
   unpackCards,
   type CardsBaked,
 } from './bake.ts'
-import { asU32, commitBake, hash3, hashF32, speciesById } from '@harness'
-import type { Experiment, ExperimentContext, FrameInfo, ViewTargets } from '@harness'
+import { DEBUG_VIEW_MODES, asU32, commitBake, hash3, hashF32, speciesById } from '@harness'
+import type { DebugViewMode, Experiment, ExperimentContext, FrameInfo, ViewTargets } from '@harness'
 import type { PARAMS } from './manifest.ts'
 
 /**
@@ -23,12 +23,12 @@ import type { PARAMS } from './manifest.ts'
  * doubling to 128m toward the horizon, so every cached cluster subtends
  * roughly the same angle (~1/4 rad). A cluster is RECONSTRUCTED only rarely:
  * a compute pass re-derives its plants from the scatter WGSL twin and renders
- * them as baked crossed-card proxies into a 176x176 slot of a shared
- * color+depth atlas through a frustum fitted from the camera position at
- * refresh time. Every frame, visible slots are drawn as single world-anchored
- * quads whose fragments re-project the cached 16-bit depth through the slot's
- * stored inverse view-proj into the live camera — correct occlusion and
- * parallax at cluster granularity for the cost of ~200 textured quads. A slot
+ * them as baked crossed-card proxies directly into its own 176x176 layer of a
+ * shared color+depth cache array, through a frustum fitted from the camera
+ * position at refresh time. Every frame, visible slots are drawn as single
+ * world-anchored quads whose fragments re-project the cached 16-bit depth
+ * through the slot's stored inverse view-proj into the live camera — correct
+ * occlusion and parallax at cluster granularity for ~200 textured quads. A slot
  * is invalidated only when the camera has moved further than
  * refreshTau x cluster distance (or on quadtree level change / eviction), and
  * refreshes run under a fixed per-frame budget: that budget — never the plant
@@ -44,11 +44,7 @@ const TOP_LEVEL = 4 // cluster sizes 8..128m
 const SPLIT_K = 4 // split when nearest-distance < SPLIT_K * size
 const MAX_DIST = 1024
 const SLOT = 176
-const GRID_X = 16
-const GRID_Y = 14
-const POOL = GRID_X * GRID_Y
-const CACHE_W = GRID_X * SLOT
-const CACHE_H = GRID_Y * SLOT
+const POOL = 224 // cache array layers (WebGPU guarantees >= 256)
 const MASK_SIDE = 16 // direct bitmask, in 8m clusters
 const NEAR_CAP = 65536
 const SCRATCH_CAP = 245760
@@ -119,8 +115,16 @@ interface Aabb {
   maxZ: number
 }
 
+/**
+ * Quadtree node identity as a plain number (no per-frame string building in
+ * the enumeration hot loop). 21 bits per axis, collision-free for any cluster
+ * coordinate this method can produce.
+ */
+const nodeKey = (level: number, cx: number, cz: number): number =>
+  (level * 2097152 + (cx & 0x1fffff)) * 2097152 + (cz & 0x1fffff)
+
 interface Leaf {
-  key: string
+  key: number
   level: number
   cx: number
   cz: number
@@ -131,7 +135,7 @@ interface Leaf {
 }
 
 interface Slot {
-  key: string | null
+  key: number | null
   level: number
   cx: number
   cz: number
@@ -140,6 +144,8 @@ interface Slot {
   camZ: number
   lastVisible: number
   valid: boolean
+  /** Debug-view generation this slot's imagery was reconstructed under. */
+  epoch: number
   meta: Float32Array // 32 floats, matches SlotMeta in composite.wgsl
   vp: Float32Array
   pxAngle: number
@@ -281,54 +287,37 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
     { tag: 'slot-meta' },
   )
 
-  const cacheColor = ctx.res.createTexture(
+  // The cache is an ARRAY of slots (one layer each), not an atlas grid: a
+  // refresh renders straight into its layer, so there is no scratch target and
+  // no per-refresh texture copy. Same bytes, one less round trip.
+  const mkCacheArray = (label: string, format: GPUTextureFormat): GPUTexture =>
+    ctx.res.createTexture(
+      {
+        label: `${ctx.id}/${label}`,
+        size: [SLOT, SLOT, POOL],
+        format,
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT,
+      },
+      { tag: 'cluster-cache' },
+    )
+  const cacheColor = mkCacheArray('cache-color', 'rgba8unorm')
+  const cacheAux = mkCacheArray('cache-aux', 'rg8unorm')
+  const slotView = (tex: GPUTexture, label: string, layer: number): GPUTextureView =>
+    tex.createView({ label: `${ctx.id}/${label}-${layer}`, dimension: '2d', baseArrayLayer: layer, arrayLayerCount: 1 })
+  const cacheColorSlots = Array.from({ length: POOL }, (_, i) => slotView(cacheColor, 'cache-color', i))
+  const cacheAuxSlots = Array.from({ length: POOL }, (_, i) => slotView(cacheAux, 'cache-aux', i))
+  // One scratch depth buffer shared by every refresh (cleared per pass, never
+  // read afterwards).
+  const slotDepth = ctx.res.createTexture(
     {
-      label: `${ctx.id}/cache-color`,
-      size: [CACHE_W, CACHE_H],
-      format: 'rgba8unorm',
-      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
-    },
-    { tag: 'cluster-cache' },
-  )
-  const cacheAux = ctx.res.createTexture(
-    {
-      label: `${ctx.id}/cache-aux`,
-      size: [CACHE_W, CACHE_H],
-      format: 'rg8unorm',
-      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
-    },
-    { tag: 'cluster-cache' },
-  )
-  const tmpColor = ctx.res.createTexture(
-    {
-      label: `${ctx.id}/tmp-color`,
-      size: [SLOT, SLOT],
-      format: 'rgba8unorm',
-      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
-    },
-    { tag: 'cluster-cache' },
-  )
-  const tmpAux = ctx.res.createTexture(
-    {
-      label: `${ctx.id}/tmp-aux`,
-      size: [SLOT, SLOT],
-      format: 'rg8unorm',
-      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
-    },
-    { tag: 'cluster-cache' },
-  )
-  const tmpDepth = ctx.res.createTexture(
-    {
-      label: `${ctx.id}/tmp-depth`,
+      label: `${ctx.id}/slot-depth`,
       size: [SLOT, SLOT],
       format: 'depth24plus',
       usage: GPUTextureUsage.RENDER_ATTACHMENT,
     },
     { tag: 'cluster-cache' },
   )
-  const tmpColorView = tmpColor.createView()
-  const tmpAuxView = tmpAux.createView()
-  const tmpDepthView = tmpDepth.createView()
+  const slotDepthView = slotDepth.createView()
 
   const cardSampler = device.createSampler({
     label: `${ctx.id}/card-sampler`,
@@ -407,8 +396,8 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
     label: `${ctx.id}/comp-bgl`,
     entries: [
       { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'read-only-storage' } },
-      { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
-      { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+      { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d-array' } },
+      { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d-array' } },
       { binding: 3, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
     ],
   })
@@ -417,8 +406,8 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
     layout: compBgl,
     entries: [
       { binding: 0, resource: { buffer: slotMetaBuf } },
-      { binding: 1, resource: cacheColor.createView() },
-      { binding: 2, resource: cacheAux.createView() },
+      { binding: 1, resource: cacheColor.createView({ dimension: '2d-array' }) },
+      { binding: 2, resource: cacheAux.createView({ dimension: '2d-array' }) },
       { binding: 3, resource: cacheSampler },
     ],
   })
@@ -483,13 +472,36 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
     camZ: 0,
     lastVisible: -1,
     valid: false,
+    epoch: -1,
     meta: new Float32Array(32),
     vp: new Float32Array(16),
     pxAngle: 0.01,
   }))
-  const byKey = new Map<string, number>()
-  const yRangeCache = new Map<string, [number, number]>()
+  const byKey = new Map<number, number>()
+  const yRangeCache = new Map<number, [number, number]>()
   const standR = ctx.stand.radius
+
+  /**
+   * The cache stores SHADED imagery, so a debug view has to be baked into it
+   * at refresh time (see shaders/cards.wgsl). The harness exposes the selector
+   * only through the frame uniform, so read it off the URL and bump a
+   * generation counter when it changes — every cached slot then re-reconstructs
+   * under the normal refresh budget while its stale image keeps drawing.
+   */
+  let lastHash = ''
+  let debugMode = 0
+  let bakedDebug = 0
+  let debugEpoch = 0
+  const readDebugMode = (): number => {
+    const h = location.hash
+    if (h === lastHash) return debugMode
+    lastHash = h
+    const q = h.indexOf('?')
+    const raw = q < 0 ? null : new URLSearchParams(h.slice(q + 1)).get('debug')
+    const idx = raw === null ? 0 : DEBUG_VIEW_MODES.indexOf(raw as DebugViewMode)
+    debugMode = idx < 0 ? 0 : idx
+    return debugMode
+  }
 
   const ringBytes = new ArrayBuffer(RING_STRIDE * (MAX_REFRESH + 1))
   const ringF = new Float32Array(ringBytes)
@@ -500,9 +512,13 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
 
   let refreshJobs: RefreshJob[] = []
   let drawCount = 0
+  let nearDispatchX = 0
+  let nearDispatchZ = 0
+  const refreshVertexCount = refreshArgs.map(() => 18)
+  const vcScratch = new Uint32Array(1)
 
   const clusterYRange = (level: number, cx: number, cz: number): [number, number] => {
-    const key = `${level}:${cx}:${cz}`
+    const key = nodeKey(level, cx, cz)
     let r = yRangeCache.get(key)
     if (r) return r
     const s = S0 << level
@@ -604,12 +620,10 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
     m[9] = up[1] * halfU
     m[10] = up[2] * halfU
     m[11] = 0
-    const col = slotIdx % GRID_X
-    const row = Math.floor(slotIdx / GRID_X)
-    m[12] = (col * SLOT + 0.5) / CACHE_W
-    m[13] = (row * SLOT + 0.5) / CACHE_H
-    m[14] = (SLOT - 1) / CACHE_W
-    m[15] = (SLOT - 1) / CACHE_H
+    m[12] = slotIdx // cache array layer
+    m[13] = slot.level // quadtree level (cluster tint)
+    m[14] = 0
+    m[15] = 0 // tint mode — rewritten per frame
     m.set(matInvert(vp), 16)
   }
 
@@ -619,6 +633,11 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       const frameIdx = frame.frameIndex
       const tau = ctx.params.refreshTau
       const directR = Math.min(ctx.params.directRadius, 48)
+      const dbg = readDebugMode()
+      if (dbg !== bakedDebug) {
+        bakedDebug = dbg
+        debugEpoch++
+      }
 
       // Live-camera frustum planes (left/right/bottom/top, Gribb-Hartmann).
       const vpM = frame.camera.viewProj as Float32Array
@@ -664,7 +683,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
             direct.push([cx, cz])
           } else {
             leaves.push({
-              key: `0:${cx}:${cz}`,
+              key: nodeKey(0, cx, cz),
               level,
               cx,
               cz,
@@ -681,7 +700,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
           visit(level - 1, cx * 2 + 1, cz * 2 + 1)
         } else {
           leaves.push({
-            key: `${level}:${cx}:${cz}`,
+            key: nodeKey(level, cx, cz),
             level,
             cx,
             cz,
@@ -712,11 +731,13 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
           slot.lastVisible = frameIdx
           drawSet.add(si)
           const err = Math.hypot(cam[0] - slot.camX, cam[1] - slot.camY, cam[2] - slot.camZ) / Math.max(leaf.dist, 1)
-          if (err > tau) scheduled.push({ leaf, priority: err * leaf.solid })
+          // Stale on parallax error, or because the debug view changed under it.
+          const wrongView = slot.epoch !== debugEpoch
+          if (err > tau || wrongView) scheduled.push({ leaf, priority: (wrongView ? 4 : err) * leaf.solid })
         } else {
           scheduled.push({ leaf, priority: leaf.solid * 4 })
           // While waiting for the slot: fall back to the parent's stale card.
-          const pi = byKey.get(`${leaf.level + 1}:${leaf.cx >> 1}:${leaf.cz >> 1}`)
+          const pi = byKey.get(nodeKey(leaf.level + 1, leaf.cx >> 1, leaf.cz >> 1))
           if (pi !== undefined && slots[pi]!.valid) {
             drawSet.add(pi)
             slots[pi]!.lastVisible = frameIdx
@@ -775,6 +796,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
           slot.camY = cam[1]
           slot.camZ = cam[2]
           slot.valid = true
+          slot.epoch = debugEpoch
           slot.lastVisible = frameIdx
           if (!leaf.sticky) drawSet.add(si)
           const s = S0 << leaf.level
@@ -803,24 +825,37 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         const camCz = Math.floor(cam[2] / S0)
         const ox = camCx - MASK_SIDE / 2
         const oz = camCz - MASK_SIDE / 2
-        ringI[0] = ox * 2
-        ringI[1] = oz * 2
-        ringU[2] = MASK_SIDE * 2
-        ringU[3] = asU32(ctx.seed)
-        ringI[4] = ox
-        ringI[5] = oz
-        ringU[6] = MASK_SIDE
-        ringU[7] = 1 // near mode
-        ringF[8] = standR
-        ringU[9] = NEAR_CAP
-        ringU[10] = 0
+        let bx0 = Infinity
+        let bx1 = -Infinity
+        let bz0 = Infinity
+        let bz1 = -Infinity
         for (const [dcx, dcz] of direct) {
           const lx = dcx - ox
           const lz = dcz - oz
           if (lx < 0 || lz < 0 || lx >= MASK_SIDE || lz >= MASK_SIDE) continue
           const bit = lz * MASK_SIDE + lx
           ringU[12 + (bit >> 5)] = ringU[12 + (bit >> 5)]! | (1 << (bit & 31))
+          bx0 = Math.min(bx0, dcx)
+          bx1 = Math.max(bx1, dcx)
+          bz0 = Math.min(bz0, dcz)
+          bz1 = Math.max(bz1, dcz)
         }
+        // Dispatch over the direct clusters that actually exist, not over the
+        // whole 128m bitmask window (directRadius is 34m by default).
+        const hasDirect = bx1 >= bx0
+        nearDispatchX = hasDirect ? (bx1 - bx0 + 1) * 2 : 0
+        nearDispatchZ = hasDirect ? (bz1 - bz0 + 1) * 2 : 0
+        ringI[0] = (hasDirect ? bx0 : ox) * 2
+        ringI[1] = (hasDirect ? bz0 : oz) * 2
+        ringU[2] = nearDispatchX
+        ringU[3] = asU32(ctx.seed)
+        ringI[4] = ox // bitmask origin stays camera-anchored
+        ringI[5] = oz
+        ringU[6] = MASK_SIDE
+        ringU[7] = 1 // near mode
+        ringF[8] = standR
+        ringU[9] = NEAR_CAP
+        ringU[10] = 0
         cardsData[20] = screenPxAngle
       }
       refreshJobs.forEach((job, j) => {
@@ -836,23 +871,35 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         ringU[o + 10] = job.base
 
         const slot = slots[job.slotIdx]!
+        const far = job.level >= FAR_SINGLE_LEVEL
         cardsData.set(slot.vp, o)
         cardsData[o + 16] = slot.camX
         cardsData[o + 17] = slot.camY
         cardsData[o + 18] = slot.camZ
-        cardsData[o + 19] = job.level >= FAR_SINGLE_LEVEL ? 2 : 1
+        cardsData[o + 19] = far ? 2 : 1
         cardsData[o + 20] = slot.pxAngle
         cardsData[o + 21] = 1.7 // min card px in the slot
         cardsData[o + 22] = job.base
+
+        // Far clusters draw ONE card; the other two quads used to be emitted
+        // and immediately clipped — 3x the vertex work on the biggest jobs.
+        const vc = far ? 6 : 18
+        if (refreshVertexCount[j] !== vc) {
+          refreshVertexCount[j] = vc
+          vcScratch[0] = vc
+          device.queue.writeBuffer(refreshArgs[j]!, 0, vcScratch)
+        }
       })
       device.queue.writeBuffer(fillRing, 0, ringBytes, 0, RING_STRIDE * (refreshJobs.length + 1))
       device.queue.writeBuffer(cardsRing, 0, cardsData.buffer, 0, RING_STRIDE * (refreshJobs.length + 1))
 
       // ---- composite meta ---------------------------------------------------
+      const tintMode = ctx.params.clusterTint === 'level' ? 1 : ctx.params.clusterTint === 'slot' ? 2 : 0
       drawCount = 0
       for (const si of drawSet) {
         if (drawCount >= POOL) break
         metaData.set(slots[si]!.meta, drawCount * 32)
+        metaData[drawCount * 32 + 15] = tintMode
         drawCount++
       }
       if (drawCount > 0) device.queue.writeBuffer(slotMetaBuf, 0, metaData.buffer, 0, drawCount * 128)
@@ -869,26 +916,37 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       cpass.setPipeline(fillPipeline)
       cpass.setBindGroup(0, ctx.frame.bindGroup)
       cpass.setBindGroup(1, nearFillBg, [0])
-      cpass.dispatchWorkgroups(MASK_SIDE * 2, MASK_SIDE * 2, entryCount)
+      if (nearDispatchX > 0) cpass.dispatchWorkgroups(nearDispatchX, nearDispatchZ, entryCount)
       refreshJobs.forEach((job, j) => {
         cpass.setBindGroup(1, refreshFillBgs[j]!, [(j + 1) * RING_STRIDE])
         cpass.dispatchWorkgroups(job.sideCells, job.sideCells, entryCount)
       })
       cpass.end()
 
-      // Amortized reconstruction: render each refreshed cluster into the tmp
-      // slot target, then blit into its cache atlas rect.
+      // Amortized reconstruction: each refreshed cluster renders straight into
+      // its own cache layer (no scratch target, no blit).
       refreshJobs.forEach((job, j) => {
         const pass = ctx.timing.renderPass(enc, 'cc-refresh', {
           colorAttachments: [
-            { view: tmpColorView, clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: 'clear', storeOp: 'store' },
-            { view: tmpAuxView, clearValue: { r: 1, g: 1, b: 0, a: 0 }, loadOp: 'clear', storeOp: 'store' },
+            {
+              view: cacheColorSlots[job.slotIdx]!,
+              clearValue: { r: 0, g: 0, b: 0, a: 0 },
+              loadOp: 'clear',
+              storeOp: 'store',
+            },
+            {
+              view: cacheAuxSlots[job.slotIdx]!,
+              clearValue: { r: 1, g: 1, b: 0, a: 0 },
+              loadOp: 'clear',
+              storeOp: 'store',
+            },
           ],
           depthStencilAttachment: {
-            view: tmpDepthView,
+            view: slotDepthView,
             depthClearValue: 1,
             depthLoadOp: 'clear',
-            depthStoreOp: 'store',
+            // Scratch depth — never read after the pass.
+            depthStoreOp: 'discard',
           },
         })
         pass.setPipeline(refreshPipeline)
@@ -896,11 +954,6 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         pass.setBindGroup(1, refreshCardsBg, [(j + 1) * RING_STRIDE])
         pass.drawIndirect(refreshArgs[j]!, 0)
         pass.end()
-        const col = job.slotIdx % GRID_X
-        const row = Math.floor(job.slotIdx / GRID_X)
-        const origin = { x: col * SLOT, y: row * SLOT }
-        enc.copyTextureToTexture({ texture: tmpColor }, { texture: cacheColor, origin }, [SLOT, SLOT])
-        enc.copyTextureToTexture({ texture: tmpAux }, { texture: cacheAux, origin }, [SLOT, SLOT])
       })
 
       // Main pass: direct near cards + cached cluster composite.

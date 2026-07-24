@@ -115,7 +115,8 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         info[8] = b.bmax[0]; info[9] = b.bmax[1]; info[10] = b.bmax[2]; info[11] = TILE
         info[12] = ATLAS; info[13] = entry.entryIndex; info[14] = originCellX; info[15] = originCellZ
         info[16] = side; info[17] = ctx.seed; info[18] = R; info[19] = ctx.params.coverage
-        info[20] = ctx.params.refine ? 1 : 0; info[21] = b.heightM; info[22] = 0; info[23] = 0
+        info[20] = ctx.params.refine ? 1 : 0; info[21] = b.heightM
+        info[22] = ctx.params.showViewGrid ? 1 : 0; info[23] = 0
         device.queue.writeBuffer(entry.infoBuffer, 0, info)
       }
     },

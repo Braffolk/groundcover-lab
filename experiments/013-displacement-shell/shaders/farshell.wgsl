@@ -2,6 +2,7 @@
 #include "src/wgsl/terrain.wgsl"
 #include "src/wgsl/wind.wgsl"
 #include "src/wgsl/lighting.wgsl"
+#include "src/wgsl/debug.wgsl"
 #include "./common.wgsl"
 
 // The literal terrain-conformal shell: a camera-centered annulus draped on the
@@ -76,14 +77,26 @@ fn fs_main(in: VOut) -> @location(0) vec4f {
   color *= 0.8 + 0.35 * vnoise(in.world.xz * 0.21, 7u);
   color *= 0.85 + 0.3 * vnoise(in.world.xz * 3.9, 23u);
 
+  // Canopy normal: the real per-fragment terrain normal the shell is draped
+  // on, softened toward +Y (a canopy of leaves reads flatter than the ground
+  // under it).
   let tn = terrain_normal(in.world.xz);
   let n = normalize(tn + vec3f(0.0, 1.2, 0.0));
-  var lit = light_surface(color, n, in.world) * 0.92;
-  lit = apply_fog(lit, in.world);
+  // Canopy self-shadow trim belongs to the albedo, not the light term, so
+  // debug_shade's albedo/lighting split stays exact.
+  let albedo = color * 0.92;
+  var lit = light_surface(albedo, n, in.world);
+  // Fog only in the normal view — debug views stay unfogged and honest.
+  if (debug_mode() == DEBUG_OFF) {
+    lit = apply_fog(lit, in.world);
+  }
 
   // Fade the shell out at the stand boundary (the meadow's actual edge).
   let b = max(abs(in.world.x), abs(in.world.z));
   let alpha = (1.0 - smoothstep(globals.stand_radius - 3.0, globals.stand_radius, b)) * in.ramp;
   if (alpha < 0.01) { discard; }
-  return vec4f(lit, alpha);
+  // Debug views paint the shell opaquely — otherwise its normals/albedo would
+  // come back blended with whatever the base pass left behind.
+  let out_alpha = select(1.0, alpha, debug_mode() == DEBUG_OFF);
+  return vec4f(debug_shade(lit, albedo, n, alpha, in.world), out_alpha);
 }

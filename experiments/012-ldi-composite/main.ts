@@ -1,6 +1,6 @@
 import cullSrc from './shaders/cull.wgsl'
 import ldiSrc from './shaders/ldi.wgsl'
-import { ATLAS_H, ATLAS_W, BAKE_VERSION, NUM_LAYERS, TILE, bakeLdi, unpackLdi, type LdiBaked } from './bake.ts'
+import { ATLAS_H, ATLAS_W, BAKE_VERSION, NUM_LAYERS, TILE, bakeLdi, unpackLdi, type LdiBaked, type LdiMeta } from './bake.ts'
 import { SCATTER_MAX_PER_CELL, commitBake, speciesById } from '@harness'
 import type { Experiment, ExperimentContext, FrameInfo, ViewTargets } from '@harness'
 import type { PARAMS } from './manifest.ts'
@@ -22,11 +22,16 @@ const MAX_RADIUS = 128 // must match the regionRadius param max
 const NEAR_VERTS = 72 // 3 stacks x 4 layers x 6 verts
 const FAR_VERTS = 12 // 2 front-layer cards
 const UNIFORM_FLOATS = 20 + 5 * 16 // five header vec4s + 5 DirRec
+/** Byte offset + float count of the only uniform fields that change per frame. */
+const DYN_OFFSET = 32
+const DYN_FLOATS = 8
+const INSPECT_MODES = ['off', 'dir', 'layer', 'path'] as const
 
 interface SpeciesGpu {
   atlas0: GPUTexture
   atlas1: GPUTexture
-  baked: LdiBaked
+  /** Header only — the 10.5 MB of atlas bytes are dead once uploaded. */
+  meta: LdiMeta
 }
 
 interface EntryGpu {
@@ -38,8 +43,6 @@ interface EntryGpu {
   instances: GPUBuffer
   nearIndirect: GPUBuffer
   farIndirect: GPUBuffer
-  /** Pristine far-args [FAR_VERTS, 0, 0, capacity], copied in per encode. */
-  farTemplate: GPUBuffer
   cullBind: GPUBindGroup
   renderBind: GPUBindGroup
 }
@@ -89,7 +92,10 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       const layout = { bytesPerRow: ATLAS_W * 4, rowsPerImage: ATLAS_H }
       device.queue.writeTexture({ texture: atlas0 }, baked.atlas0, layout, [ATLAS_W, ATLAS_H])
       device.queue.writeTexture({ texture: atlas1 }, baked.atlas1, layout, [ATLAS_W, ATLAS_H])
-      return { atlas0, atlas1, baked }
+      // Keep only the header: atlas0/atlas1 are views into the whole packed
+      // artifact, so holding `baked` would pin ~10.5 MB of host memory per
+      // species for the rest of the session for nothing.
+      return { atlas0, atlas1, meta: baked.meta }
     })()
     speciesCache.set(speciesId, p)
     return p
@@ -145,16 +151,26 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         )
       const nearIndirect = mkIndirect('near-args')
       const farIndirect = mkIndirect('far-args')
-      const farTemplate = ctx.res.createBuffer(
-        {
-          label: `${ctx.id}/far-template-${entryIndex}`,
-          size: 16,
-          usage: GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
-        },
-        { species: e.species, tag: 'ldi-indirect' },
-      )
+      // vertexCount / firstVertex / firstInstance never change: only the
+      // instance count is reset per encode (clearBuffer), so neither draw
+      // needs a template copy — and firstInstance stays 0, which is the only
+      // value WebGPU accepts without the `indirect-first-instance` feature.
       device.queue.writeBuffer(nearIndirect, 0, new Uint32Array([NEAR_VERTS, 0, 0, 0]))
-      device.queue.writeBuffer(farTemplate, 0, new Uint32Array([FAR_VERTS, 0, 0, capacity]))
+      device.queue.writeBuffer(farIndirect, 0, new Uint32Array([FAR_VERTS, 0, 0, 0]))
+
+      // Everything except `region` and `tune` (floats 8..15) is a bake/stand
+      // constant — write the whole block once here, then per frame touch only
+      // the 32-byte dynamic window.
+      const m = gpu.meta
+      const uniInit = new Float32Array(UNIFORM_FLOATS)
+      uniInit.set([m.center[0]!, m.center[1]!, m.center[2]!, m.boundR], 0)
+      uniInit.set([TILE, ATLAS_W, ATLAS_H, NUM_LAYERS], 4)
+      uniInit.set([ctx.seed, entryIndex, capacity, ctx.stand.radius], 16)
+      m.dirs.forEach((d, i) => {
+        uniInit.set([...d.right, d.halfW, ...d.up, d.halfH, ...d.fwd, d.sMax, ...d.meanD], 20 + i * 16)
+      })
+      device.queue.writeBuffer(uniform, 0, uniInit)
+
       const cullBind = device.createBindGroup({
         label: `${ctx.id}/cull-bg-${entryIndex}`,
         layout: cullBgl,
@@ -185,7 +201,6 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         instances,
         nearIndirect,
         farIndirect,
-        farTemplate,
         cullBind,
         renderBind,
       }
@@ -218,52 +233,34 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
   build()
   const unsubscribe = ctx.shaders.onReload(build)
 
-  const uniData = new Float32Array(UNIFORM_FLOATS)
+  // Only `region` + `tune` move per frame; the rest of the block was written
+  // at create time. All entries share these values, so it is one 32-byte
+  // scratch reused for every entry's write.
+  const dyn = new Float32Array(DYN_FLOATS)
   let side = 1
 
   return {
     update(frame: FrameInfo): void {
       const R = ctx.params.regionRadius
       const cam = frame.camera.pose
-      const originCellX = Math.floor((cam.x - R) / CELL)
-      const originCellZ = Math.floor((cam.z - R) / CELL)
       side = Math.max(1, Math.ceil((2 * R) / CELL) + 1)
 
-      for (const entry of entries) {
-        const m = entry.gpu.baked.meta
-        uniData[0] = m.center[0]
-        uniData[1] = m.center[1]
-        uniData[2] = m.center[2]
-        uniData[3] = m.boundR
-        uniData[4] = TILE
-        uniData[5] = ATLAS_W
-        uniData[6] = ATLAS_H
-        uniData[7] = NUM_LAYERS
-        uniData[8] = originCellX
-        uniData[9] = originCellZ
-        uniData[10] = side
-        uniData[11] = ctx.seed
-        uniData[12] = R
-        uniData[13] = ctx.params.layerCullDist
-        uniData[14] = ctx.params.parallax ? 1 : 0
-        uniData[15] = entry.entryIndex
-        uniData[16] = ctx.params.coverage
-        uniData[17] = entry.capacity
-        uniData[18] = ctx.stand.radius
-        uniData[19] = 0
-        m.dirs.forEach((d, i) => {
-          const o = 20 + i * 16
-          uniData.set([...d.right, d.halfW, ...d.up, d.halfH, ...d.fwd, d.sMax, ...d.meanD], o)
-        })
-        device.queue.writeBuffer(entry.uniform, 0, uniData)
-      }
+      dyn[0] = Math.floor((cam.x - R) / CELL)
+      dyn[1] = Math.floor((cam.z - R) / CELL)
+      dyn[2] = side
+      dyn[3] = R
+      dyn[4] = ctx.params.layerCullDist
+      dyn[5] = ctx.params.parallax ? 1 : 0
+      dyn[6] = ctx.params.coverage
+      dyn[7] = Math.max(0, INSPECT_MODES.indexOf(ctx.params.inspect))
+      for (const entry of entries) device.queue.writeBuffer(entry.uniform, DYN_OFFSET, dyn)
     },
 
     encode(enc: GPUCommandEncoder, _frame: FrameInfo, targets: ViewTargets): void {
       // Reset instance counts inside this encoder so multi-view frames stay correct.
       for (const entry of entries) {
         enc.clearBuffer(entry.nearIndirect, 4, 4)
-        enc.copyBufferToBuffer(entry.farTemplate, 0, entry.farIndirect, 0, 16)
+        enc.clearBuffer(entry.farIndirect, 4, 4)
       }
 
       const cpass = ctx.timing.computePass(enc, 'ldi-cull')

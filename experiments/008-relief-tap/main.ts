@@ -1,7 +1,7 @@
 import cullSrc from './shaders/cull.wgsl'
 import reliefSrc from './shaders/relief.wgsl'
-import { ATLAS, bakeViews, GRID, TILE, type BakedViews } from './bake.ts'
-import { SCATTER_CELL_SIZE, speciesById } from '@harness'
+import { ATLAS, GRID, loadSpeciesViews, TILE, type BakedViews } from './bake.ts'
+import { SCATTER_CELL_SIZE } from '@harness'
 import type { Experiment, ExperimentContext, FrameInfo, ViewTargets } from '@harness'
 import type { PARAMS } from './manifest.ts'
 
@@ -18,8 +18,8 @@ import type { PARAMS } from './manifest.ts'
 
 const MAX_DIST_CAP = 88 // must match PARAMS.maxDist max — sizes the buffers
 const RELIEF_MODES = ['flat-1tap', 'linear-2tap', 'secant-3tap'] as const
-const VIEW_MODES = ['stochastic', 'nearest'] as const
-const DEBUG_MODES = ['lit', 'albedo', 'normal', 'height'] as const
+const VIEW_MODES = ['nearest', 'stochastic'] as const
+const INSPECT_MODES = ['off', 'height', 'view-cell'] as const
 
 interface EntryState {
   speciesId: string
@@ -29,6 +29,9 @@ interface EntryState {
   drawUbo: GPUBuffer
   cullBind: GPUBindGroup
   drawBind: GPUBindGroup
+  /** Last bytes uploaded to drawUbo — its contents depend only on the bake and
+   *  the params, so it is re-uploaded on change, not every frame. */
+  lastDraw: Float32Array
 }
 
 export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Experiment> {
@@ -38,8 +41,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
   const uniqueSpecies = [...new Set(ctx.stand.species.map((e) => e.species))]
   const baked = new Map<string, { views: BakedViews; albedo: GPUTexture; geom: GPUTexture }>()
   for (const speciesId of uniqueSpecies) {
-    const mesh = await ctx.meshes.load(speciesById(speciesId).meshId)
-    const views = await bakeViews(ctx, mesh)
+    const views = await loadSpeciesViews(ctx, speciesId)
     const albedo = ctx.res.createTexture(
       {
         label: `${ctx.id}/${speciesId}/albedo`,
@@ -147,6 +149,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       capacity,
       cullUbo,
       drawUbo,
+      lastDraw: new Float32Array(24).fill(NaN),
       cullBind: device.createBindGroup({
         label: `${ctx.id}/cull-bind-${entryIndex}`,
         layout: cullBgl,
@@ -184,10 +187,16 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
     update(frame: FrameInfo): void {
       const maxDist = Math.min(ctx.params.maxDist, MAX_DIST_CAP)
       const cam = frame.camera.pose
-      const c0x = Math.floor((cam.x - maxDist) / SCATTER_CELL_SIZE)
-      const c0z = Math.floor((cam.z - maxDist) / SCATTER_CELL_SIZE)
-      cellsX = Math.floor((cam.x + maxDist) / SCATTER_CELL_SIZE) - c0x + 1
-      cellsZ = Math.floor((cam.z + maxDist) / SCATTER_CELL_SIZE) - c0z + 1
+      // Cell window = the camera's maxDist box intersected with the stand's
+      // cell region. The shader rejects out-of-region cells anyway (same lo/hi
+      // test), so clipping here changes nothing except not launching those
+      // workgroups at all.
+      const lo = Math.floor(-ctx.stand.radius / SCATTER_CELL_SIZE)
+      const hi = Math.floor(ctx.stand.radius / SCATTER_CELL_SIZE)
+      const c0x = Math.max(Math.floor((cam.x - maxDist) / SCATTER_CELL_SIZE), lo)
+      const c0z = Math.max(Math.floor((cam.z - maxDist) / SCATTER_CELL_SIZE), lo)
+      cellsX = Math.max(0, Math.min(Math.floor((cam.x + maxDist) / SCATTER_CELL_SIZE), hi) - c0x + 1)
+      cellsZ = Math.max(0, Math.min(Math.floor((cam.z + maxDist) / SCATTER_CELL_SIZE), hi) - c0z + 1)
 
       device.queue.writeBuffer(drawArgs, 0, drawArgsReset)
       entries.forEach((entry, entryIndex) => {
@@ -223,18 +232,32 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         drawData[17] = Math.max(0, RELIEF_MODES.indexOf(ctx.params.reliefMode))
         drawData[18] = Math.max(0, VIEW_MODES.indexOf(ctx.params.viewSelect))
         drawData[19] = entry.capacity
-        drawData[20] = Math.max(0, DEBUG_MODES.indexOf(ctx.params.debugView))
-        device.queue.writeBuffer(entry.drawUbo, 0, drawData)
+        drawData[20] = Math.max(0, INSPECT_MODES.indexOf(ctx.params.inspect))
+        // Nothing in here depends on the camera or on time — upload only when
+        // a param (or the bake) actually changed it.
+        let dirty = false
+        for (let i = 0; i < drawData.length; i++) {
+          if (drawData[i] !== entry.lastDraw[i]) {
+            dirty = true
+            break
+          }
+        }
+        if (dirty) {
+          entry.lastDraw.set(drawData)
+          device.queue.writeBuffer(entry.drawUbo, 0, drawData)
+        }
       })
     },
 
     encode(enc: GPUCommandEncoder, _frame: FrameInfo, targets: ViewTargets): void {
       const cull = ctx.timing.computePass(enc, 'cull')
-      cull.setPipeline(cullPipeline)
-      cull.setBindGroup(0, ctx.frame.bindGroup)
-      for (const entry of entries) {
-        cull.setBindGroup(1, entry.cullBind)
-        cull.dispatchWorkgroups(cellsX, cellsZ, 1)
+      if (cellsX > 0 && cellsZ > 0) {
+        cull.setPipeline(cullPipeline)
+        cull.setBindGroup(0, ctx.frame.bindGroup)
+        for (const entry of entries) {
+          cull.setBindGroup(1, entry.cullBind)
+          cull.dispatchWorkgroups(cellsX, cellsZ, 1)
+        }
       }
       cull.end()
 

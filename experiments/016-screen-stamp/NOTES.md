@@ -73,6 +73,36 @@ for the same reason 005 documents (dev server answers missing bake files with
 200 index.html, poisoning the cache). Capture pipeline adapted from
 005-octa-impostors; everything after the readback is new.
 
+## Debug views
+
+All three passes (`near`, `stamp`) answer the global `view` selector
+(`frame.debug_mode`, URL `debug=`):
+
+- `near.wgsl` is an alpha-tested opaque card: `debug_shade(..., coverage 1.0)`.
+- `resolve.wgsl` composites, so it accumulates **albedo and world normal with
+  the same front-to-back weights as the colour** (`trans * a`, including the
+  aggregate tint field) and un-premultiplies at the end. albedo / normals /
+  lighting therefore show the coverage-weighted average surface the pass
+  actually resolved, and `depth` uses the nearest contributing stamp's hit
+  point. Fog is applied only when `debug_mode() == DEBUG_OFF`.
+- `coverage` is the accumulated stamp alpha, written **opaque** (the terrain
+  writes coverage 1.0 everywhere, so a blended coverage map washes out to
+  uniform white). Pixels the near-card pass already filled are skipped instead
+  of overwritten, so the near field reads as covered rather than empty.
+- Normals are real per-fragment normals: the baked normal atlas is decoded,
+  coverage-weighted through the mip chain, and rotated into world space by the
+  plant yaw (the bake stores mesh-local, y-up normals). Lighting is the shared
+  `light_surface()`; the atlas stores raw vertex colour (never premultiplied by
+  light), so there is no double-lighting. The `lighting` view saturates to
+  white in bright areas because the harness model peaks at 1.15 + 0.32 — same
+  for terrain, not a bug in this method.
+
+Method-specific state has its own param, `tileView` (`off` / `fill` = list
+occupancy heatmap / `mode` = which binning strategy each tile picked: blue
+tint-only, green enumerate, orange column-march). `mode` is a good way to see
+that at grazing MOST tiles are in enumerate mode and only the horizon band
+column-marches.
+
 ## Status
 
 working — verified by headless screenshots at grazing, topdown,
@@ -117,3 +147,53 @@ Honesty / known issues:
   community-tile edges into hollow card outlines).
 - No bench JSONs yet (contended GPU). A/B vs ground truth:
   `#/ab/016-screen-stamp/000-ground-truth?stand=default&cam=grazing&seed=42`.
+
+## Audit (structural waste review)
+
+Found and fixed:
+
+1. **Binning kept grinding cells after the tile list was full** (the big one).
+   `try_plant()` does `atomicAdd` then drops the plant when `idx >= MAX_LIST`,
+   but nothing stopped the *enumerate* path from walking its whole padded
+   footprint (up to 7x7 cells x 3 entries x 128 slots) long after the 64-entry
+   list had filled. With 4 m cells and density 3/m² a single cell already holds
+   ~144 candidates, so a full list after cell 1-2 was the norm — and `tileView=mode`
+   shows enumerate is the *dominant* mode at grazing, not just top-down.
+   Column mode had a per-column budget break but nothing inside a column.
+   Fix: one `atomicLoad(&wg_count) >= MAX_LIST` early-out at the top of
+   `process_cell()`. Provably image-identical: `wg_count` only grows, so a
+   thread can only skip once no append can succeed for anyone.
+2. **Tile frustum computed 128x per tile.** All 128 threads redundantly did the
+   same four `inv_view_proj` unprojections + four plane normals. Folded into the
+   existing thread-0 block that fills `wg_red` and broadcast through the
+   `workgroupUniformLoad` that was already there — no new barrier, same bits.
+3. **160-byte uniform re-uploaded every frame** although it holds seed, entry
+   count, per-species impostor meta and three params — nothing per-frame. Now
+   written only when a param actually changes.
+4. Dead `R_SLACK` constant removed; stale `16x16` / `256 texels` comments fixed
+   (tiles are 16x8 / 128 texels).
+
+Deliberately left alone:
+
+- **Thread 0 insertion-sorts the tile list (O(n²), up to 64 entries, 127 lanes
+  idle).** A bitonic sort over 128 threads is the textbook answer, but it is a
+  rewrite of that step and needs a quiet GPU to justify — and the column walk
+  already appends roughly front-to-back, so insertion sort usually runs near
+  O(n). Suggestion for a later pass, not an obvious win.
+- **Near pass draws 6x6x128x3 = 13824 instances**, ~63% of which collapse to
+  degenerate triangles because the scatter slot is empty. Compacting would need
+  a compute prepass; the count is constant and region-bounded, which is the
+  property that matters.
+- **`apply_fog` per stamp inside the composite loop** (up to 64x per pixel).
+  Folding it to one fog application on the composite would change the image.
+- Per-pixel `pixel_scale` / `tiles_x` recomputation, the 4-plane cull loops and
+  the 4-tile bilinear header fetch: ALU-level, out of scope.
+- Tile-list VRAM (2080 B/tile, ~16.6 MB at 1280x800) is still the honest weak
+  spot; K or the 32 B packing could halve it, but that is a quality/perf
+  trade-off needing measurement.
+
+Verification: `debug=off` screenshots at grazing / topdown / inside-plant /
+far-horizon with `det=1&t=3` before and after the structural fixes differ by
+RMSE 0.0005-0.018, which is exactly the *same-code* run-to-run noise floor
+(0.0004-0.018) — the tile lists are inherently race-ordered when they overflow.
+No image change. The debug-view work did not touch the `debug=off` path.

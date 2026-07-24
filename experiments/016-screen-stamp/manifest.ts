@@ -4,7 +4,11 @@ import { defineExperiment, HARNESS_API, p } from '@harness'
 export const PARAMS = {
   maxDist: p.num(80, { min: 30, max: 160, step: 5 }),
   tintStrength: p.num(0.9, { min: 0, max: 1, step: 0.05 }),
-  debugTiles: p.bool(false),
+  // Method-specific inspection of the screen-tile state, on top of the global
+  // `view` debug modes: `fill` = list occupancy (green empty -> red at K=64),
+  // `mode` = binning strategy per tile (blue tint-only / green enumerate /
+  // orange column-march).
+  tileView: p.enum('off', ['off', 'fill', 'mode'] as const),
 }
 
 export default defineExperiment({

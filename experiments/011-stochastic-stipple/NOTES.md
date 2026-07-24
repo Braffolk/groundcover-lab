@@ -57,8 +57,8 @@ screen space, so it does not swim under camera translation.
 
 Per species: two rgba8 768×768 atlases with 7 mip levels ≈ 768²·4·(4/3) ≈
 3.1MB each → **~6.3MB per species** (HUD: 6.0/25MB), plus 160B uniform per
-stand entry. No instance buffers at any plant count. Carpet: 112B uniform.
-Well inside the 25MB budget.
+stand entry. No instance buffers at any plant count. Carpet: 112B uniform,
+card quad index buffer: 12B. Well inside the 25MB budget.
 
 ## Bake
 
@@ -73,7 +73,36 @@ Mips are regenerated on the GPU at load. Committed for all three species.
 
 working — verified by headless screenshots: grazing, topdown, inside-plant
 (default stand), far-horizon (scaling-100m, 134M plants), debugRings ring
-placement. No console errors; typecheck clean.
+placement, and all six `debug=` views. No console errors; typecheck clean.
+
+## Debug views
+
+Both fragment shaders (`cards.wgsl`, `carpet.wgsl`) route their final colour
+through the shared `debug_shade()` and apply fog only when
+`debug_mode() == DEBUG_OFF`. What each view carries here:
+
+- **albedo** — the un-premultiplied mean radiance of the covered area
+  (`alb.rgb / alb.a`) times the vertical card AO ramp; carpet: the mottled
+  species mean colour. No lighting anywhere in it.
+- **normals** — the real decoded per-fragment card normal: the normal atlas is
+  premultiplied and mip-averaged exactly like the albedo, un-premultiplied
+  (`nrm.rgb / nrm.a`), rotated by plant yaw into world space, then blended
+  toward the statistical canopy normal by `sigma`. It shows the expected
+  camera-facing hue gradient across the screen (the bake faceforwards each
+  view's normals toward its capture direction) with per-leaf variation inside
+  it — the same rainbow speckle 000-ground-truth's real geometry produces.
+- **lighting** — the shared `light_surface()` term alone. It reads mostly
+  blown-out white; that is the harness model (SUN_COLOR 1.15 + AMBIENT 0.21
+  clips >1), and 000-ground-truth's lighting view looks identical, so it is
+  not a double-applied or skipped lighting term.
+- **coverage** — `a_eff`, the densified fractional-coverage statistic the
+  hashed test actually realizes (carpet: its dissolve ramp). Near field ~1,
+  falling with distance — the technique's core quantity, visible directly.
+- **depth** — standard ramp; shows the stipple holes punched through the
+  depth buffer past `stochStart`.
+
+`debugRings` (own manifest param) tints cards by cascade ring; it is applied
+only in the normal view so it can't pollute the debug views.
 
 ## Findings
 
@@ -104,3 +133,76 @@ placement. No console errors; typecheck clean.
     roughly halve vertex work if the pass ever shows up hot on target GPUs.
   - Top-view uv de-rotation sign was validated only visually (yaw-symmetric
     clumps make the error subtle either way).
+  - Seen from straight above the card normals collapse toward +Y (the bake
+    faceforwards the top view's normals toward its capture direction), so the
+    topdown normals view is near-uniform green with only fine speckle. It is
+    a property of single-sided card capture, not a missing decode — the
+    grazing views carry the full normal variation.
+
+## Audit (structural-waste + debug-view pass)
+
+Debug views did not exist here at all: neither shader included `debug.wgsl`,
+so both cards and carpet ignored the global `view` selector and always drew
+lit+fogged pixels. Both are now wired (see **Debug views** above). Nothing
+was broken behind them — normals were already real, per-fragment and decoded
+from the mip-averaged normal atlas, lighting already went through the shared
+`light_surface()` exactly once, and the bake stores authored albedo (not
+pre-lit), so the debug wiring changed no pixel in the normal view.
+
+Structural waste found and fixed (all four verified image-identical; see the
+verification note below):
+
+1. **Card quads drawn non-indexed.** `draw(6, N)` shaded 6 vertices per card
+   where the two triangles share two corners. Now a 12-byte index buffer +
+   `drawIndexed(6, N)` with a 4-corner array: the post-transform cache shades
+   **4 instead of 6** vertices per instance — a third off the heaviest stage
+   in this method (~163k instances × 3 entries, each doing hashes, terrain
+   fetch, billboard basis and wind), for identical triangles.
+2. **Per-fragment work that is constant over the card.** The FS recomputed
+   `cos(yaw)`/`sin(yaw)` *twice*, plus `smoothstep(stochStart, stochFull, d)`
+   and the densify exponent `gamma`, all from flat varyings. They are now
+   computed once in the VS and carried flat (`yaw_gs`, `top_vf`); `amp` and
+   `dist` no longer need to reach the FS at all. Same varying slot count.
+3. **Normal atlas sampled before the alpha tests.** Both atlases were tapped
+   up front, then ~half the fragments were discarded by the coverage/hash
+   test. Coverage lives entirely in the albedo alpha, so the 2–3
+   `textureSampleGrad`s of the normal atlas now happen *after* both discards —
+   discarded quads never touch it. (Safe: gradients are taken in uniform
+   control flow and the taps use `textureSampleGrad`.)
+4. **Carpet drawn before the cards.** The near card layer is a solid, hard-
+   alpha-tested, depth-writing occluder and the carpet is a large 54m→800m
+   sheet largely hidden behind it. Order can't affect the image (both are
+   depth-tested opaque, no blending), so cards now draw first and early-z
+   rejects the covered carpet fragments instead of shading them.
+5. **Per-frame CPU/uniform churn that depends on nothing per-frame.**
+   `carpetStats()` (a pure function of stand + baked meta) was recomputed and
+   re-uploaded every frame — now computed once at create. The ring table was
+   rebuilt (allocating row objects) every frame and all three 160-byte card
+   uniforms were rewritten every frame, although their only time-varying
+   field is the camera's 4m cell. Both are now change-driven: a still camera
+   with untouched params uploads zero bytes.
+
+Deliberately left alone:
+
+- **The ~50-60% of vertex invocations that early-out** on nonexistent or
+  rank-killed slots. Fixing it means a compute compaction prepass — a
+  redesign, and its win depends on measurement this session cannot provide.
+- **`scatter_candidate()` recomputing the `hash4` + offset hashes** the VS
+  already evaluated for the cheap existence/rank rejection. Inlining them
+  would duplicate the shared placement twin inside experiment code and risk
+  silent divergence from `src/wgsl/scatter.wgsl`; the redundancy is a handful
+  of ALU ops on the surviving path only.
+- **The ≤6-iteration ring lookup loop** and the 4-entry species-pick loop in
+  the carpet: bounded, tiny, and collapsing them is pure ALU shuffling.
+- **The carpet's non-indexed 11.5k-vertex draw** (indexing saves ~4k vertex
+  invocations — noise next to the base terrain pass).
+- **Mip level 6 is generated but `lodMaxClamp: 5` never samples it** (~576
+  bytes and one load-time blit). Left for the owner: dropping `MIP_LEVELS` to
+  6 would also change the committed bake's shape for no measurable gain.
+
+Verification: `?det=1&t=3` (paused, deterministic) canvas captures at
+grazing/topdown/far-horizon, before vs after, diffed with ImageMagick. Two
+runs of the same build are bit-exact (0 differing pixels), and before-vs-after
+differs by **11 / 3 / 3 pixels** out of 422k in the HUD-free crops — 1-ULP
+differences from evaluating `cos`/`sin`/`smoothstep` in the vertex stage
+flipping a few fragments across the alpha threshold. Visually identical.

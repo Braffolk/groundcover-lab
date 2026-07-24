@@ -1,5 +1,6 @@
 #include "src/wgsl/lighting.wgsl"
 #include "src/wgsl/wind.wgsl"
+#include "src/wgsl/debug.wgsl"
 
 // Crossed-card plant proxies, drawn from a fill.wgsl instance list, in two
 // modes sharing all geometry math:
@@ -169,10 +170,17 @@ fn fs_near(i: VOut) -> @location(0) vec4f {
   // camera enters the plant so it fades away instead of clipping.
   var thr = mix(0.5, 0.28, i.lod / 5.0) + smoothstep(0.9, 0.25, dcam) + i.thr_bias;
   if (tex.a < thr) { discard; }
+  // Per-fragment normal: baked plant-local octahedral normal, rotated into the
+  // world by the instance yaw.
   let ne = textureSampleLevel(card_normal, card_sampler, i.uv, i.layer, i.lod);
   let n = rot_yaw(oct_decode(ne.rg * 2.0 - 1.0), i.yaw);
-  let lit = light_surface(tex.rgb / max(tex.a, 1e-3), n, i.world_pos);
-  return vec4f(apply_fog(lit, i.world_pos), 1.0);
+  let albedo = tex.rgb / max(tex.a, 1e-3);
+  var color = light_surface(albedo, n, i.world_pos);
+  // Fog only in the normal view — debug views stay unfogged and honest.
+  if (debug_mode() == DEBUG_OFF) {
+    color = apply_fog(color, i.world_pos);
+  }
+  return vec4f(debug_shade(color, albedo, n, tex.a, i.world_pos), 1.0);
 }
 
 // ---------------------------------------------------------------------------
@@ -213,14 +221,18 @@ fn fs_refresh(i: VOut) -> RefreshOut {
   if (tex.a < thr) { discard; }
   let ne = textureSampleLevel(card_normal, card_sampler, i.uv, i.layer, i.lod);
   let n = rot_yaw(oct_decode(ne.rg * 2.0 - 1.0), i.yaw);
-  let lit = light_surface(tex.rgb / max(tex.a, 1e-3), n, i.world_pos);
+  let albedo = tex.rgb / max(tex.a, 1e-3);
+  let lit = light_surface(albedo, n, i.world_pos);
 
   let d16 = floor(clamp(i.pos.z, 0.0, 1.0) * 65535.0 + 0.5);
   let hi = floor(d16 / 256.0);
   let lo = d16 - hi * 256.0;
 
   var o: RefreshOut;
-  o.color = vec4f(lit, 1.0);
+  // The cache holds SHADED imagery, so the debug view has to be baked in here
+  // (main.ts re-reconstructs every slot when the selector changes). Composite
+  // overrides the coverage/depth views with live values.
+  o.color = vec4f(debug_shade(lit, albedo, n, tex.a, i.world_pos), 1.0);
   o.aux = vec4f(hi / 255.0, lo / 255.0, 0.0, 1.0);
   return o;
 }

@@ -1,5 +1,6 @@
 #include "src/wgsl/lighting.wgsl"
 #include "src/wgsl/wind.wgsl"
+#include "src/wgsl/debug.wgsl"
 #include "./ldi_common.wgsl"
 
 // Runtime LDI compositing, two indirect draws fed by cull.wgsl:
@@ -71,7 +72,7 @@ fn build_card(ii: u32, stack: u32, layer: u32, corner_i: u32) -> VOut {
   let bound_r = uni.center.w * scale;
   let near_fade = smoothstep(bound_r * 0.4, bound_r * 0.95, dcam);
   let d_xz = distance(center_w.xz, frame.camera_pos.xz);
-  let reg = uni.fade.x;
+  let reg = uni.region.w;
   let far_fade = 1.0 - smoothstep(reg * 0.85, reg * 0.99, d_xz);
   // Foreshortening cull: beyond close range, a card nearly edge-on to the
   // view contributes almost nothing — top cards at grazing, side cards from
@@ -116,10 +117,16 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
 }
 
 // Far plants: quad 0 = nearest side stack, quad 1 = top stack, front layer only.
+// cull.wgsl compacts far survivors DOWNWARD from the top of the shared instance
+// array (near fills upward from 0), so the draw itself keeps firstInstance = 0
+// — a non-zero firstInstance in an indirect draw requires the optional
+// `indirect-first-instance` feature and silently no-ops the whole draw without
+// it — and the descending mapping is applied here instead.
 @vertex
 fn vs_far(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut {
   let quad = vi / 6u;
-  return build_card(ii, quad * 2u, 0u, vi % 6u);
+  let slot = u32(uni.ids.z) - 1u - ii;
+  return build_card(slot, quad * 2u, 0u, vi % 6u);
 }
 
 fn oct_decode_yup(e: vec2f) -> vec3f {
@@ -141,12 +148,36 @@ fn aux_depth(aux: vec4f) -> f32 {
   return (aux.b * 255.0 * 256.0 + aux.a * 255.0) / 65535.0;
 }
 
-fn shade(alb: vec3f, aux: vec4f, yaw: f32, world_texel: vec3f) -> vec3f {
+// Method-specific inspection, driven by this experiment's own `inspect` param
+// (never a competing global mode — it only applies when the shared debug view
+// is off): 1 = which baked capture direction the fragment came from, 2 = which
+// peel layer, 3 = which draw path (near 12-card vs far 2-card).
+fn inspect_color(mode: u32, dir_i: u32, layer: u32, is_far: bool) -> vec3f {
+  var pal = array<vec3f, 5>(
+    vec3f(0.90, 0.22, 0.20), vec3f(0.95, 0.66, 0.15), vec3f(0.25, 0.78, 0.32),
+    vec3f(0.25, 0.45, 0.95), vec3f(0.76, 0.30, 0.88),
+  );
+  if (mode == 1u) { return pal[dir_i]; }
+  if (mode == 2u) { return pal[layer]; }
+  return select(vec3f(0.95, 0.45, 0.10), vec3f(0.15, 0.55, 0.95), is_far);
+}
+
+/// Decode the baked normal, light it with the shared model, then hand the
+/// result to the global debug selector. Fog is applied in the normal view only.
+fn shade(
+  alb: vec3f, cov: f32, aux: vec4f, yaw: f32, world_texel: vec3f,
+  dir_i: u32, layer: u32, is_far: bool,
+) -> vec3f {
   var n = rot_yaw(oct_decode_yup(aux.rg * 2.0 - 1.0), yaw);
   let vdir = normalize(frame.camera_pos - world_texel);
   if (dot(n, vdir) < 0.0) { n = -n; }  // thin foliage is two-sided
   var color = light_surface(alb, n, world_texel);
-  return apply_fog(color, world_texel);
+  if (debug_mode() == DEBUG_OFF) {
+    color = apply_fog(color, world_texel);
+    let ins = u32(uni.tune.w + 0.5);
+    if (ins > 0u) { color = inspect_color(ins, dir_i, layer, is_far); }
+  }
+  return debug_shade(color, alb, n, cov, world_texel);
 }
 
 struct FOut {
@@ -173,7 +204,7 @@ fn fs_main(in: VOut) -> FOut {
   // texels off the card plane land closer to their true screen position.
   // A single precomputed-depth lookup — no marching. Sub-pixel at range, so
   // skip it there and save the extra taps.
-  if (uni.fade.z > 0.5 && distance(frame.camera_pos, in.world) < 30.0) {
+  if (uni.tune.y > 0.5 && distance(frame.camera_pos, in.world) < 30.0) {
     let s_texel = d.fwd.w - aux_depth(aux) * 2.0 * d.fwd.w;
     let ds = s_texel - s_plane;  // metres in front of the card plane (unit scale)
     let v_loc = rot_yaw(normalize(frame.camera_pos - in.world), -yaw);
@@ -187,7 +218,8 @@ fn fs_main(in: VOut) -> FOut {
   }
 
   let alb = textureSampleLevel(atlas_albedo, atlas_samp, atlas_uv_for(dir_i, layer, uv), 0.0);
-  if (alb.a * fade < uni.misc.x) { discard; }
+  let cov = alb.a * fade;
+  if (cov < uni.tune.z) { discard; }
 
   // True per-texel depth: push the fragment from the card plane to the baked
   // capture depth along the capture axis, then reproject.
@@ -197,7 +229,7 @@ fn fs_main(in: VOut) -> FOut {
   let clip = frame.view_proj * vec4f(world_texel, 1.0);
 
   var out: FOut;
-  out.color = vec4f(shade(alb.rgb, aux, yaw, world_texel), 1.0);
+  out.color = vec4f(shade(alb.rgb, cov, aux, yaw, world_texel, dir_i, layer, false), 1.0);
   out.depth = clamp(clip.z / max(clip.w, 1e-4), 0.0, 1.0);
   return out;
 }
@@ -209,7 +241,8 @@ fn fs_far(in: VOut) -> @location(0) vec4f {
   let inset = 0.5 / uni.atlas.x;
   let uv0 = atlas_uv_for(in.idx.x, in.idx.y, clamp(in.uv, vec2f(inset), vec2f(1.0 - inset)));
   let alb = textureSampleLevel(atlas_albedo, atlas_samp, uv0, 0.0);
-  if (alb.a * in.fdat.z < uni.misc.x) { discard; }
+  let cov = alb.a * in.fdat.z;
+  if (cov < uni.tune.z) { discard; }
   let aux = textureSampleLevel(atlas_aux, atlas_samp, uv0, 0.0);
-  return vec4f(shade(alb.rgb, aux, in.fdat.x, in.world), 1.0);
+  return vec4f(shade(alb.rgb, cov, aux, in.fdat.x, in.world, in.idx.x, in.idx.y, true), 1.0);
 }

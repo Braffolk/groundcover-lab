@@ -10,6 +10,13 @@ export const PARAMS = {
   parallax: p.bool(true),
   /** Beyond this camera distance only the front peel layer of each stack draws. */
   layerCullDist: p.num(70, { min: 10, max: 200, step: 5 }),
+  /**
+   * Method-specific inspection on top of the global `view` debug modes (it
+   * only applies when that is off): which baked capture direction a fragment
+   * came from, which peel layer, or which draw path (near 12-card vs far
+   * 2-card). Colours are flat, not lit.
+   */
+  inspect: p.enum('off', ['off', 'dir', 'layer', 'path'] as const),
 }
 
 export default defineExperiment({

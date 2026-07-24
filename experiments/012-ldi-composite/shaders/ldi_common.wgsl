@@ -1,6 +1,10 @@
 // Shared between cull.wgsl (compute) and ldi.wgsl (render): the per-stand-entry
-// uniform block, filled by main.ts every frame. Field packing must match the
-// Float32Array layout in main.ts (writeSpeciesUniform).
+// uniform block. Field packing must match the Float32Array layout in main.ts.
+//
+// The block is split into a STATIC half (bake + stand constants, written once
+// at create time) and a DYNAMIC half (`region` + `tune`, floats 8..15, the only
+// two vec4s main.ts rewrites per frame). Keep the dynamic pair contiguous — the
+// per-frame writeBuffer covers exactly byte range [32, 64).
 
 const LDI_DIRS: u32 = 5u;      // 4 side captures + 1 top capture
 const LDI_LAYERS: u32 = 4u;    // depth-peeled layers per capture
@@ -15,11 +19,14 @@ struct DirRec {
 }
 
 struct SpeciesU {
+  // --- static: written once at create time ---------------------------------
   center: vec4f,   // xyz = mesh bbox center (unit scale), w = bounding radius (m)
   atlas: vec4f,    // tile px, atlas w px, atlas h px, layer count
-  region: vec4f,   // origin cell x, origin cell z, side (cells), seed
-  fade: vec4f,     // region radius (m), layer cull dist (m), parallax 0/1, entry index
-  misc: vec4f,     // coverage threshold, instance capacity, stand radius (m), unused
+  // --- dynamic: rewritten every frame (floats 8..15) ------------------------
+  region: vec4f,   // origin cell x, origin cell z, side (cells), region radius (m)
+  tune: vec4f,     // layer cull dist (m), parallax 0/1, coverage threshold, inspect mode
+  // --- static ---------------------------------------------------------------
+  ids: vec4f,      // seed, stand entry index, instance capacity, stand radius (m)
   dirs: array<DirRec, 5>,
 }
 

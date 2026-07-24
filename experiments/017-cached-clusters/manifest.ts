@@ -10,6 +10,12 @@ export const PARAMS = {
   refreshBudget: p.num(3, { min: 1, max: 16, step: 1 }),
   /** Freeze all cache refreshes to inspect staleness/invalidation visually. */
   freezeCache: p.bool(false),
+  /**
+   * Method-specific inspection: tint each CACHED cluster by its quadtree level
+   * (LOD structure) or by its cache slot (pool churn / eviction). The direct
+   * near ring stays untinted, so the handoff boundary is visible too.
+   */
+  clusterTint: p.enum('off', ['off', 'level', 'slot']),
 }
 
 export default defineExperiment({

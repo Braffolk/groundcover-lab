@@ -1,5 +1,5 @@
 import bakeShaderSrc from './shaders/bake.wgsl'
-import type { ExperimentContext, GcMesh } from '@harness'
+import { bakedArtifact, commitBake, speciesById, type ExperimentContext, type GcMesh } from '@harness'
 import type { PARAMS } from './manifest.ts'
 
 /**
@@ -14,15 +14,33 @@ import type { PARAMS } from './manifest.ts'
  * After readback, empty texels bordering covered ones are DILATED (records
  * copied, coverage kept 0) so runtime parallax reprojections that land just
  * outside a silhouette read a plausible height/color instead of background.
- * Baked fresh in-browser per session (~25 draws over the source mesh); the
- * harness bakedArtifact() cache is intentionally not used — the dev server's
- * SPA fallback answers missing /mesh/baked files with 200 index.html, which
- * poisons the cache (see 004/005 NOTES; harness limitation).
+ *
+ * The result goes through the standard harness bake flow (OPFS cache ->
+ * committed mesh/baked/<exp>/<key>.bin -> in-browser bake), so a normal load
+ * never touches the raw source meshes at all — poa-pratensis alone is a 229 MB
+ * download, and re-rendering 25 full-mesh captures per species plus the CPU
+ * dilation on every page load bought nothing. (The reason the first version
+ * skipped the cache — Vite's SPA fallback answering missing /mesh/baked files
+ * with index.html at HTTP 200 — is now handled inside src/bake/io.ts, and the
+ * artifact is magic+size validated here as well.)
+ *
+ * Artifact (little-endian, 64-byte header):
+ *   u32 magic 'R8TP', u32 version, u32 atlasPx, u32 grid
+ *   f32 centre.xyz, f32 radius, f32 halfExt.xyz, f32 topH, zeros to byte 64
+ *   u8  [atlas^2 * 4]   albedo rgba8   (a = coverage)
+ *   u8  [atlas^2 * 8]   geom rgba16float (h, oct normal .yz, spare)
  */
 
 export const GRID = 5
 export const TILE = 256
 export const ATLAS = GRID * TILE // 1280
+
+const MAGIC = 0x50543852 // 'R8TP'
+const VERSION = 1
+const HEADER_BYTES = 64
+const ALBEDO_BYTES = ATLAS * ATLAS * 4
+const GEOM_BYTES = ATLAS * ATLAS * 8
+const ARTIFACT_BYTES = HEADER_BYTES + ALBEDO_BYTES + GEOM_BYTES
 
 export interface BakedViews {
   center: [number, number, number]
@@ -105,6 +123,72 @@ function dilate(albedo: Uint8Array, geom: Uint8Array, iters: number): void {
     }
     covered.set(next)
   }
+}
+
+function packViews(v: BakedViews): ArrayBuffer {
+  const buf = new ArrayBuffer(ARTIFACT_BYTES)
+  const u32 = new Uint32Array(buf, 0, 4)
+  u32[0] = MAGIC
+  u32[1] = VERSION
+  u32[2] = ATLAS
+  u32[3] = GRID
+  const f32 = new Float32Array(buf, 16, 8)
+  f32.set([...v.center, v.radius, ...v.halfExt, v.topH])
+  new Uint8Array(buf, HEADER_BYTES, ALBEDO_BYTES).set(v.albedo)
+  new Uint8Array(buf, HEADER_BYTES + ALBEDO_BYTES, GEOM_BYTES).set(v.geom)
+  return buf
+}
+
+/** Validate + view an artifact in place (null = not one of ours -> rebake). */
+function unpackViews(buf: ArrayBuffer): BakedViews | null {
+  if (buf.byteLength !== ARTIFACT_BYTES) return null
+  const u32 = new Uint32Array(buf, 0, 4)
+  if (u32[0] !== MAGIC || u32[1] !== VERSION || u32[2] !== ATLAS || u32[3] !== GRID) return null
+  const f = new Float32Array(buf, 16, 8)
+  return {
+    center: [f[0]!, f[1]!, f[2]!],
+    radius: f[3]!,
+    halfExt: [f[4]!, f[5]!, f[6]!],
+    topH: f[7]!,
+    albedo: new Uint8Array(buf, HEADER_BYTES, ALBEDO_BYTES),
+    geom: new Uint8Array(buf, HEADER_BYTES + ALBEDO_BYTES, GEOM_BYTES),
+  }
+}
+
+/**
+ * The one entry point the renderer uses: cached artifact if there is one,
+ * otherwise load the source mesh and bake (then offer the result back to the
+ * repo). The mesh load lives INSIDE the bake closure on purpose — a cache hit
+ * must not fetch hundreds of MB of triangles it will never look at.
+ */
+export async function loadSpeciesViews(
+  ctx: ExperimentContext<typeof PARAMS>,
+  speciesId: string,
+): Promise<BakedViews> {
+  const key = `views-v${VERSION}-g${GRID}t${TILE}-${speciesId}`
+  let bakedFresh = false
+  const runBake = async (): Promise<ArrayBuffer> => {
+    bakedFresh = true
+    const mesh = await ctx.meshes.load(speciesById(speciesId).meshId)
+    return packViews(await bakeViews(ctx, mesh))
+  }
+
+  let buf = await bakedArtifact({ expId: ctx.id, key }, runBake)
+  let views = unpackViews(buf)
+  if (!views) {
+    console.warn(`[${ctx.id}] cached artifact for ${speciesId} is not a valid R8TP view set — rebaking`)
+    buf = await runBake()
+    views = unpackViews(buf)
+    if (!views) throw new Error(`[${ctx.id}] bake for ${speciesId} produced an invalid artifact`)
+  }
+  if (bakedFresh) {
+    try {
+      await commitBake(ctx.id, key, buf)
+    } catch (err) {
+      console.warn(`[${ctx.id}] commitBake failed (static build?):`, err)
+    }
+  }
+  return views
 }
 
 /** Render all GRID^2 captures on the GPU and read both atlases back. */

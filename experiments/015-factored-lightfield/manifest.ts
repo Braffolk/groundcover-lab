@@ -10,13 +10,18 @@ export const PARAMS = {
   // One eye-ray reprojection tap after the first depth lookup (8 gathers
   // instead of 4) — kills the residual parallax of the ~4.3deg view grid.
   refine: p.bool(true),
+  // Inspection: replace albedo with a stable per-view-node colour, blended by
+  // the same 4-view weights. Shows WHICH of the 576 hemi-oct views a fragment
+  // is reading and how wide the blend region is (method-specific state, so it
+  // lives here and not in the global debug=<mode> selector).
+  showViewGrid: p.bool(false),
 }
 
 export default defineExperiment({
   id: '015-factored-lightfield',
   title: 'Factored quantized light field',
   description:
-    'The 4D per-species light field factored into geometry x radiance: 576 hemi-oct views of 8-bit ortho depth (one r8 atlas) answer "what surface do you see from where"; the reconstructed hit point indexes a view-independent 3D appearance volume, so colour cannot ghost between views.',
+    'The 4D per-species light field factored into geometry x radiance: 576 hemi-oct views of 8-bit ortho depth + coverage (one rg8 atlas) answer "what surface do you see from where"; the reconstructed hit point indexes a view-independent 3D appearance volume, so colour cannot ghost between views.',
   status: 'working',
   harnessApi: HARNESS_API,
   species: ['calamagrostis-canescens', 'elymus-repens', 'poa-pratensis'],

@@ -79,12 +79,15 @@ capture axis (two-sided foliage). After readback, covered texels are
 **dilated** 4 rings into empty neighbours per tile (raw byte copies, coverage
 kept 0) so parallax reprojections that land just past a silhouette read a
 plausible height/color instead of background; empty background height is −1
-(far side) so rays travel THROUGH gaps to whatever is behind. ~1–3 s for all
-three species, in-browser at first load, per session. The harness
-`bakedArtifact()` cache is intentionally not used — the dev server's SPA
-fallback answers missing `/mesh/baked` files with 200 index.html and poisons
-the cache (same harness limitation 004/005 hit; fix belongs in
-`src/bake/io.ts`).
+(far side) so rays travel THROUGH gaps to whatever is behind.
+
+The result goes through the standard harness bake flow (`bakedArtifact()`:
+OPFS cache → committed `mesh/baked/008-relief-tap/views-v1-g5t256-<species>.bin`
+→ in-browser bake, then `commitBake()`), so a normal load never fetches a raw
+source mesh at all. Artifact = 64 B header (`'R8TP'`, version, atlas px, grid,
+centre / radius / halfExt / topH) + albedo rgba8 + geom rgba16float = 18.75 MiB
+per species, magic+size validated on load — the SPA-fallback HTML that poisoned
+other experiments' caches can only cause a rebake here, never a bad atlas.
 
 ## Status
 
@@ -94,6 +97,34 @@ the cache (same harness limitation 004/005 hit; fix belongs in
 `close-quality` for the 1/2/3-tap comparison. All three species render at the
 stand's exact placement via the scatter twin. Typecheck clean, no console
 errors.
+
+## Debug views
+
+The fragment shader routes its final colour through the shared
+`debug_shade()` (`src/wgsl/debug.wgsl`), so the global `view` selector
+(`debug=albedo|normals|lighting|coverage|depth`) works here exactly as it does
+on the terrain; fog is applied only in `DEBUG_OFF`. What each mode reads:
+
+- **albedo** — `surf.rgb` of the solved hit times the depth-in-clump AO ramp
+  (the same value handed to `light_surface`, so **lighting** — which divides
+  it back out — is exact).
+- **normals** — the baked per-texel local normal at the hit, oct-decoded and
+  yaw-rotated. It is genuinely per fragment and genuinely high frequency:
+  one texel of a 256px view covers several blades of a 2M-tri plant, and
+  stochastic view selection means neighbouring pixels can read different
+  captures. The lighting term measured over a grazing crop spans 0.13 → 1.0
+  (mean 0.76), i.e. real half-Lambert variation, not a constant.
+- **coverage** — the bilinear alpha that was alpha-tested, so it is bounded
+  below by `covThresh` (0.38) by construction: white = solid interior, grey =
+  silhouette texels sitting on the threshold.
+- **depth** — from the reconstructed hit written to `frag_depth`, so it shows
+  the relief displacement, not the card plane.
+
+Method-specific state lives in the experiment's own `inspect` param (`off` /
+`height` = the solved hit's relief height along the capture axis / `view-cell`
+= which of the 25 baked views each pixel sampled — the stochastic dither shows
+as two-colour grain, and the cell boundaries sweeping across the meadow are
+the view quantization made visible).
 
 ## Findings
 
@@ -129,3 +160,74 @@ errors.
   before quoting numbers.
 - A/B vs ground truth:
   `#/ab/008-relief-tap/000-ground-truth?stand=default&cam=grazing&seed=42`.
+
+## Audit
+
+Structural pass (no frame times used — the GPU was shared with other agents;
+everything below is argued from the code and checked by screenshot).
+
+**Fixed**
+
+1. **The committed baked artifacts were dead weight.** `mesh/baked/008-relief-tap/`
+   already held all three view sets, but `bake.ts` never looked at them: every
+   page load downloaded the raw GCMESH1 source mesh (poa-pratensis alone is
+   229 MB), re-rendered 25 full-mesh ortho captures per species, read two
+   1280² atlases back, and ran the 4-ring CPU dilation over 1.6 M texels ×3 —
+   all to reproduce bytes that were sitting in the repo. It is now on the
+   normal harness flow (OPFS → committed `.bin` → bake → `commitBake`), with
+   the mesh load moved *inside* the bake closure so a cache hit fetches no
+   triangles at all. Measured effect on load: with the old code a fresh
+   `far-horizon` load was still rendering black 8 s in; with the artifact it
+   is up in ~2 s. The reason the first version gave for skipping the cache
+   (Vite's SPA fallback returning `index.html` at HTTP 200) is now handled in
+   `src/bake/io.ts`, and the loader magic+size validates anyway.
+2. **Per-fragment recomputation of per-card constants.** The fragment shader
+   ran `to_mesh()` twice per pixel — each one a `rot_y` with its own
+   `cos`/`sin` — plus `hemioct_encode` + normalizes to pick the view cell,
+   for quantities that are identical over the whole card. All of it moved to
+   the vertex stage: the eye position in mesh frame, the view-cell coords
+   (`g0`, frac), and `cos(yaw)`/`sin(yaw)` are `@interpolate(flat)` varyings
+   now. The card point itself is an *affine* function of world position, so
+   passing `o_u` as an ordinary perspective-correct varying reproduces it
+   exactly instead of re-deriving it — the fragment stage no longer contains
+   a single trig call. Also drops `yaw`/`scale`/`fade`/`root`/`sway` from
+   perspective interpolation to flat, which is what they always were.
+3. **`drawUbo` was re-uploaded every frame for every species** although not
+   one of its 24 floats depends on the camera or on time (bake constants +
+   params). Now uploaded only when its contents actually change.
+4. **Cull dispatch was not clipped to the stand region.** The dispatch is
+   sized by the camera's `maxDist` box; cells outside the stand aabb were
+   launched only for the shader to reject them with the same `lo/hi` test.
+   The CPU now intersects the box with that region (identical predicate, so
+   the surviving cell set is unchanged) and skips the dispatch entirely when
+   the window is empty.
+
+**Verified unchanged.** Deterministic (`det=1&t=3.5`) crops at `grazing`,
+`topdown`, `inside-plant` and `far-horizon`, old code vs new: RMSE 0.5 %–1.2 %,
+visually indistinguishable — i.e. the committed artifact is equivalent to a
+fresh bake, and the vertex-stage hoisting only moved float rounding around.
+
+**Deliberately left alone**
+
+- `node_basis()` still runs per fragment. It has only 25 possible results and
+  could be a small uniform table, but the choice is per-pixel (stochastic view
+  selection), the replacement trades ~20 ALU for a dynamically indexed uniform
+  read, and which wins is hardware-dependent — that needs a bench, which this
+  session cannot honestly run. Same verdict for folding the three per-pixel
+  PCG draws into fewer rounds.
+- `frag_depth` + `discard` defeats early-z, which is the method's real perf
+  ceiling at grazing angles. Fixing that means a depth prepass or giving up
+  reconstructed depth — a redesign, not an audit item.
+- The dithered near/far dissolve stays: it *is* the fade mechanism (CLAUDE.md's
+  dither rule allows exactly that case), and it only runs inside the fade
+  bands.
+- The instance buffers stay sized for `MAX_DIST_CAP` rather than the current
+  `maxDist`, so the `maxDist` slider never reallocates GPU memory mid-session;
+  the 25 MB/species budget still holds (21.3 MiB worst case on `default`).
+
+**Open question for a future pass.** The normals debug view shows just how
+high-frequency the baked normal field is — one texel spans several blades, and
+bilinear filtering across an oct-encoded discontinuity can point anywhere. A
+bake-time normal filter (or storing a filtered plus a detail normal) would calm
+the lighting noise, but it changes the visual character, so it is a design
+change rather than an audit fix.

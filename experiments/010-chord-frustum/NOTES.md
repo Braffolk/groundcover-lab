@@ -57,9 +57,17 @@ regionRadius, never by stand size; nothing per-plant lives on the CPU.
 
 - chord surf atlas: 1584×768×4 B rgba8 = 4.87 MB
 - chord geom atlas: 1584×768×4 B rgba8 = 4.87 MB
-- instance buffer (worst-case region 80m: 41² cells × 128 slots × 32 B) = 6.89 MB
-- info/cull uniforms + indirect: ~130 B
-- Total ≈ 16.6 MB (HUD: 15.8/25 MiB per species). Under budget.
+- instance buffer: the region at the max radius (80 m) is 41² cells × 128
+  candidate slots = 215k slots, but a slot only EXISTS with probability
+  density/8, and only existing plants are ever appended. Sized at
+  `slots × density/8 × 1.15 + 4096` — over 2×10⁵ Bernoulli trials the count is
+  within a few hundred of its mean, so the margin is unreachable (and the cull
+  shader drops overflow gracefully). density 3 → 96,888 × 32 B = 3.10 MB
+  (elymus, density 2.5 → 2.61 MB).
+- proxy index buffer 192 B, info/cull uniforms + indirect: ~160 B
+- Total ≈ 12.8 MB (HUD: 12.2/25 MiB per species; 11.8 for elymus). Under
+  budget with room to spare — was 16.6 MB before the audit right-sized the
+  instance buffer.
 
 Bake-time transients (~130 MB G-buffer + mesh buffers) are raw allocations,
 destroyed at the end of the bake; they never coexist with rendering.
@@ -100,6 +108,96 @@ Gotchas hit and fixed along the way (documented for reuse):
 - The dev server answers missing /mesh/baked files with index.html (200), so
   the committed-artifact path can hand back poisoned bytes; the loader
   validates a magic header and rebakes.
+
+## Audit (structural waste + debug views)
+
+Second pass over the finished method: wire the global debug views, then hunt
+structural waste. No frame times are quoted — the GPU was shared with other
+agents during this pass, so every fix below is justified from the code alone.
+
+**Debug views (were entirely missing).** `render.wgsl` now includes
+`src/wgsl/debug.wgsl`, applies fog only when `debug_mode() == DEBUG_OFF`, and
+returns `debug_shade(color, albedo·var, n, alpha, hit_w)`. What each mode
+turned out to show — the method needed no repair here, only exposure:
+- *normals*: real per-fragment normals. They are the baked mesh normal at the
+  chord's first hit (coverage-weighted mean of the 4 entry-bin taps), oct-decoded,
+  yawed into world, flipped towards the eye. At `inside-plant` they resolve
+  into coherent blade-shaped patches; at `grazing` they look like coloured
+  noise, which is honest — one pixel there covers many sub-mm blades.
+- *lighting*: goes through the shared `light_surface()`, once. Albedo is baked
+  premultiplied by COVERAGE (not by light) and divided back out at runtime, so
+  nothing is double-lit. The view is bright/clipped over most of the frame, but
+  so is the terrain's — that is the shared half-lambert model, not this
+  renderer.
+- *albedo*: the raw baked chord colour × the anchored-noise variation actually
+  used for shading (so the *lighting* view's division is exact).
+- *coverage*: the resolved chord coverage after the far/near/inside fades —
+  exactly the number the hard alpha test judges.
+- *depth*: continuous through the field with no proxy-shaped plateaus,
+  confirming `frag_depth` really is the reconstructed hit, not the proxy hull.
+- `debugChart` stays an own-manifest param (chord chart coords) and only
+  applies in the `off` view.
+
+**Fixed — vertex-stage/uniform work that was done per fragment.** The
+fragment shader recomputed, for every fragment, quantities that are constant
+over the whole instance: the wind shear `wl`, the shear factor, and the eye
+position transformed into the plant-local unsheared frame — three
+`rot_y(·, ±yaw)` calls, i.e. six transcendentals per fragment, on the most
+fill-bound pass in the experiment. They are now computed once in the vertex
+stage and passed flat (`ray_o_shear`, `shear_cs`), with `cos/sin(yaw)` passed
+down so the two remaining fragment rotations (`rot_y_cs`) cost no
+transcendentals at all.
+
+**Fixed — the proxy was drawn non-indexed.** Its 32 triangles have only 18
+distinct vertices (8 bottom ring, 8 top ring, 2 fan centers), so `draw` was
+shading 96 vertices per plant — 5.3× redundant. Now a 192 B index buffer +
+`drawIndexedIndirect`. Bonus: the ring seam used to be `cos(2π)` on one quad
+and `cos(0)` on the next (a hairline crack waiting to happen); indexing makes
+them literally the same vertex.
+
+**Fixed — per-frame uploads of values that never change.** `update()` rewrote
+both uniform buffers for every stand entry every frame. The render uniform
+holds only the baked frustum fit + params, so it is now written at init and
+from `onParamsChanged`. The cull uniform additionally carries the region's
+corner cell, which changes only when the camera crosses a 4 m cell boundary —
+written on that transition. Only the indirect counter reset is genuinely
+per-frame now.
+
+**Fixed — instance buffer sized for an impossible worst case** (see VRAM math
+above): 6.89 → 3.10 MB per species, total VRAM 54.3 → 43.0 MB.
+
+**Verified unchanged:** before/after screenshots at `grazing`, `topdown`,
+`far-horizon` differ in 0.15–1.2% of pixels, all isolated single pixels
+scattered over the field with no structure, no silhouette shifts and no
+missing plants. That is the expected last-ULP jitter of the world-anchored
+alpha-test hash (`floor(hit_u·48)` flips a cell when the reconstructed hit
+moves by 1e-7), caused by evaluating the ray setup in the vertex stage instead
+of the fragment stage. The indexed-draw change on its own is bit-identical
+(0–3 pixels of 247k). Typecheck clean, console free of WebGPU errors.
+
+**Deliberately left alone** (each needs a bench to justify, which this session
+cannot provide honestly):
+- No depth prepass. `frag_depth` disables early-z, so grazing overdraw is
+  shaded then late-z rejected. A depth-only proxy prepass (or front-to-back
+  ordering by entry distance) is the obvious next experiment, but it doubles
+  the geometry pass and only pays off if overdraw dominates — measure first.
+- The cull enumerates all 128 candidate slots of every cell in the region
+  square. That is forced by the shared scatter twin (existence is per-slot), so
+  it cannot shrink; a per-cell early-out (cell AABB vs frustum, or cell-to-camera
+  horizontal distance vs max_dist) would skip whole cells before the hash +
+  terrain sample, and the square's corners alone are 21% of the threads. Left
+  out because the cull pass is a rounding error next to the fragment stage and
+  a sloppy conservative bound would pop plants.
+- The 5 frustum planes are rebuilt per cull thread rather than uploaded as a
+  uniform. Uploading them would make the cull uniform per-frame again, undoing
+  the fix above, for ~40 ALU next to a hash chain plus a terrain texture fetch.
+- Skipping the cull dispatch entirely while the camera and params are
+  unchanged. Real win for a parked camera, but it needs every frame-uniform
+  input (pose, viewport/aspect) tracked or plants pop — not worth the hidden
+  dependency for a case where nothing is under load anyway.
+- The bake's second gather dispatch covers the whole atlas and early-outs on
+  the non-resident view rows (two batches, ~half the threads wasted each). Bake
+  time only, and it keeps the batching logic trivially correct.
 
 ## Status
 

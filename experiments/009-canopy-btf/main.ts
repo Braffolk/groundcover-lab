@@ -17,6 +17,8 @@ import type { PARAMS } from './manifest.ts'
 const GRID_CELLS = 128
 const SPACING = 2
 const MAX_ENTRIES = 4
+/** Order must match the `inspect` branch in shaders/canopy.wgsl. */
+const INSPECT_MODES = ['off', 'bin', 'lod', 'layer'] as const
 /** Densities the community tiles are treated as representing (plants/m²). */
 const REF_DENSITY: Record<string, number> = {
   'calamagrostis-canescens': 3,
@@ -129,41 +131,48 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
   build()
   const unsubscribe = ctx.shaders.onReload(build)
 
+  // Everything but the camera snap and the params depends only on stand +
+  // baked meta, so it is computed and uploaded ONCE here; the per-frame
+  // writeBuffer below only touches the 12-float header.
   const uniforms = new Float32Array(UNIFORM_FLOATS)
   // Bin directions are identical across species by construction.
   uniforms.set(artifacts.get(unique[0]!)!.meta.dirs, 60)
+  uniforms[2] = SPACING
+  uniforms[3] = GRID_CELLS
+  uniforms[4] = ctx.stand.radius
+  let shellTop = 0.4
+  entries.forEach((e, i) => {
+    const art = artifacts.get(e.species)!
+    const sMean = (e.scaleMin + e.scaleMax) / 2
+    shellTop = Math.max(shellTop, art.meta.topH * e.scaleMax)
+    const o = 12 + i * 12
+    uniforms[o] = art.meta.tileSize * sMean
+    uniforms[o + 1] = art.meta.topH * sMean
+    uniforms[o + 2] = sMean
+    uniforms[o + 3] = e.sway
+    uniforms[o + 4] = Math.min(1.3, Math.max(0.3, e.density / (REF_DENSITY[e.species] ?? 3)))
+    uniforms[o + 5] = speciesById(e.species).index
+    uniforms[o + 6] = art.meta.avgColor[0]
+    uniforms[o + 7] = art.meta.avgColor[1]
+    uniforms[o + 8] = art.meta.avgColor[2]
+  })
+  uniforms[5] = shellTop + 0.05
+  uniforms[6] = entries.length
+  device.queue.writeBuffer(uniformBuf, 0, uniforms)
+
+  const HEADER_FLOATS = 12
 
   return {
     update(frame: FrameInfo): void {
       const cam = frame.camera.pose
       uniforms[0] = Math.floor(cam.x / SPACING) * SPACING
       uniforms[1] = Math.floor(cam.z / SPACING) * SPACING
-      uniforms[2] = SPACING
-      uniforms[3] = GRID_CELLS
-      uniforms[4] = ctx.stand.radius
-      let shellTop = 0.4
-      entries.forEach((e, i) => {
-        const art = artifacts.get(e.species)!
-        const sMean = (e.scaleMin + e.scaleMax) / 2
-        shellTop = Math.max(shellTop, art.meta.topH * e.scaleMax)
-        const o = 12 + i * 12
-        uniforms[o] = art.meta.tileSize * sMean
-        uniforms[o + 1] = art.meta.topH * sMean
-        uniforms[o + 2] = sMean
-        uniforms[o + 3] = e.sway
-        uniforms[o + 4] = Math.min(1.3, Math.max(0.3, e.density / (REF_DENSITY[e.species] ?? 3)))
-        uniforms[o + 5] = speciesById(e.species).index
-        uniforms[o + 6] = art.meta.avgColor[0]
-        uniforms[o + 7] = art.meta.avgColor[1]
-        uniforms[o + 8] = art.meta.avgColor[2]
-      })
-      uniforms[5] = shellTop + 0.05
-      uniforms[6] = entries.length
       uniforms[7] = ctx.params.taps === '4' ? 4 : ctx.params.taps === '1' ? 1 : 0
       uniforms[8] = ctx.params.windAmount
       uniforms[9] = ctx.params.coverage
       uniforms[10] = ctx.params.macroTint ? 1 : 0
-      device.queue.writeBuffer(uniformBuf, 0, uniforms)
+      uniforms[11] = INSPECT_MODES.indexOf(ctx.params.inspect)
+      device.queue.writeBuffer(uniformBuf, 0, uniforms, 0, HEADER_FLOATS)
     },
 
     encode(enc: GPUCommandEncoder, _frame: FrameInfo, targets: ViewTargets): void {

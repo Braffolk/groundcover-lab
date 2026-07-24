@@ -1,6 +1,7 @@
 #include "src/wgsl/scatter.wgsl"
 #include "src/wgsl/wind.wgsl"
 #include "src/wgsl/lighting.wgsl"
+#include "src/wgsl/debug.wgsl"
 
 // Secant relief cards. Every plant is one camera-facing card. Its appearance
 // comes from a small hemi-octahedral set (5x5 = 25) of DEPTH-AUGMENTED
@@ -27,6 +28,14 @@
 // Wind is exact-by-construction: sway is a linear-in-height shear, and lines
 // stay lines under shear — so instead of bending the plant we inverse-shear
 // the eye ray into the un-swayed baked frame (per plant, per fragment).
+//
+// Everything that is CONSTANT over a card — the eye position in the plant's
+// mesh frame, the view-cell coordinates it selects, cos/sin of the plant yaw —
+// is computed once in the vertex stage and passed flat. The one quantity that
+// varies, the card point in mesh frame, is an AFFINE function of the world
+// position, so perspective-correct interpolation reproduces it exactly: the
+// fragment stage never redoes the world->mesh transform (two rotations with
+// trig, per pixel, for a value the primitive already knows).
 
 struct Meta {
   center: vec3f,        // mesh bounds center, local mesh units
@@ -45,7 +54,7 @@ struct Meta {
   relief_mode: f32,     // 0 flat, 1 linear, 2 secant
   view_mode: f32,       // 0 stochastic, 1 nearest
   capacity: f32,
-  debug_mode: f32,      // 0 lit, 1 albedo, 2 normal, 3 height
+  inspect: f32,         // method-specific inspector: 0 off, 1 height, 2 view-cell
   _p0: f32,
   _p1: f32,
   _p2: f32,
@@ -57,9 +66,12 @@ struct Meta {
 @group(1) @binding(2) var atlas_albedo: texture_2d<f32>;
 @group(1) @binding(3) var atlas_geom: texture_2d<f32>;
 
-fn rot_y(v: vec3f, a: f32) -> vec3f {
-  let c = cos(a);
-  let s = sin(a);
+const INSPECT_HEIGHT: u32 = 1u;
+const INSPECT_VIEW_CELL: u32 = 2u;
+
+// Yaw rotation with the cosine/sine supplied — the plant yaw is a per-instance
+// constant, so its trig is evaluated once per vertex and reused everywhere.
+fn rot_y_cs(v: vec3f, c: f32, s: f32) -> vec3f {
   return vec3f(c * v.x + s * v.z, v.y, -s * v.x + c * v.z);
 }
 
@@ -119,19 +131,25 @@ fn tap_h(p: vec3f, b: Basis, node: vec2f) -> f32 {
 // World -> un-swayed local mesh frame. Forward map of a baked point q is
 //   world(q) = root + rot_y(q, yaw)*scale + sway * (q.y / top_h)
 // which is affine in q, so it inverts exactly (including for ray directions
-// taken as point differences).
-fn to_mesh(p: vec3f, root: vec3f, yaw: f32, inv_scale: f32, sway: vec3f, inv_shear: f32) -> vec3f {
+// taken as point differences) — and, being affine, its image interpolates
+// exactly across the card.
+fn to_mesh(p: vec3f, root: vec3f, cs: f32, sn: f32, inv_scale: f32, sway: vec3f, inv_shear: f32) -> vec3f {
   let p1 = p - root;
   let qy = p1.y * inv_shear; // 1 / (scale + sway.y/top_h)
-  return rot_y((p1 - sway * (qy / mp.top_h)) * inv_scale, -yaw);
+  return rot_y_cs((p1 - sway * (qy / mp.top_h)) * inv_scale, cs, -sn);
 }
 
 struct VOut {
   @builtin(position) pos: vec4f,
-  @location(0) world: vec3f,
-  @location(1) root: vec3f,
-  @location(2) misc: vec4f,  // yaw, scale, fade, unused
-  @location(3) sway: vec3f,  // world-space tip sway displacement
+  // Card point in the plant's un-swayed, un-yawed, unit-radius mesh frame.
+  // Affine in world position -> perspective-correct interpolation is exact.
+  @location(0) o_u: vec3f,
+  // --- constant over the card, computed once per vertex ---------------------
+  @location(1) @interpolate(flat) cam_u: vec3f,  // eye in the same frame
+  @location(2) @interpolate(flat) root: vec3f,
+  @location(3) @interpolate(flat) sway: vec3f,   // world-space tip sway
+  @location(4) @interpolate(flat) cell: vec4f,   // view grid: g0.xy, frac.xy
+  @location(5) @interpolate(flat) misc: vec4f,   // cos(yaw), sin(yaw), scale, fade
 }
 
 @vertex
@@ -148,10 +166,12 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
   let scale = d1.x;
   let phase = d1.z;
   let entry = u32(mp.entry_index);
+  let cs = cos(yaw);
+  let sn = sin(yaw);
 
   let sway = wind_sway(root, frame.time, stand_table[entry].sway, phase) * mp.sway_mul;
   let R = mp.radius * scale;
-  let center = root + rot_y(mp.center, yaw) * scale + sway * (mp.center.y / mp.top_h);
+  let center = root + rot_y_cs(mp.center, cs, sn) * scale + sway * (mp.center.y / mp.top_h);
 
   let dcam = distance(frame.camera_pos, center);
   // Camera-inside-plant rule: dissolve when the camera enters the bounding
@@ -177,8 +197,8 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
   if (abs(dir.y) > 0.99) { up_ref = vec3f(1.0, 0.0, 0.0); }
   let right = normalize(cross(up_ref, dir));
   let up = normalize(cross(dir, right));
-  let bx = rot_y(vec3f(1.0, 0.0, 0.0), yaw);
-  let bz = rot_y(vec3f(0.0, 0.0, 1.0), yaw);
+  let bx = vec3f(cs, 0.0, -sn);   // rot_y(+x, yaw)
+  let bz = vec3f(sn, 0.0, cs);    // rot_y(+z, yaw)
   let he = mp.half_ext * scale;
   let half_w = abs(dot(right, bx)) * he.x + abs(right.y) * he.y + abs(dot(right, bz)) * he.z;
   let half_h = abs(dot(up, bx)) * he.x + abs(up.y) * he.y + abs(dot(up, bz)) * he.z;
@@ -190,11 +210,26 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     + right * (c.x * (half_w * enlarge + slack))
     + up * (c.y * (half_h * enlarge + slack));
 
+  // --- per-card constants: the eye ray frame and the baked view cell --------
+  let inv_scale = 1.0 / scale;
+  let inv_shear = 1.0 / (scale + sway.y / mp.top_h);
+  let inv_r = 1.0 / (mp.radius + 1e-6);
+  let cam_u = (to_mesh(frame.camera_pos, root, cs, sn, inv_scale, sway, inv_shear) - mp.center) * inv_r;
+
+  // View direction from plant center -> baked view cell (upper hemisphere).
+  var v = normalize(cam_u);
+  v = normalize(vec3f(v.x, max(v.y, 0.02), v.z));
+  let gm1 = mp.grid - 1.0;
+  let g = clamp(hemioct_encode(v) * 0.5 + 0.5, vec2f(0.0), vec2f(1.0)) * gm1;
+  let g0 = clamp(floor(g), vec2f(0.0), vec2f(gm1 - 1.0));
+
   out.pos = frame.view_proj * vec4f(world, 1.0);
-  out.world = world;
+  out.o_u = (to_mesh(world, root, cs, sn, inv_scale, sway, inv_shear) - mp.center) * inv_r;
+  out.cam_u = cam_u;
   out.root = root;
-  out.misc = vec4f(yaw, scale, fade, 0.0);
   out.sway = sway;
+  out.cell = vec4f(g0, clamp(g - g0, vec2f(0.0), vec2f(1.0)));
+  out.misc = vec4f(cs, sn, scale, fade);
   return out;
 }
 
@@ -205,27 +240,17 @@ struct FOut {
 
 @fragment
 fn fs_main(in: VOut) -> FOut {
-  let yaw = in.misc.x;
-  let scale = in.misc.y;
-  let fade = in.misc.z;
-  let inv_scale = 1.0 / scale;
-  let inv_shear = 1.0 / (scale + in.sway.y / mp.top_h);
-  let inv_r = 1.0 / (mp.radius + 1e-6);
+  let cs = in.misc.x;
+  let sn = in.misc.y;
+  let scale = in.misc.z;
+  let fade = in.misc.w;
 
-  // Eye ray in the plant's un-swayed, un-yawed, unit-radius frame.
-  let q_frag = to_mesh(in.world, in.root, yaw, inv_scale, in.sway, inv_shear);
-  let q_cam = to_mesh(frame.camera_pos, in.root, yaw, inv_scale, in.sway, inv_shear);
-  let o_u = (q_frag - mp.center) * inv_r;
-  let cam_u = (q_cam - mp.center) * inv_r;
-  let d_u = normalize(o_u - cam_u);
-
-  // View direction from plant center -> baked view cell (upper hemisphere).
-  var v = normalize(cam_u);
-  v = normalize(vec3f(v.x, max(v.y, 0.02), v.z));
-  let gm1 = mp.grid - 1.0;
-  let g = clamp(hemioct_encode(v) * 0.5 + 0.5, vec2f(0.0), vec2f(1.0)) * gm1;
-  let g0 = clamp(floor(g), vec2f(0.0), vec2f(gm1 - 1.0));
-  let f = clamp(g - g0, vec2f(0.0), vec2f(1.0));
+  // Eye ray in the plant's un-swayed, un-yawed, unit-radius frame — both ends
+  // arrive from the vertex stage.
+  let o_u = in.o_u;
+  let d_u = normalize(o_u - in.cam_u);
+  let g0 = in.cell.xy;
+  let f = in.cell.zw;
 
   // Deterministic per-pixel dither (shared PCG hash of pixel coords).
   let px = vec2u(in.pos.xy);
@@ -273,29 +298,41 @@ fn fs_main(in: VOut) -> FOut {
   let geom = textureSampleLevel(atlas_geom, linear_sampler, uv2, 0.0);  // tap 3 (b)
 
   // Alpha test + dithered near/far dissolve.
-  if (surf.a < mp.cov_thresh || fade < r3) { discard; }
+  let coverage = surf.a;
+  if (coverage < mp.cov_thresh || fade < r3) { discard; }
 
   // Snap the hit onto the sampled height sheet and reconstruct the world
   // point -> true frag_depth (plants inter-occlude in 3D).
   let p_hit = p2 + b.f * (geom.x - dot(p2, b.f));
   let q_hit = p_hit * mp.radius + mp.center;
-  let world_hit = in.root + rot_y(q_hit, yaw) * scale + in.sway * (q_hit.y / mp.top_h);
+  let world_hit = in.root + rot_y_cs(q_hit, cs, sn) * scale + in.sway * (q_hit.y / mp.top_h);
   let clip = frame.view_proj * vec4f(world_hit, 1.0);
 
-  let n_w = rot_y(oct_decode(geom.yz), yaw);
+  // Real per-fragment normal: the baked local-frame normal of the surface the
+  // ray actually hit, rotated into world by the plant yaw.
+  let n_w = rot_y_cs(oct_decode(geom.yz), cs, sn);
   let ynorm = clamp(q_hit.y / mp.top_h, 0.0, 1.0);
   let albedo = surf.rgb * mix(1.0 - mp.ao, 1.0, ynorm);
 
   var color = light_surface(albedo, n_w, world_hit);
-  color = apply_fog(color, world_hit);
-
-  let dbg = mp.debug_mode;
-  if (dbg > 0.5 && dbg < 1.5) { color = surf.rgb; }
-  else if (dbg > 1.5 && dbg < 2.5) { color = n_w * 0.5 + 0.5; }
-  else if (dbg > 2.5) { color = vec3f(geom.x * 0.5 + 0.5); }
+  // Fog only in the normal view — debug views stay unfogged and honest.
+  if (debug_mode() == DEBUG_OFF) {
+    let ins = u32(mp.inspect + 0.5);
+    if (ins == INSPECT_HEIGHT) {
+      // Relief height of the solved hit along the capture axis, [-1,1] -> grey.
+      color = vec3f(geom.x * 0.5 + 0.5);
+    } else if (ins == INSPECT_VIEW_CELL) {
+      // Which of the 25 baked views this pixel sampled (stochastic dither
+      // shows up as grain between two cell colours).
+      let gm1 = mp.grid - 1.0;
+      color = vec3f(node.x / gm1, node.y / gm1, 0.35);
+    } else {
+      color = apply_fog(color, world_hit);
+    }
+  }
 
   var out: FOut;
-  out.color = vec4f(color, 1.0);
+  out.color = vec4f(debug_shade(color, albedo, n_w, coverage, world_hit), 1.0);
   out.depth = clamp(clip.z / max(clip.w, 1e-4), 0.0, 1.0);
   return out;
 }

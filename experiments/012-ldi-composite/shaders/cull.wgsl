@@ -8,7 +8,10 @@
 // inside frustum) are compacted into ONE instance array shared by two
 // indirect draws: NEAR plants (full 12-card LDI, frag_depth) fill from index
 // 0 up, FAR plants (2 cheap cards, early-z friendly) fill from the top end
-// down — the far draw's firstInstance is maintained with the same atomics.
+// down. Both draws keep firstInstance = 0 — a non-zero firstInstance in an
+// indirect draw needs the optional `indirect-first-instance` feature and is
+// otherwise turned into a silent no-op, so vs_far mirrors the descending fill
+// itself (slot = capacity - 1 - instance_index).
 
 @group(1) @binding(0) var<uniform> uni: SpeciesU;
 @group(1) @binding(1) var<storage, read_write> out_instances: array<vec4f>;
@@ -18,12 +21,12 @@
 @compute @workgroup_size(128)
 fn cs_cull(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) li: u32) {
   let cell = vec2i(i32(uni.region.x) + i32(wg.x), i32(uni.region.y) + i32(wg.y));
-  let entry = u32(uni.fade.w);
-  let sp = scatter_candidate(u32(uni.region.w), entry, cell, li);
+  let entry = u32(uni.ids.y);
+  let sp = scatter_candidate(u32(uni.ids.x), entry, cell, li);
   if (!sp.exists) { return; }
 
   // The stand's square region is the world; nothing grows beyond it.
-  let stand_r = uni.misc.z;
+  let stand_r = uni.ids.w;
   if (abs(sp.pos.x) > stand_r || abs(sp.pos.z) > stand_r) { return; }
 
   let center_w = sp.pos + rot_yaw(uni.center.xyz, sp.yaw) * sp.scale;
@@ -31,7 +34,7 @@ fn cs_cull(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) li
 
   // Bounded-region circle around the camera.
   let d_xz = distance(center_w.xz, frame.camera_pos.xz);
-  if (d_xz > uni.fade.x) { return; }
+  if (d_xz > uni.region.w) { return; }
 
   // Conservative sphere-vs-frustum in clip space.
   let c = frame.view_proj * vec4f(center_w, 1.0);
@@ -41,21 +44,21 @@ fn cs_cull(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) li
   if (c.x > c.w + rx || c.x < -c.w - rx) { return; }
   if (c.y > c.w + ry || c.y < -c.w - ry) { return; }
 
+  let cap = u32(uni.ids.z);
   var slot: u32;
-  if (distance(center_w, frame.camera_pos) < uni.fade.y) {
+  if (distance(center_w, frame.camera_pos) < uni.tune.x) {
     slot = atomicAdd(&near_args[1], 1u);
-    if (slot >= u32(uni.misc.y)) {
+    if (slot >= cap) {
       atomicSub(&near_args[1], 1u);
       return;
     }
   } else {
-    let first = atomicSub(&far_args[3], 1u);
-    if (first == 0u) {
-      atomicAdd(&far_args[3], 1u);
+    let k = atomicAdd(&far_args[1], 1u);
+    if (k >= cap) {
+      atomicSub(&far_args[1], 1u);
       return;
     }
-    slot = first - 1u;
-    atomicAdd(&far_args[1], 1u);
+    slot = cap - 1u - k;
   }
   out_instances[slot * 2u] = vec4f(sp.pos, sp.yaw);
   out_instances[slot * 2u + 1u] = vec4f(sp.scale, sp.phase, f32(entry), 0.0);

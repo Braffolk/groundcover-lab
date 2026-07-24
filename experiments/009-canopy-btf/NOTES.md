@@ -15,7 +15,8 @@ ground.
 
 Per frame there is exactly ONE draw whose cost is screen/region-bounded and
 completely independent of plant count: a camera-centred terrain-following grid
-(128x128 quads, uniform 2 m spacing inner +-64 m, exponential to ~1.3 km)
+(128x128 quads, uniform 2 m spacing inner +-64 m, exponential to ~2.1 km,
+quads entirely outside the stand region culled in the vertex stage)
 rasterised twice — a ground layer and a canopy-top shell (for crest/sky
 silhouettes and camera-below-canopy views). Every fragment:
 
@@ -80,8 +81,120 @@ mix, region, per-entry mean scale/height, per-entry sway, and density
 individual plants have no identity. A/B vs per-plant renderers matches in
 aggregate (palette, height, coverage), never plant-for-plant.
 
+## Debug views
+
+Wired to the global `frame.debug_mode` selector (runner/AB `view` dropdown,
+URL `debug=`). Because this renderer composites up to 4 species layers in one
+fragment, `debug_shade()` is called **per entry** — albedo, the aggregate
+normal and the light term are per-entry quantities, and the front-to-back
+composite then blends the debug colours with exactly the same weights as the
+shaded colour, so `albedo`/`normals`/`lighting` are per-layer exact instead of
+an ad-hoc average. Coverage and depth are composite quantities, so they are
+resolved once after the composite.
+
+- `normals` — the baked oct-encoded aggregate normal, decoded per fragment and
+  fed to the shared `light_surface()` (this was already true before the audit;
+  nothing here was flat-shaded). Mostly up-facing with per-pixel speckle: that
+  speckle is honest — it is the stochastic view-bin pick plus texels where the
+  16 supersampled normals nearly cancel (leaf front/back faces), so the
+  normalised mean is ill-conditioned.
+- `lighting` — near-white over the whole ground. Not a bug in this renderer:
+  `SUN_COLOR` is 1.15 and the half-lambert term plus hemisphere ambient exceeds
+  1.0 for up-facing normals, so the terrain base pass blows out identically.
+- `coverage` — reports the RAW reconstructed coverage (before the
+  `1-(1-A)^1.6` presentation lift) and **skips the dither discard in this mode
+  only**, so the field reads as a continuous coverage map instead of its own
+  stipple. A dense 3-species stand genuinely resolves to ~1 over most of the
+  frame; the structure is at crests, the region edge and the near-camera fade.
+- Fog is applied only when `debug_mode() == DEBUG_OFF`.
+- The normal view divides by the lifted A (unchanged historical behaviour); the
+  debug views divide by the true weight sum so they are not scaled by the lift.
+
+Method-local state the global modes cannot express is a param in this
+manifest, `inspect` (`off`/`bin`/`lod`/`layer`), never a competing global mode:
+
+- `bin` — colour-codes which of the 25 hemi-oct view bins the pixel resolved
+  to. This is the single most useful view for this method: sector boundaries,
+  the stochastic dither between bins and bin popping are all directly visible.
+- `lod` — the distance detail fade (footprint-derived). Shows visible per-quad
+  faceting at grazing angles, because the footprint comes from `dpdx/dpdy` of
+  the ground hit across a coarse proxy quad. Pre-existing, worth a look.
+- `layer` — ground grid (green) vs canopy-top shell (orange); confirms the
+  shell only contributes in the mid-distance band and on crests.
+
+## Audit
+
+Structural pass over pipeline + shader (no ALU micro-optimisation, no
+retuning). Frame times were NOT used — the GPU was shared with other agents.
+
+Found and fixed:
+
+1. **The proxy grid rasterised the whole world out to ~2.1 km even though a
+   stand is a bounded region** (default: ±128 m). Every fragment beyond the
+   region ran the ground-hit refinement, the hemi-oct encode and the 4-entry
+   loop only to hit `edge == 0` and `discard`. `vs_main` now culls a quad
+   (both its triangles, all 6 vertices, so it is crack-free) when the quad's
+   whole footprint is outside the region: ~60% of the 16 384 quads on the
+   default stand, plus every fragment of the distant ground band — at
+   `far-horizon` that band is most of the visible ground. Exactness: for the
+   ground layer `G.xz == world.xz`, so the quad bound is the fragment test; for
+   the top-shell layer `G` only walks FORWARD along the view ray, and for a
+   camera inside the region `‖(1+s)W − sC‖∞ ≥ ‖W‖∞`, so it stays outside too
+   (hence the extra `cam_in` guard — outside-the-region cameras cull the ground
+   layer only). Verified: cull vs no-cull is **byte-identical** on
+   grazing/topdown/far-horizon/inside-plant, on both `default` and
+   `close-quality` (the stand where the cull is most aggressive).
+2. **View-bin selection was recomputed once per species entry.** `i0`, the
+   smoothstepped bin fraction, both `ign()` dither taps, the bilinear weights,
+   the tap count and the nearest-bin index depend only on the view direction
+   and the pixel — never on the entry — but sat inside the 4-iteration entry
+   loop. Hoisted above it; bit-identical output (the diff vs the pre-hoist
+   build was exactly zero pixels).
+3. **The uniform buffer was fully rewritten every frame** including the entry
+   block (tile size, canopy top, sway, density modulation, species slot, mean
+   colour), the shell height and the 25 bin directions — all pure functions of
+   stand + baked meta. Those are now computed and uploaded ONCE in `create()`;
+   `update()` writes only the 12-float header (camera snap + params).
+4. Dead code: `nidx` was computed per entry per fragment and never used.
+5. `loadOrBakeSpecies()` fetched a root-absolute `/mesh/baked/...` URL, which
+   404s under the production base path — now goes through `assetUrl()`
+   (CLAUDE.md rule). Dev behaviour unchanged.
+
+Deliberately left alone:
+
+- **Three separate BTF textures with a 3-way `switch` around every
+  `textureSampleGrad`.** Merging them into one `2d_array` with a per-entry
+  layer base would delete the switch, but it would also collapse the
+  per-species VRAM accounting the HUD budget bar depends on (one texture
+  cannot be attributed to three species). Not obviously a win; left as a
+  suggestion.
+- **Hoisting `wind_sway` out of the entry loop.** It is exactly linear in
+  `sway` (every component scales by it), so one evaluation times `ent.sway`
+  would replace 3–4 — but that is ALU-level, explicitly out of scope, and the
+  multiplication reorder would flip dither-threshold pixels.
+- **Earlier rejection of redundant top-shell fragments.** The `< 2.5 m`
+  redundancy discard already exists but only after two heightfield refinement
+  steps; a conservative per-quad version in the vertex stage is possible but
+  needs care not to punch holes in the sky silhouette, and it cannot be
+  justified without measuring. Suggestion, not a change.
+- **`frag_depth` writes disable early-z**, and the dithered coverage punches
+  depth holes (the CLAUDE.md taste rule). Both are load-bearing for the
+  technique — reconstructed hit depth IS the method, and the dither IS the
+  bin-blend/coverage resolve (see Findings). Changing either is a redesign.
+- The 4-iteration entry loop runs to 4 with a `continue` guard rather than to
+  `entry_count`; the guard skips the work and the default stand uses 3 of 4.
+
+Image equivalence: with `windAmount=0` (which removes every `frame.time` term,
+making the render deterministic) the `off` view before and after the whole
+audit differs by **11 pixels out of 836 400** across grazing/topdown/
+far-horizon — isolated single pixels flipping across the stochastic-alpha
+threshold from float re-association, no structural change. The cull itself is
+byte-exact (proved separately above).
+
 ## Findings
 
+- Bench numbers below are from BEFORE the audit and were not re-run (the GPU
+  was shared during the audit session); the structural fixes only remove work.
 - Bench (apple-metal-3, 1280x800, orbit-low):
   - `results/009-canopy-btf__default__p-8bf7dbf3__apple-metal-3__2026-07-24T16-28-06-648Z.json`
     — canopy-btf p50 **4.82 ms**, p95 5.81 ms (~557k plants).

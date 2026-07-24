@@ -202,6 +202,16 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
     entries: [{ binding: 0, resource: { buffer: carpetUniform } }],
   })
 
+  // Card quad as an INDEXED draw: the two triangles share two corners, so the
+  // post-transform vertex cache shades 4 vertices per instance instead of 6 —
+  // a third fewer runs of the (expensive) placement/thinning vertex stage for
+  // exactly the same triangles.
+  const quadIndices = ctx.res.createBuffer(
+    { label: `${ctx.id}/card-idx`, size: 12, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST },
+    { tag: 'card-idx' },
+  )
+  device.queue.writeBuffer(quadIndices, 0, new Uint16Array([0, 1, 2, 1, 3, 2]))
+
   let cardPipeline!: GPURenderPipeline
   let carpetPipeline!: GPURenderPipeline
   const build = (): void => {
@@ -238,9 +248,10 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
   let totalInstances = 0
   let drawCarpet = false
 
-  // Carpet statistics from the stand + baked meta (recomputed on the fly —
-  // cheap, and meta only exists after the species promise resolved).
-  const carpetStats = (): { colors: number[]; height: number } => {
+  // Carpet mean-field statistics: a pure function of the stand + the baked
+  // per-species meta, both frozen for the lifetime of the experiment. Computed
+  // ONCE here, never per frame.
+  const carpetStats = ((): { colors: number[]; height: number } => {
     const weights = ctx.stand.species.map((e, i) => {
       const meanScale = (e.scaleMin + e.scaleMax) / 2
       return e.density * (entries[i]?.meta.coverTop ?? 0.5) * meanScale * meanScale
@@ -259,21 +270,59 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       height += ((weights[i] ?? 0) / sum) * speciesById(e.species).heightScale * meanScale
     })
     return { colors, height }
+  })()
+
+  // The card uniforms depend only on (params, camera CELL, stand, bake) and the
+  // carpet uniform only on (params, stand, bake) — neither is a per-frame
+  // quantity. Both are rebuilt on change only; a still camera writes nothing.
+  let ringRows: RingRow[] = []
+  let ringKeyR = Number.NaN
+  let ringKeyCount = -1
+  const ensureRingTable = (detailR: number, ringCount: number): void => {
+    if (detailR === ringKeyR && ringCount === ringKeyCount) return
+    const { rows, total } = ringTable(detailR, ringCount)
+    ringRows = rows
+    totalInstances = total
+    ringKeyR = detailR
+    ringKeyCount = ringCount
+  }
+  // [detailRadius, rings, widthCap, densify, stochStart, stochFull, debugRings, camCellX, camCellZ]
+  const cardKey = new Float64Array(9).fill(Number.NaN)
+  const carpetKey = new Float64Array(3).fill(Number.NaN)
+  const keyChanged = (key: Float64Array, next: readonly number[]): boolean => {
+    let dirty = false
+    for (let i = 0; i < key.length; i++) {
+      if (key[i] !== next[i]) {
+        key[i] = next[i]!
+        dirty = true
+      }
+    }
+    return dirty
   }
 
   return {
     update(frame: FrameInfo): void {
       const p = ctx.params
       const ringCount = Math.round(p.rings)
-      const { rows, total } = ringTable(p.detailRadius, ringCount)
-      totalInstances = total
+      ensureRingTable(p.detailRadius, ringCount)
       const camCellX = Math.floor(frame.camera.pose.x / CELL)
       const camCellZ = Math.floor(frame.camera.pose.z / CELL)
 
-      for (let e = 0; e < entries.length; e++) {
-        const entry = entries[e]!
+      if (
+        keyChanged(cardKey, [
+          p.detailRadius,
+          ringCount,
+          p.widthCap,
+          p.densify,
+          p.stochStart,
+          p.stochFull,
+          p.debugRings ? 1 : 0,
+          camCellX,
+          camCellZ,
+        ])
+      ) {
         for (let k = 0; k < MAX_RINGS; k++) {
-          const row = rows[Math.min(k, rows.length - 1)]!
+          const row = ringRows[Math.min(k, ringRows.length - 1)]!
           cardU[k * 4] = row.start
           cardU[k * 4 + 1] = row.n
           cardU[k * 4 + 2] = row.h
@@ -281,36 +330,38 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         }
         cardU[24] = ringCount
         cardU[25] = ctx.seed >>> 0
-        cardU[26] = e
         cardU[27] = p.debugRings ? 1 : 0
         cardI[28] = camCellX
         cardI[29] = camCellZ
         cardF[30] = ctx.stand.radius
         cardF[31] = p.detailRadius
-        cardF[32] = entry.meta.center[0]
-        cardF[33] = entry.meta.center[1]
-        cardF[34] = entry.meta.center[2]
-        cardF[35] = entry.meta.rCard
         cardF[36] = p.widthCap
         cardF[37] = p.densify
         cardF[38] = p.stochStart
         cardF[39] = p.stochFull
-        device.queue.writeBuffer(entry.uniform, 0, cardScratch)
+        for (let e = 0; e < entries.length; e++) {
+          const entry = entries[e]!
+          cardU[26] = e
+          cardF[32] = entry.meta.center[0]
+          cardF[33] = entry.meta.center[1]
+          cardF[34] = entry.meta.center[2]
+          cardF[35] = entry.meta.rCard
+          device.queue.writeBuffer(entry.uniform, 0, cardScratch)
+        }
       }
 
       // Carpet: from where clump amplification saturates to past the horizon.
       const innerR = Math.max(p.widthCap * p.detailRadius * 0.6, 30)
-      const cascadeOuter = N0 * (1 << (ringCount - 1)) * CELL
-      const outerR = Math.max(800, Math.min(3000, ctx.stand.radius * 1.5))
       drawCarpet = p.carpet && ctx.stand.radius * 1.45 > innerR
-      if (drawCarpet) {
-        const { colors, height } = carpetStats()
-        carpetScratch.set(colors, 0)
+      if (drawCarpet && keyChanged(carpetKey, [p.detailRadius, ringCount, p.widthCap])) {
+        const cascadeOuter = N0 * (1 << (ringCount - 1)) * CELL
+        const outerR = Math.max(800, Math.min(3000, ctx.stand.radius * 1.5))
+        carpetScratch.set(carpetStats.colors, 0)
         carpetU[16] = ctx.stand.species.length
         carpetU[17] = ctx.seed >>> 0
         carpetScratch[20] = innerR
         carpetScratch[21] = Math.max(outerR, cascadeOuter)
-        carpetScratch[22] = height * 0.45
+        carpetScratch[22] = carpetStats.height * 0.45
         carpetScratch[23] = ctx.stand.radius
         carpetScratch[24] = p.widthCap * p.detailRadius * 0.9 // fade band
         device.queue.writeBuffer(carpetUniform, 0, carpetScratch)
@@ -323,15 +374,20 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         depthStencilAttachment: { view: targets.depthView, depthLoadOp: 'load', depthStoreOp: 'store' },
       })
       pass.setBindGroup(0, ctx.frame.bindGroup)
+      // Cards first, carpet last. Both are depth-tested opaque (alpha test, no
+      // blending), so order cannot change the image — but the near card layer
+      // is a solid occluder, and drawing it first lets early-z reject the
+      // carpet fragments hidden behind it instead of shading them.
+      pass.setPipeline(cardPipeline)
+      pass.setIndexBuffer(quadIndices, 'uint16')
+      for (const entry of entries) {
+        pass.setBindGroup(1, entry.bindGroup)
+        pass.drawIndexed(6, totalInstances)
+      }
       if (drawCarpet) {
         pass.setPipeline(carpetPipeline)
         pass.setBindGroup(1, carpetBindGroup)
         pass.draw(96 * 20 * 6)
-      }
-      pass.setPipeline(cardPipeline)
-      for (const entry of entries) {
-        pass.setBindGroup(1, entry.bindGroup)
-        pass.draw(6, totalInstances)
       }
       pass.end()
     },

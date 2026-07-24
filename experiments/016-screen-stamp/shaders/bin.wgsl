@@ -1,11 +1,11 @@
 #include "src/wgsl/scatter.wgsl"
 #include "src/wgsl/wind.wgsl"
 
-// SCREEN-TILE BINNING — the inverted loop. One workgroup per 16x16 screen
+// SCREEN-TILE BINNING — the inverted loop. One workgroup per 16x8 screen
 // tile. Instead of iterating plants and projecting them to the screen, each
 // tile works out which plants project INTO IT:
 //
-//   1. reduce the tile's 256 scene-depth texels -> visible-ground cell bbox,
+//   1. reduce the tile's 128 scene-depth texels -> visible-ground cell bbox,
 //      max ground distance, sky presence (the terrain base pass has already
 //      written depth, so the depth buffer IS the tile->world footprint map);
 //   2. pick a strategy per tile:
@@ -39,13 +39,12 @@ const WG_SIZE: u32 = 128u;
 const MAX_COLUMNS: u32 = 30u;
 const GRID_F: f32 = 10.0;          // hemi-octa atlas grid (bake.ts GRID)
 const MAX_PLANT_H: f32 = 2.2;      // conservative world-space plant height
-const R_SLACK: f32 = 0.45;         // sway + quantization slack on radii
 const ENUM_MAX_DIM: i32 = 4;       // bbox cell span allowed for enumerate mode
 const TWO_PI_S: f32 = 6.2831853;
 
 struct StampParams {
   dims: vec4u,                 // x,y unused, z = seed, w = entry_count
-  tuning: vec4f,               // x = max_dist, y = tint_strength, z = debug, w unused
+  tuning: vec4f,               // x = max_dist, y = tint_strength, z = tile overlay, w unused
   entry_meta: array<vec4f, 4>, // impostor local center.xyz, bounding radius
   entry_info: array<vec4f, 4>, // species average albedo rgb, pad
 }
@@ -53,11 +52,21 @@ struct StampParams {
 @group(1) @binding(1) var<storage, read_write> tile_lists: array<u32>;
 @group(1) @binding(2) var scene_depth: texture_depth_2d;
 
+// Everything that is workgroup-uniform for the tile: the depth reduction AND
+// the tile frustum. Both are computed ONCE by thread 0 and broadcast through
+// a single workgroupUniformLoad (which barriers before and after the load),
+// instead of 128 threads each redoing four inv_view_proj unprojections and
+// four plane normals for the same tile.
 struct Reduced {
   sky: u32,
   ground_far: f32,
   cmin: vec2i,
   cmax: vec2i,
+  center_ray: vec3f,
+  plane0: vec3f,
+  plane1: vec3f,
+  plane2: vec3f,
+  plane3: vec3f,
 }
 
 var<workgroup> wg_count: atomic<u32>;
@@ -180,6 +189,13 @@ fn try_plant(cell: vec2i, entry_index: u32, slot: u32) {
 // Cooperatively test every scatter slot of one cell (cell-level sphere cull
 // first — evaluated redundantly per thread, SIMD-coherent, no barriers).
 fn process_cell(cell: vec2i) {
+  // The list is full: try_plant() can only atomicAdd past MAX_LIST and throw
+  // the result away, so stop evaluating scatter slots entirely. wg_count only
+  // grows, so once any thread sees it full no thread can append again — the
+  // accepted set is bit-identical to running on. Without this, an enumerate
+  // tile (close-up / top-down) keeps grinding all ~36 footprint cells x 384
+  // slots even though a single 4m cell already overfills the 64-entry list.
+  if (atomicLoad(&wg_count) >= MAX_LIST) { return; }
   let cc = (vec2f(cell) + 0.5) * SCATTER_CELL_SIZE;
   let ty = terrain_height(cc);
   let csph = vec3f(cc.x, ty + MAX_PLANT_H * 0.5, cc.y) - frame.camera_pos;
@@ -245,28 +261,34 @@ fn cs_bin(@builtin(workgroup_id) wg_id: vec3u, @builtin(local_invocation_index) 
     wg_red.ground_far = bitcast<f32>(atomicLoad(&wg_far_bits));
     wg_red.cmin = vec2i(atomicLoad(&wg_cmin_x), atomicLoad(&wg_cmin_z));
     wg_red.cmax = vec2i(atomicLoad(&wg_cmax_x), atomicLoad(&wg_cmax_z));
+    // Tile frustum — four corner rays + four inward plane normals. Depends
+    // only on workgroup_id and the frame uniform, so one thread does it.
+    let x0 = f32(tile_xy.x * TILE_W);
+    let y0 = f32(tile_xy.y * TILE_H);
+    let x1 = x0 + f32(TILE_W);
+    let y1 = y0 + f32(TILE_H);
+    let r_tl = pixel_ray(vec2f(x0, y0));
+    let r_tr = pixel_ray(vec2f(x1, y0));
+    let r_br = pixel_ray(vec2f(x1, y1));
+    let r_bl = pixel_ray(vec2f(x0, y1));
+    let cray = normalize(r_tl + r_tr + r_br + r_bl);
+    wg_red.center_ray = cray;
+    wg_red.plane0 = plane_n(r_tl, r_bl, cray);
+    wg_red.plane1 = plane_n(r_tr, r_tl, cray);
+    wg_red.plane2 = plane_n(r_br, r_tr, cray);
+    wg_red.plane3 = plane_n(r_bl, r_br, cray);
   }
-  let red = workgroupUniformLoad(&wg_red);
-
-  // --- tile frustum (redundant per thread; all inputs are wg-uniform) ---
-  let x0 = f32(tile_xy.x * TILE_W);
-  let y0 = f32(tile_xy.y * TILE_H);
-  let x1 = x0 + f32(TILE_W);
-  let y1 = y0 + f32(TILE_H);
   // NOTE: uniformity-critical values (mode, bin_limit, center_ray) are
   // function-scope lets derived only from workgroup_id, uniforms and
   // workgroupUniformLoad results, so the barriers below validate. The
   // g_* privates only feed the barrier-free helper functions.
-  let r_tl = pixel_ray(vec2f(x0, y0));
-  let r_tr = pixel_ray(vec2f(x1, y0));
-  let r_br = pixel_ray(vec2f(x1, y1));
-  let r_bl = pixel_ray(vec2f(x0, y1));
-  let center_ray = normalize(r_tl + r_tr + r_br + r_bl);
+  let red = workgroupUniformLoad(&wg_red);
+  let center_ray = red.center_ray;
   g_center_ray = center_ray;
-  g_planes[0] = plane_n(r_tl, r_bl, center_ray);
-  g_planes[1] = plane_n(r_tr, r_tl, center_ray);
-  g_planes[2] = plane_n(r_br, r_tr, center_ray);
-  g_planes[3] = plane_n(r_bl, r_br, center_ray);
+  g_planes[0] = red.plane0;
+  g_planes[1] = red.plane1;
+  g_planes[2] = red.plane2;
+  g_planes[3] = red.plane3;
 
   // --- 2. strategy ---
   let has_ground = red.cmax.x >= red.cmin.x;

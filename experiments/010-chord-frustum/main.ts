@@ -2,7 +2,14 @@ import cullSrc from './shaders/cull.wgsl'
 import renderSrc from './shaders/render.wgsl'
 import { bakeChordField } from './bake.ts'
 import { ATLAS_H, ATLAS_W, unpackChordField, type ChordField } from './chords.ts'
-import { bakedArtifact, commitBake, speciesById, SCATTER_CELL_SIZE } from '@harness'
+import {
+  bakedArtifact,
+  commitBake,
+  speciesById,
+  SCATTER_CELL_SIZE,
+  SCATTER_MAX_DENSITY,
+  SCATTER_MAX_PER_CELL,
+} from '@harness'
 import type { Experiment, ExperimentContext, FrameInfo, ViewTargets } from '@harness'
 import type { PARAMS } from './manifest.ts'
 
@@ -17,7 +24,28 @@ import type { PARAMS } from './manifest.ts'
 
 const BAKE_VERSION = 6
 const MAX_REGION_RADIUS = 80
-const VERTS_PER_PROXY = 96
+
+/**
+ * The 8-sided frustum proxy: 32 triangles over 18 DISTINCT vertices — 8
+ * bottom-ring, 8 top-ring, then the top- and bottom-cap fan centers. Drawing
+ * it non-indexed would shade every vertex 5.3x over. Winding is CCW-outward
+ * (the pipeline culls front faces, keeping the proxy's far side). Must match
+ * the vertex_index decode in shaders/render.wgsl.
+ */
+const PROXY_INDICES: Uint16Array<ArrayBuffer> = (() => {
+  const idx: number[] = []
+  const bottom = (i: number): number => i % 8
+  const top = (i: number): number => 8 + (i % 8)
+  const TOP_CENTER = 16
+  const BOTTOM_CENTER = 17
+  for (let q = 0; q < 8; q++) {
+    idx.push(bottom(q), top(q), bottom(q + 1))
+    idx.push(bottom(q + 1), top(q), top(q + 1))
+  }
+  for (let t = 0; t < 8; t++) idx.push(TOP_CENTER, top(t + 1), top(t))
+  for (let t = 0; t < 8; t++) idx.push(BOTTOM_CENTER, bottom(t), bottom(t + 1))
+  return new Uint16Array(idx)
+})()
 
 interface SpeciesGpu {
   field: ChordField
@@ -118,11 +146,25 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
   })
 
   const maxSide = Math.ceil((2 * MAX_REGION_RADIUS) / SCATTER_CELL_SIZE) + 1
-  const instanceCap = maxSide * maxSide * 128
+  const maxSlots = maxSide * maxSide * SCATTER_MAX_PER_CELL
+
+  const indexBuf = ctx.res.createBuffer(
+    { label: `${ctx.id}/proxy-idx`, size: PROXY_INDICES.byteLength, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST },
+    { tag: 'proxy-index' },
+  )
+  device.queue.writeBuffer(indexBuf, 0, PROXY_INDICES)
 
   const entries: EntryGpu[] = await Promise.all(
     ctx.stand.species.map(async (e, entryIndex): Promise<EntryGpu> => {
       const gpu = await loadSpecies(e.species)
+      // The instance list only ever holds slots that EXIST, and a slot exists
+      // with probability density/SCATTER_MAX_DENSITY — sizing it for "every
+      // one of the 128 candidate slots per cell survives" wastes 2-3x the
+      // biggest buffer in the budget. Over ~2e5 Bernoulli slots the count is
+      // within a few hundred of its mean, so mean + 15% + 4k is unreachable
+      // (and the cull shader drops overflow gracefully anyway).
+      const slotFrac = Math.min(e.density, SCATTER_MAX_DENSITY) / SCATTER_MAX_DENSITY
+      const instanceCap = Math.ceil(maxSlots * slotFrac * 1.15) + 4096
       const infoBuf = ctx.res.createBuffer(
         { label: `${ctx.id}/info-${entryIndex}`, size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST },
         { species: e.species, tag: 'info' },
@@ -138,7 +180,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       const indirectBuf = ctx.res.createBuffer(
         {
           label: `${ctx.id}/indirect-${entryIndex}`,
-          size: 16,
+          size: 32, // draw-indexed-indirect args (20B), rounded up
           usage: GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST,
         },
         { species: e.species, tag: 'indirect' },
@@ -193,8 +235,44 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
 
   const infoData = new Float32Array(16)
   const cullData = new Float32Array(12)
-  const indirectReset = new Uint32Array([VERTS_PER_PROXY, 0, 0, 0])
+  // indexCount, instanceCount, firstIndex, baseVertex, firstInstance
+  const indirectReset = new Uint32Array([PROXY_INDICES.length, 0, 0, 0, 0])
+  const cellMin = Math.floor(-ctx.stand.radius / SCATTER_CELL_SIZE)
+  const cellMax = Math.floor(ctx.stand.radius / SCATTER_CELL_SIZE)
   let side = 1
+  // The render uniform holds the baked frustum fit + params ONLY — nothing in
+  // it varies per frame, so it is uploaded at init and on param changes. The
+  // cull uniform additionally carries the region's corner cell, which changes
+  // only when the camera crosses a 4m cell boundary.
+  let paramsDirty = true
+  let lastOriginX = NaN
+  let lastOriginZ = NaN
+
+  const writeInfo = (R: number): void => {
+    for (const entry of entries) {
+      const f = entry.gpu.field.fit
+      infoData[0] = f.r0; infoData[1] = f.r1; infoData[2] = f.h; infoData[3] = f.sideLen
+      infoData[4] = f.capB; infoData[5] = f.capT; infoData[6] = f.axisY; infoData[7] = R
+      infoData[8] = f.axisX; infoData[9] = f.axisZ; infoData[10] = ctx.params.coverage
+      infoData[11] = ctx.params.entrySmooth ? 1 : 0
+      infoData[12] = entry.entryIndex
+      infoData[13] = ctx.params.debugChart ? 1 : 0
+      infoData[14] = f.rb; infoData[15] = 0
+      device.queue.writeBuffer(entry.infoBuf, 0, infoData)
+    }
+  }
+
+  const writeCull = (R: number, originCellX: number, originCellZ: number): void => {
+    for (const entry of entries) {
+      const f = entry.gpu.field.fit
+      const cullRad = f.rb + Math.hypot(f.axisX, f.axisZ)
+      cullData[0] = originCellX; cullData[1] = originCellZ; cullData[2] = side; cullData[3] = ctx.seed
+      cullData[4] = entry.entryIndex; cullData[5] = R; cullData[6] = cullRad
+      cullData[7] = cellMin; cullData[8] = cellMax
+      cullData[9] = 0; cullData[10] = 0; cullData[11] = 0
+      device.queue.writeBuffer(entry.cullBuf, 0, cullData)
+    }
+  }
 
   return {
     update(frame: FrameInfo): void {
@@ -203,33 +281,27 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       const originCellX = Math.floor((cam.x - R) / SCATTER_CELL_SIZE)
       const originCellZ = Math.floor((cam.z - R) / SCATTER_CELL_SIZE)
       side = Math.max(1, Math.ceil((2 * R) / SCATTER_CELL_SIZE) + 1)
-      const cellMin = Math.floor(-ctx.stand.radius / SCATTER_CELL_SIZE)
-      const cellMax = Math.floor(ctx.stand.radius / SCATTER_CELL_SIZE)
 
-      for (const entry of entries) {
-        const f = entry.gpu.field.fit
-        infoData[0] = f.r0; infoData[1] = f.r1; infoData[2] = f.h; infoData[3] = f.sideLen
-        infoData[4] = f.capB; infoData[5] = f.capT; infoData[6] = f.axisY; infoData[7] = R
-        infoData[8] = f.axisX; infoData[9] = f.axisZ; infoData[10] = ctx.params.coverage
-        infoData[11] = ctx.params.entrySmooth ? 1 : 0
-        infoData[12] = entry.entryIndex
-        infoData[13] = ctx.params.debugChart ? 1 : 0
-        infoData[14] = f.rb; infoData[15] = 0
-        device.queue.writeBuffer(entry.infoBuf, 0, infoData)
-
-        const cullRad = f.rb + Math.hypot(f.axisX, f.axisZ)
-        cullData[0] = originCellX; cullData[1] = originCellZ; cullData[2] = side; cullData[3] = ctx.seed
-        cullData[4] = entry.entryIndex; cullData[5] = R; cullData[6] = cullRad
-        cullData[7] = cellMin; cullData[8] = cellMax
-        cullData[9] = 0; cullData[10] = 0; cullData[11] = 0
-        device.queue.writeBuffer(entry.cullBuf, 0, cullData)
-        device.queue.writeBuffer(entry.indirectBuf, 0, indirectReset)
+      if (paramsDirty) writeInfo(R)
+      if (paramsDirty || originCellX !== lastOriginX || originCellZ !== lastOriginZ) {
+        writeCull(R, originCellX, originCellZ)
+        lastOriginX = originCellX
+        lastOriginZ = originCellZ
       }
+      paramsDirty = false
+
+      // Only the indirect counter genuinely changes every frame.
+      for (const entry of entries) device.queue.writeBuffer(entry.indirectBuf, 0, indirectReset)
+    },
+
+    onParamsChanged(): void {
+      paramsDirty = true
     },
 
     encode(enc: GPUCommandEncoder, _frame: FrameInfo, targets: ViewTargets): void {
-      const threads = side * side * 128
-      const groups = Math.ceil(threads / 64)
+      // One thread per candidate scatter slot of the camera-bounded region —
+      // bounded by regionRadius, never by the stand's plant count.
+      const groups = Math.ceil((side * side * SCATTER_MAX_PER_CELL) / 64)
 
       const cpass = ctx.timing.computePass(enc, 'cull')
       cpass.setPipeline(cullPipeline)
@@ -246,9 +318,10 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       })
       pass.setPipeline(renderPipeline)
       pass.setBindGroup(0, ctx.frame.bindGroup)
+      pass.setIndexBuffer(indexBuf, 'uint16')
       for (const entry of entries) {
         pass.setBindGroup(1, entry.renderBg)
-        pass.drawIndirect(entry.indirectBuf, 0)
+        pass.drawIndexedIndirect(entry.indirectBuf, 0)
       }
       pass.end()
     },

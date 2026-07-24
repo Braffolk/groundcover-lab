@@ -167,8 +167,13 @@ fn oct_nrm_encode(n: vec3f) -> vec2f {
   return vec2f(px, pz);
 }
 
-fn rot_y(v: vec3f, a: f32) -> vec3f {
-  let c = cos(a);
-  let s = sin(a);
+// Yaw rotation with the sin/cos supplied by the caller. The fragment stage
+// only ever rotates by a PER-INSTANCE yaw, so the transcendentals are
+// evaluated once in the vertex stage and passed down flat.
+fn rot_y_cs(v: vec3f, c: f32, s: f32) -> vec3f {
   return vec3f(c * v.x + s * v.z, v.y, -s * v.x + c * v.z);
+}
+
+fn rot_y(v: vec3f, a: f32) -> vec3f {
+  return rot_y_cs(v, cos(a), sin(a));
 }

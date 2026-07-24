@@ -298,12 +298,25 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
     return res
   }
 
+  // The uniform holds seed, entry count, per-species impostor meta and the
+  // three params — nothing that varies per frame. Upload only when a param
+  // actually changes instead of re-writing 160 constant bytes every frame.
+  const TILE_VIEWS = ['off', 'fill', 'mode'] as const
+  let uniDirty = true
+
   return {
     update(_frame: FrameInfo): void {
-      uniF32[4] = ctx.params.maxDist
-      uniF32[5] = ctx.params.tintStrength
-      uniF32[6] = ctx.params.debugTiles ? 1 : 0
-      device.queue.writeBuffer(uniBuf, 0, uniData)
+      const tileView = TILE_VIEWS.indexOf(ctx.params.tileView)
+      if (uniF32[4] !== ctx.params.maxDist || uniF32[5] !== ctx.params.tintStrength || uniF32[6] !== tileView) {
+        uniF32[4] = ctx.params.maxDist
+        uniF32[5] = ctx.params.tintStrength
+        uniF32[6] = tileView
+        uniDirty = true
+      }
+      if (uniDirty) {
+        device.queue.writeBuffer(uniBuf, 0, uniData)
+        uniDirty = false
+      }
     },
 
     encode(enc: GPUCommandEncoder, _frame: FrameInfo, targets: ViewTargets): void {

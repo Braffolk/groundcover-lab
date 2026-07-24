@@ -18,8 +18,14 @@ export const PARAMS = {
    */
   reliefMode: p.enum('secant-3tap', ['flat-1tap', 'linear-2tap', 'secant-3tap'] as const),
   /** View-cell selection: per-pixel stochastic (dithered bilinear) or nearest. */
-  viewSelect: p.enum('stochastic', ['stochastic', 'nearest'] as const),
-  debugView: p.enum('lit', ['lit', 'albedo', 'normal', 'height'] as const),
+  viewSelect: p.enum('nearest', ['stochastic', 'nearest'] as const),
+  /**
+   * Method-specific inspector (albedo/normals/lighting/coverage/depth are the
+   * harness-global `view` selector — this only shows state unique to relief):
+   * height    = the solved hit's relief height along the capture axis,
+   * view-cell = which of the 25 baked views each pixel sampled.
+   */
+  inspect: p.enum('off', ['off', 'height', 'view-cell'] as const),
 }
 
 export default defineExperiment({

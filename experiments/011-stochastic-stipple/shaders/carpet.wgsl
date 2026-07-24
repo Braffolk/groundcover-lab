@@ -2,6 +2,7 @@
 #include "src/wgsl/terrain.wgsl"
 #include "src/wgsl/wind.wgsl"
 #include "src/wgsl/lighting.wgsl"
+#include "src/wgsl/debug.wgsl"
 
 // Mean-field carpet: beyond the point where clump amplification saturates,
 // the ensemble collapses to its first-order statistics — a terrain-following
@@ -91,7 +92,13 @@ fn fs_main(in: VOut) -> @location(0) vec4f {
   let shimmer = 1.0 + 0.06 * frame.wind_strength * wind_gust(frame.time)
     * sin(along * 0.35 - frame.time * 1.9);
 
-  var color = light_surface(tint * 0.9 * shimmer, n, in.world);
-  color = apply_fog(color, in.world);
-  return vec4f(color, 1.0);
+  let albedo = tint * 0.9 * shimmer;
+  var color = light_surface(albedo, n, in.world);
+  // Fog only in the normal view — debug views stay unfogged and honest.
+  if (debug_mode() == DEBUG_OFF) {
+    color = apply_fog(color, in.world);
+  }
+  // Coverage view shows the carpet's dissolve-in ramp (its fractional
+  // presence), which is exactly what the hashed patch test realizes.
+  return vec4f(debug_shade(color, albedo, n, ramp, in.world), 1.0);
 }

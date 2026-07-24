@@ -1,6 +1,7 @@
 #include "src/wgsl/scatter.wgsl"
 #include "src/wgsl/wind.wgsl"
 #include "src/wgsl/lighting.wgsl"
+#include "src/wgsl/debug.wgsl"
 
 // Stochastic thinning cascade. Placement is evaluated procedurally with the
 // shared scatter twin over concentric cell annuli around the camera. A plant
@@ -38,14 +39,18 @@ struct CardUni {
 @group(1) @binding(2) var atlas_normal: texture_2d<f32>;
 @group(1) @binding(3) var atlas_samp: sampler;
 
+// Everything the fragment stage needs that is CONSTANT over the card is
+// resolved here in the vertex stage and carried flat: yaw's sin/cos, the
+// densify exponent (from the width amplification) and the stochastic-blend
+// factor (from distance). The FS never re-derives them per pixel.
 struct VOut {
   @builtin(position) pos: vec4f,
   @location(0) uv: vec2f,                          // card uv, v up
   @location(1) world: vec3f,
   @location(2) @interpolate(flat) pid: u32,        // stable per-plant hash
-  @location(3) @interpolate(flat) yad: vec4f,      // yaw, amp, dist, vf (azimuth view coord)
+  @location(3) @interpolate(flat) yaw_gs: vec4f,   // cos(yaw), sin(yaw), gamma, sigma
   @location(4) @interpolate(flat) axes: vec4f,     // right.xz, up2.xz (top-view mapping)
-  @location(5) @interpolate(flat) ktop: f32,
+  @location(5) @interpolate(flat) top_vf: vec2f,   // top-view weight, azimuth view coord
   @location(6) @interpolate(flat) ring_id: u32,
 }
 
@@ -142,9 +147,9 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
   right = select(right / max(rl, 1e-5), vec3f(1.0, 0.0, 0.0), rl < 1e-3);
   let up2 = cross(fwd, right);
 
-  var corners = array<vec2f, 6>(
-    vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(-1.0, 1.0),
-    vec2f(1.0, -1.0), vec2f(1.0, 1.0), vec2f(-1.0, 1.0),
+  // 4 unique corners, indexed 0,1,2, 1,3,2 by the card index buffer.
+  var corners = array<vec2f, 4>(
+    vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(-1.0, 1.0), vec2f(1.0, 1.0),
   );
   let c = corners[vi];
   let half_size = card_uni.r_card * scale;
@@ -164,9 +169,13 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
   out.pid = eh;
   var vf = (atan2(fwd.z, fwd.x) - sp.yaw) * 1.2732395; // / (pi/4)
   vf = vf - 8.0 * floor(vf / 8.0);
-  out.yad = vec4f(sp.yaw, amp, d, vf);
+  // Per-card constants: densify exponent (a card standing in for 1/keep
+  // plants) and the hard->hashed alpha-test blend factor.
+  let gamma = 1.0 + (amp - 1.0) * card_uni.densify;
+  let sigma = smoothstep(card_uni.stoch_start, card_uni.stoch_full, d);
+  out.yaw_gs = vec4f(cyaw, syaw, gamma, sigma);
   out.axes = vec4f(right.x, right.z, up2.x, up2.z);
-  out.ktop = smoothstep(0.30, 0.95, fwd.y);
+  out.top_vf = vec2f(smoothstep(0.30, 0.95, fwd.y), vf);
   out.ring_id = r;
   return out;
 }
@@ -184,33 +193,36 @@ fn tap_normal(idx: u32, uvl: vec2f, gx: vec2f, gy: vec2f) -> vec4f {
   return textureSampleGrad(atlas_normal, atlas_samp, tile_uv(idx, uvl), gx, gy);
 }
 
+/// Map the card plane into the plant-local top frame (foreshortened by the
+/// projected card axes, de-rotated by yaw). Only evaluated inside the flat
+/// `top_vf.x > 0` branch, so it costs nothing at grazing angles.
+fn top_uv(uv_t: vec2f, axes: vec4f, cy: f32, sy: f32) -> vec2f {
+  let q = uv_t - 0.5;
+  let wxz = axes.xy * q.x - axes.zw * q.y;
+  return vec2f(cy * wxz.x + sy * wxz.y, -sy * wxz.x + cy * wxz.y) + 0.5;
+}
+
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4f {
-  let yaw = in.yad.x;
-  let amp = in.yad.y;
-  let dist = in.yad.z;
+  let cy = in.yaw_gs.x;
+  let sy = in.yaw_gs.y;
+  let gamma = in.yaw_gs.z;
+  let sigma = in.yaw_gs.w;
+  let ktop = in.top_vf.x;
 
   let uv_t = vec2f(in.uv.x, 1.0 - in.uv.y);
   let gx = dpdx(uv_t) / 3.0;
   let gy = dpdy(uv_t) / 3.0;
 
-  // Two nearest azimuth views, then the top view by elevation.
-  let i0 = u32(floor(in.yad.w)) % 8u;
+  // Two nearest azimuth views, then the top view by elevation. Coverage is
+  // resolved from the ALBEDO atlas alone — the normal atlas is only fetched
+  // for fragments that survive both alpha tests.
+  let i0 = u32(floor(in.top_vf.y)) % 8u;
   let i1 = (i0 + 1u) % 8u;
-  let t = fract(in.yad.w);
+  let t = fract(in.top_vf.y);
   var alb = mix(tap_albedo(i0, uv_t, gx, gy), tap_albedo(i1, uv_t, gx, gy), t);
-  var nrm = mix(tap_normal(i0, uv_t, gx, gy), tap_normal(i1, uv_t, gx, gy), t);
-  if (in.ktop > 0.004) {
-    // Map the card plane into the plant-local top frame (foreshortened by
-    // the projected card axes, de-rotated by yaw).
-    let q = uv_t - 0.5;
-    let wxz = in.axes.xy * q.x - in.axes.zw * q.y;
-    let cy = cos(yaw);
-    let sy = sin(yaw);
-    let l = vec2f(cy * wxz.x + sy * wxz.y, -sy * wxz.x + cy * wxz.y);
-    let uv_top = l + 0.5;
-    alb = mix(alb, tap_albedo(8u, uv_top, gx, gy), in.ktop);
-    nrm = mix(nrm, tap_normal(8u, uv_top, gx, gy), in.ktop);
+  if (ktop > 0.004) {
+    alb = mix(alb, tap_albedo(8u, top_uv(uv_t, in.axes, cy, sy), gx, gy), ktop);
   }
 
   let a = alb.a;
@@ -219,34 +231,39 @@ fn fs_main(in: VOut) -> @location(0) vec4f {
   // Opacity as statistics: densify amplified clumps (a card standing in for
   // 1/keep plants raises its interior coverage like independent overlap
   // would), then realize the fractional coverage with a stable hashed test.
-  let gamma = 1.0 + (amp - 1.0) * card_uni.densify;
   let a_eff = 1.0 - pow(1.0 - min(a, 0.995), gamma);
   let px = vec2u(clamp(uv_t, vec2f(0.0), vec2f(0.999)) * 128.0);
   let xi = hash_f32(hash3(in.pid, px.x, px.y));
-  let sigma = smoothstep(card_uni.stoch_start, card_uni.stoch_full, dist);
   let tau = mix(0.5, mix(0.03, 0.97, xi), sigma);
   if (a_eff < tau) { discard; }
+
+  var nrm = mix(tap_normal(i0, uv_t, gx, gy), tap_normal(i1, uv_t, gx, gy), t);
+  if (ktop > 0.004) {
+    nrm = mix(nrm, tap_normal(8u, top_uv(uv_t, in.axes, cy, sy), gx, gy), ktop);
+  }
 
   let mean_rgb = alb.rgb / a; // un-premultiply: mean radiance of covered area
   var n_l = nrm.rgb / max(nrm.a, 0.01) * 2.0 - 1.0;
   n_l = select(n_l, vec3f(0.0, 1.0, 0.0), dot(n_l, n_l) < 1e-4);
   n_l = normalize(n_l);
-  let cyw = cos(yaw);
-  let syw = sin(yaw);
-  let n_w0 = vec3f(cyw * n_l.x - syw * n_l.z, n_l.y, syw * n_l.x + cyw * n_l.z);
+  let n_w0 = vec3f(cy * n_l.x - sy * n_l.z, n_l.y, sy * n_l.x + cy * n_l.z);
   // Far cards drift toward the statistical canopy normal (up-dominated).
   let n_w = normalize(mix(n_w0, vec3f(0.0, 1.0, 0.0), 0.25 * sigma));
 
-  let ao = 0.62 + 0.38 * in.uv.y;
-  var color = light_surface(mean_rgb * ao, n_w, in.world);
-  color = apply_fog(color, in.world);
+  let albedo = mean_rgb * (0.62 + 0.38 * in.uv.y); // vertical card AO
+  var color = light_surface(albedo, n_w, in.world);
 
-  if (card_uni.debug_rings == 1u) {
-    var ring_tints = array<vec3f, 6>(
-      vec3f(1.0, 0.2, 0.2), vec3f(1.0, 1.0, 0.2), vec3f(0.2, 1.0, 0.2),
-      vec3f(0.2, 0.6, 1.0), vec3f(0.8, 0.2, 1.0), vec3f(1.0, 1.0, 1.0),
-    );
-    color = mix(color, ring_tints[in.ring_id], 0.55);
+  // Fog and the ring tint only in the normal view — debug views stay honest.
+  if (debug_mode() == DEBUG_OFF) {
+    color = apply_fog(color, in.world);
+    if (card_uni.debug_rings == 1u) {
+      var ring_tints = array<vec3f, 6>(
+        vec3f(1.0, 0.2, 0.2), vec3f(1.0, 1.0, 0.2), vec3f(0.2, 1.0, 0.2),
+        vec3f(0.2, 0.6, 1.0), vec3f(0.8, 0.2, 1.0), vec3f(1.0, 1.0, 1.0),
+      );
+      color = mix(color, ring_tints[in.ring_id], 0.55);
+    }
   }
-  return vec4f(color, 1.0);
+  // Coverage view shows the densified statistic the hashed test realizes.
+  return vec4f(debug_shade(color, albedo, n_w, a_eff, in.world), 1.0);
 }

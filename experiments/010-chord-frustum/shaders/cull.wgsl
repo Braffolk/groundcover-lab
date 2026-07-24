@@ -25,10 +25,12 @@ struct PlantInst {
   scale_phase: vec4f,
 }
 
+// draw-indexed-indirect args (the proxy is an indexed 18-vertex mesh).
 struct DrawArgs {
-  vertex_count: u32,
+  index_count: u32,
   instance_count: atomic<u32>,
-  first_vertex: u32,
+  first_index: u32,
+  base_vertex: i32,
   first_instance: u32,
 }
 

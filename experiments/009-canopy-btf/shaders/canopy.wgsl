@@ -2,6 +2,7 @@
 #include "src/wgsl/wind.wgsl"
 #include "src/wgsl/lighting.wgsl"
 #include "src/wgsl/hash.wgsl"
+#include "src/wgsl/debug.wgsl"
 
 // Canopy BTF runtime. The scene's groundcover is drawn as ONE plant-count-free
 // proxy: a camera-centred terrain-following grid rasterised twice (ground
@@ -45,7 +46,7 @@ struct U {
   wind_amount: f32,
   coverage: f32,
   macro_tint: f32,
-  _pad0: f32,
+  inspect: f32, // method-local inspect view (manifest param), 0 = off
   entries: array<EntryU, 4>,
   bin_dirs: array<vec4f, 32>,
 }
@@ -98,14 +99,20 @@ fn sample_b(si: u32, uv: vec2f, gx: vec2f, gy: vec2f) -> vec4f {
 }
 
 // Non-linear grid spacing: 1:1 for the inner INNER_CELLS, exponential beyond,
-// reaching ~1.3 km at the grid edge (past fog saturation, inside the far
-// plane). Per-frame vertex count is constant regardless of plant count.
+// reaching ~2.1 km at the grid edge (past fog saturation, inside the far
+// plane). Per-frame vertex count is constant regardless of plant count, and
+// quads beyond the stand region never reach the rasteriser (see vs_main).
 fn grid_offset(i: f32) -> f32 {
   let x = i - u.cells * 0.5;
   let a = abs(x);
   let inner = min(a, INNER_CELLS);
   let outer = max(a - INNER_CELLS, 0.0);
   return sign(x) * u.spacing * inner * pow(1.115, outer);
+}
+
+// Smallest |v| over the interval [a,b] (grid_offset is monotone, so a <= b).
+fn min_abs_span(a: f32, b: f32) -> f32 {
+  return select(min(abs(a), abs(b)), 0.0, a <= 0.0 && b >= 0.0);
 }
 
 // --- vertex ----------------------------------------------------------------
@@ -128,14 +135,36 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) layer: u32) 
     vec2u(1u, 0u), vec2u(1u, 1u), vec2u(0u, 1u),
   );
   let c = co[corner];
-  let x = u.snap.x + grid_offset(f32(cx + c.x));
-  let z = u.snap.y + grid_offset(f32(cz + c.y));
-  let y = terrain_height(vec2f(x, z)) + select(0.02, u.shell_top, layer == 1u);
+  let x0 = u.snap.x + grid_offset(f32(cx));
+  let x1 = u.snap.x + grid_offset(f32(cx + 1u));
+  let z0 = u.snap.y + grid_offset(f32(cz));
+  let z1 = u.snap.y + grid_offset(f32(cz + 1u));
 
   var out: VOut;
+  out.layer = f32(layer);
+
+  // Region cull, whole-quad and therefore crack-free: the fragment shader's
+  // `edge` term is exactly 0 once max(|G.x|,|G.z|) >= u.region, and every such
+  // fragment discards. The grid reaches ~2 km but a stand is typically +-128 m,
+  // so this drops ~60% of the quads AND all their fragments — the entire
+  // distant ground plane that used to be rasterised only to be discarded.
+  // Ground layer: G.xz == world.xz, so the quad bound is exact.
+  // Top-shell layer: G walks FORWARD along the view ray, and for a camera
+  // inside the region ||(1+s)W - sC||inf >= ||W||inf, so it stays outside too.
+  let cam_in = max(abs(frame.camera_pos.x), abs(frame.camera_pos.z)) <= u.region;
+  let quad_region = max(min_abs_span(x0, x1), min_abs_span(z0, z1));
+  if (quad_region >= u.region && (layer == 0u || cam_in)) {
+    out.world = vec3f(0.0);
+    out.pos = vec4f(0.0, 0.0, -1.0, 1.0); // behind the near plane -> clipped
+    return out;
+  }
+
+  let x = select(x0, x1, c.x == 1u);
+  let z = select(z0, z1, c.y == 1u);
+  let y = terrain_height(vec2f(x, z)) + select(0.02, u.shell_top, layer == 1u);
+
   out.world = vec3f(x, y, z);
   out.pos = frame.view_proj * vec4f(out.world, 1.0);
-  out.layer = f32(layer);
   return out;
 }
 
@@ -187,9 +216,40 @@ fn fs_main(in: VOut) -> FOut {
   let region_d = max(abs(G.x), abs(G.z));
   let edge = 1.0 - smoothstep(u.region - 1.5, u.region, region_d);
 
+  // Tap set. Bilinear blending of view bins ghosts the PERIODIC tile into
+  // moiré fringes, so the default resolves the blend stochastically: one tap
+  // whose bin is picked per-pixel with probability = the bilinear weight.
+  // This depends only on the view direction and the pixel, never on the stand
+  // entry — so it is resolved ONCE here instead of once per species below.
+  var i0 = clamp(floor(gc), vec2f(0.0), vec2f(BINS - 2.0));
+  var f = gc - i0;
+  f = f * f * (3.0 - 2.0 * f); // C1 blend kills mach-band rings between bins
+  if (u.taps < 2.0) {
+    // nearest ('1') or stochastic ('dither', taps==0)
+    if (u.taps < 0.5) {
+      let n1 = ign(in.pos.xy + vec2f(13.0, 41.0));
+      let n2 = ign(in.pos.xy + vec2f(59.0, 17.0));
+      i0 = clamp(i0 + vec2f(select(0.0, 1.0, n1 < f.x), select(0.0, 1.0, n2 < f.y)),
+        vec2f(0.0), vec2f(BINS - 1.0));
+    } else {
+      i0 = clamp(round(gc), vec2f(0.0), vec2f(BINS - 1.0));
+    }
+    f = vec2f(0.0);
+  }
+  let wts = vec4f(
+    (1.0 - f.x) * (1.0 - f.y),
+    f.x * (1.0 - f.y),
+    (1.0 - f.x) * f.y,
+    f.x * f.y,
+  );
+  let ntaps = select(1u, 4u, u.taps >= 2.0);
+  // Nearest bin, used by the parallax pre-tap below — also entry-independent.
+  let ni = clamp(round(gc), vec2f(0.0), vec2f(BINS - 1.0));
+
   var cols: array<vec3f, 4>;
   var alphas: array<f32, 4>;
   var ts: array<f32, 4>;
+  var last_lod = 0.0; // diagnostic only (the `inspect=lod` view)
   let ec = min(u32(u.entry_count), 4u);
 
   for (var e = 0u; e < 4u; e++) {
@@ -211,39 +271,13 @@ fn fs_main(in: VOut) -> FOut {
     // also use it to damp parallax (a mip-averaged tile has no height left).
     let foot = max(length(gx), length(gy)) * ATLAS_PX;
     let lodX = clamp((log2(max(foot, 1e-4)) - 3.0) * 0.5, 0.0, 1.0);
-
-    // Tap set. Bilinear blending of view bins ghosts the PERIODIC tile into
-    // moiré fringes, so the default resolves the blend stochastically: one tap
-    // whose bin is picked per-pixel with probability = the bilinear weight.
-    var i0 = clamp(floor(gc), vec2f(0.0), vec2f(BINS - 2.0));
-    var f = gc - i0;
-    f = f * f * (3.0 - 2.0 * f); // C1 blend kills mach-band rings between bins
-    if (u.taps < 2.0) {
-      // nearest ('1') or stochastic ('dither', taps==0)
-      if (u.taps < 0.5) {
-        let n1 = ign(in.pos.xy + vec2f(13.0, 41.0));
-        let n2 = ign(in.pos.xy + vec2f(59.0, 17.0));
-        i0 = clamp(i0 + vec2f(select(0.0, 1.0, n1 < f.x), select(0.0, 1.0, n2 < f.y)),
-          vec2f(0.0), vec2f(BINS - 1.0));
-      } else {
-        i0 = clamp(round(gc), vec2f(0.0), vec2f(BINS - 1.0));
-      }
-      f = vec2f(0.0);
-    }
-    let wts = vec4f(
-      (1.0 - f.x) * (1.0 - f.y),
-      f.x * (1.0 - f.y),
-      (1.0 - f.x) * f.y,
-      f.x * f.y,
-    );
+    last_lod = lodX;
 
     // Parallax anchor at the RECONSTRUCTED content height: a cheap pre-tap at
     // the ground anchor estimates the local hit height, and the real taps then
     // reproject about that height. Anchoring all bins at the height the
     // content actually sits at makes their periodic copies line up — a fixed
     // mid-canopy anchor produces moiré fringes between neighbouring bins.
-    let ni = clamp(round(gc), vec2f(0.0), vec2f(BINS - 1.0));
-    let nidx = u32(ni.y) * u32(BINS) + u32(ni.x);
     let fr0 = fract((G.xz - sw.xz) / sc);
     let auv0 = (ni * CELL_PX + vec2f(BORDER_PX) + fr0 * CONTENT_PX) / ATLAS_PX;
     let h_est = sample_b(si, auv0, gx, gy).r * (1.0 - lodX);
@@ -261,7 +295,6 @@ fn fs_main(in: VOut) -> FOut {
     var accN = vec3f(0.0);
     var accSig = 0.0;
 
-    let ntaps = select(1u, 4u, u.taps >= 2.0);
     for (var t = 0u; t < ntaps; t++) {
       let w = select(1.0, wts[t], ntaps == 4u);
       if (w < 1e-4) { continue; }
@@ -316,12 +349,20 @@ fn fs_main(in: VOut) -> FOut {
     let spark = (hash_f32(hash2(bitcast<u32>(cellN.x), bitcast<u32>(cellN.y))) - 0.5)
       * sigma * 1.6 * (1.0 - lodX) * clamp(1.0 - foot * 0.25, 0.0, 1.0);
 
-    var lit = light_surface(col * tint * (1.0 + spark), nrm, H);
-    // Gust shimmer: cheap brightness ripple advected along the wind.
+    // Gust shimmer: cheap brightness ripple advected along the wind. It is a
+    // light-side term, not albedo, so it stays out of the debug albedo.
     let shim = 1.0 + 0.05 * u.wind_amount * ent.sway
       * sin(frame.time * 3.1 + dot(G.xz, frame.wind_dir) * 1.4);
-    cols[e] = apply_fog(lit * shim, H);
-    alphas[e] = clamp(alpha, 0.0, 1.0);
+    let albedo = col * tint * (1.0 + spark);
+    let a_e = clamp(alpha, 0.0, 1.0);
+    var lit = light_surface(albedo, nrm, H) * shim;
+    // Fog only in the normal view — debug views stay unfogged and honest.
+    if (debug_mode() == DEBUG_OFF) { lit = apply_fog(lit, H); }
+    // Debug per ENTRY (albedo/normal/light term are per-entry quantities); the
+    // composite below then blends them with the same front-to-back weights as
+    // the shaded colour, so albedo/normals/lighting stay exact per layer.
+    cols[e] = debug_shade(lit, albedo, nrm, a_e, H);
+    alphas[e] = a_e;
     ts[e] = tH;
   }
 
@@ -351,18 +392,52 @@ fn fs_main(in: VOut) -> FOut {
   }
 
   if (A < 0.004) { discard; }
+  // Raw reconstructed coverage, before the presentation lift below — this is
+  // the quantity the BTF actually stores, and the weights in C sum to it.
+  let a_raw = A;
   // A dense stand reads near-opaque: lift mid coverage before the dither so
   // the stipple only appears at genuine edges/thin spots.
   A = 1.0 - pow(1.0 - A, 1.6);
-  // Dithered coverage: keeps the pass opaque (depth-writing, order-free).
-  if (A < ign(in.pos.xy)) { discard; }
+  let dm = debug_mode();
+  // Dithered coverage: keeps the pass opaque (depth-writing, order-free). The
+  // coverage view skips it so the aggregate coverage field is readable as a
+  // continuous field instead of its own stipple pattern.
+  if (A < ign(in.pos.xy) && dm != DEBUG_COVERAGE) { discard; }
 
   if (depth_t < 0.0) { depth_t = first_t; }
   let H = cam + v * depth_t;
   let hp = frame.view_proj * vec4f(H, 1.0);
 
+  // Normal view keeps the historical C/A_lifted normalisation; the debug views
+  // divide by the true weight sum so albedo/normals/lighting are exact.
+  var rgb = C / select(A, a_raw, dm != DEBUG_OFF);
+  // Coverage/depth are composite quantities, so they are resolved once here
+  // rather than per entry.
+  if (dm == DEBUG_COVERAGE || dm == DEBUG_DEPTH) {
+    rgb = debug_shade(rgb, vec3f(1.0), vec3f(0.0, 1.0, 0.0), a_raw, H);
+  }
+  // Method-local state that no global mode can express (manifest param
+  // `inspect`); the shared debug views always win over it.
+  if (dm == DEBUG_OFF && u.inspect > 0.5) {
+    if (u.inspect < 1.5) {
+      // Which of the 25 hemi-oct view bins this pixel resolved to — makes the
+      // stochastic bin pick, sector boundaries and bin popping directly visible.
+      let bidx = u32(i0.y) * u32(BINS) + u32(i0.x);
+      rgb = vec3f(
+        hash_f32(hash2(bidx, 11u)),
+        hash_f32(hash2(bidx, 22u)),
+        hash_f32(hash2(bidx, 33u)),
+      );
+    } else if (u.inspect < 2.5) {
+      rgb = vec3f(last_lod); // detail fade toward the baked mean colour
+    } else {
+      // Which proxy layer produced the pixel: ground grid vs canopy-top shell.
+      rgb = select(vec3f(0.16, 0.42, 0.14), vec3f(0.95, 0.52, 0.10), in.layer > 0.5);
+    }
+  }
+
   var out: FOut;
-  out.color = vec4f(C / A, 1.0);
+  out.color = vec4f(rgb, 1.0);
   out.depth = clamp(hp.z / max(hp.w, 1e-5), 0.0, 0.999999);
   return out;
 }

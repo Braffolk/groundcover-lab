@@ -424,7 +424,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
     gF32[12] = p.rOuter - 8
     gF32[13] = shellHNom * p.shellHeight
     gF32[14] = stand.radius
-    gF32[15] = p.debugRings ? 1 : 0
+    gF32[15] = p.debugRings ? 1 : 0 // ring_debug (our param, NOT frame.debug_mode)
     gF32[16] = shellBob
     gU32[17] = caps[0]!
     gU32[18] = caps[1]!
@@ -477,7 +477,10 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         cull.end()
       }
 
-      const pass = ctx.timing.renderPass(enc, 'strands', {
+      // ONE render pass for strands + far shell: identical attachments and
+      // load/store ops, no dependency between them. Two passes would cost a
+      // full colour+depth store and reload (tile flush on TBDR) for nothing.
+      const pass = ctx.timing.renderPass(enc, 'strands+shell', {
         colorAttachments: [{ view: targets.colorView, loadOp: 'load', storeOp: 'store' }],
         depthStencilAttachment: { view: targets.depthView, depthLoadOp: 'load', depthStoreOp: 'store' },
       })
@@ -488,19 +491,15 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         pass.setIndexBuffer(indexBufs[i]!, 'uint16')
         pass.drawIndexedIndirect(indirectBuf, i * 20)
       }
+      // Shell last: it is alpha-blended over whatever the plants left, and
+      // depth-tests against them so occluded shell pixels are rejected.
+      pass.setPipeline(shellPipeline)
+      pass.setBindGroup(0, ctx.frame.bindGroup)
+      pass.setBindGroup(1, shellBG)
+      pass.setVertexBuffer(0, shellVB)
+      pass.setIndexBuffer(shellIB, 'uint16')
+      pass.drawIndexed(shellIdx.length)
       pass.end()
-
-      const shell = ctx.timing.renderPass(enc, 'farshell', {
-        colorAttachments: [{ view: targets.colorView, loadOp: 'load', storeOp: 'store' }],
-        depthStencilAttachment: { view: targets.depthView, depthLoadOp: 'load', depthStoreOp: 'store' },
-      })
-      shell.setPipeline(shellPipeline)
-      shell.setBindGroup(0, ctx.frame.bindGroup)
-      shell.setBindGroup(1, shellBG)
-      shell.setVertexBuffer(0, shellVB)
-      shell.setIndexBuffer(shellIB, 'uint16')
-      shell.drawIndexed(shellIdx.length)
-      shell.end()
     },
 
     dispose(): void {

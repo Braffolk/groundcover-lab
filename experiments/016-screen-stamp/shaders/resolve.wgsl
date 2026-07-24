@@ -2,6 +2,7 @@
 #include "src/wgsl/terrain.wgsl"
 #include "src/wgsl/hash.wgsl"
 #include "src/wgsl/fullscreen.wgsl"
+#include "src/wgsl/debug.wgsl"
 
 // PER-PIXEL STAMP RESOLVE. One fullscreen pass; each pixel walks its screen
 // tile's front-to-back plant list (built by bin.wgsl), intersects the pixel
@@ -13,6 +14,12 @@
 // list ends (or the tile skipped individual plants entirely) a statistical
 // meadow tint — species average albedos mixed by world-anchored value noise,
 // lit by the terrain normal — takes over.
+//
+// Debug views (frame.debug_mode) describe what THIS pass contributed: albedo,
+// world normal and the shaded colour are accumulated with the same
+// front-to-back weights as the colour, so albedo/normals/lighting show the
+// coverage-weighted average of every stamp (and the tint field) that landed on
+// the pixel, and coverage is the accumulated alpha.
 
 const TILE_W: u32 = 16u;
 const TILE_H: u32 = 8u;
@@ -28,7 +35,7 @@ const TWO_PI_S: f32 = 6.2831853;
 
 struct StampParams {
   dims: vec4u,                 // x,y unused, z = seed, w = entry_count
-  tuning: vec4f,               // x = max_dist, y = tint_strength, z = debug, w unused
+  tuning: vec4f,               // x = max_dist, y = tint_strength, z = tile overlay, w unused
   entry_meta: array<vec4f, 4>,
   entry_info: array<vec4f, 4>, // species average albedo rgb, pad
 }
@@ -81,6 +88,7 @@ fn value_noise(p: vec2f) -> f32 {
 
 @fragment
 fn fs_main(in: FullscreenOut) -> @location(0) vec4f {
+  let dbg = debug_mode();
   let px = vec2u(in.pos.xy);
   let tiles_x = (u32(frame.viewport.x) + TILE_W - 1u) / TILE_W;
   let tiles_y = (u32(frame.viewport.y) + TILE_H - 1u) / TILE_H;
@@ -124,6 +132,12 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4f {
 
   var acc = vec3f(0.0);
   var trans = 1.0;
+  // Debug accumulators — same front-to-back weights as `acc`, so the debug
+  // views report exactly what this pass composited (see header).
+  var alb_acc = vec3f(0.0);
+  var nrm_acc = vec3f(0.0);
+  var dbg_world = scene_pos;
+  var have_world = false;
 
   for (var i = 0u; i < count; i++) {
     let ebase = tbase + HEADER_U32 + i * ENTRY_U32;
@@ -207,9 +221,19 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4f {
     if (dot(n_local, n_local) < 1e-4) { n_local = vec3f(0.0, 1.0, 0.0); }
     let n_ws = rot_y_v(normalize(n_local), yaw);
     var col = light_surface(albedo, n_ws, hit);
-    col = apply_fog(col, hit);
+    // Fog only in the normal view — debug views stay unfogged and honest.
+    if (dbg == DEBUG_OFF) {
+      col = apply_fog(col, hit);
+    }
 
-    acc += trans * a * col;
+    let w = trans * a;
+    acc += w * col;
+    alb_acc += w * albedo;
+    nrm_acc += w * n_ws;
+    if (!have_world) {
+      dbg_world = hit;
+      have_world = true;
+    }
     trans *= 1.0 - a;
     if (trans < 0.04) { break; }
   }
@@ -238,18 +262,59 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4f {
       // the aggregate field carries the same busyness as the stamped zone.
       tint *= 0.72 + 0.56 * value_noise(wxz * 2.3);
       tint *= 0.78 + 0.34 * value_noise(wxz * 5.1);
-      let tn = terrain_normal(wxz);
-      var tc = light_surface(tint, normalize(tn + vec3f(0.0, 0.6, 0.0)), scene_pos);
-      tc = apply_fog(tc, scene_pos);
-      acc += trans * tf * tc;
+      let tn = normalize(terrain_normal(wxz) + vec3f(0.0, 0.6, 0.0));
+      var tc = light_surface(tint, tn, scene_pos);
+      // Fog only in the normal view — debug views stay unfogged and honest.
+      if (dbg == DEBUG_OFF) {
+        tc = apply_fog(tc, scene_pos);
+      }
+      let wt = trans * tf;
+      acc += wt * tc;
+      alb_acc += wt * tint;
+      nrm_acc += wt * tn;
+      if (!have_world) {
+        dbg_world = scene_pos;
+        have_world = true;
+      }
       trans *= 1.0 - tf;
     }
   }
 
-  // Debug: tile fill heatmap (param-gated).
-  if (sp.tuning.z > 0.5) {
+  if (dbg != DEBUG_OFF) {
+    // Un-premultiply the accumulators to get this pass's coverage-weighted
+    // average surface, then let the shared debug_shade() do the rest.
+    let cov = 1.0 - trans;
+    let inv = 1.0 / max(cov, 1e-4);
+    var n_avg = vec3f(0.0, 1.0, 0.0);
+    if (dot(nrm_acc, nrm_acc) > 1e-8) { n_avg = normalize(nrm_acc); }
+    let dcol = debug_shade(acc * inv, alb_acc * inv, n_avg, cov, dbg_world);
+    if (dbg == DEBUG_COVERAGE) {
+      // Coverage is drawn opaque — the terrain writes 1.0 everywhere, so a
+      // blended coverage map would wash out to uniform white. Exception: the
+      // near-field card pass already wrote opaque groundcover into this pixel
+      // (its surface sits well above the terrain), and overwriting it with the
+      // stamp pass's ~0 coverage would hide real coverage.
+      if (d < 0.99999 && scene_pos.y - terrain_height(scene_pos.xz) > 0.15) { discard; }
+      return vec4f(dcol, 1.0);
+    }
+    if (cov < 0.003) { discard; }
+    return vec4f(dcol * cov, cov);
+  }
+
+  // Method-specific inspection overlay (own param — see manifest tileView).
+  let overlay = u32(sp.tuning.z + 0.5);
+  if (overlay == 1u) {
     let heat = f32(count) / f32(MAX_LIST);
     acc = mix(acc, vec3f(heat, 1.0 - heat, 0.15), 0.4);
+    trans = min(trans, 0.5);
+  } else if (overlay == 2u) {
+    // Which binning strategy the tile picked: blue = tint-only,
+    // green = enumerate, orange = column march.
+    let tile_mode = tile_lists[tbase + 2u];
+    var mc = vec3f(0.10, 0.16, 0.65);
+    if (tile_mode == 1u) { mc = vec3f(0.12, 0.62, 0.18); }
+    if (tile_mode == 2u) { mc = vec3f(0.75, 0.45, 0.08); }
+    acc = mix(acc, mc, 0.45);
     trans = min(trans, 0.5);
   }
 

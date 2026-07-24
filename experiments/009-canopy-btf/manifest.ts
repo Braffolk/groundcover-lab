@@ -12,6 +12,13 @@ export const PARAMS = {
   macroTint: p.bool(true),
   /** Draw the canopy-top shell layer (crest/sky silhouettes). */
   topShell: p.bool(true),
+  /**
+   * Method-local inspection the global `view` modes cannot express: which of
+   * the 25 hemi-oct view bins a pixel resolved to, the distance detail fade,
+   * or which proxy layer (ground grid / canopy-top shell) drew it. The global
+   * debug views take precedence when both are set.
+   */
+  inspect: p.enum('off', ['off', 'bin', 'lod', 'layer'] as const),
 }
 
 export default defineExperiment({

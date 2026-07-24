@@ -1,6 +1,7 @@
 #include "src/wgsl/scatter.wgsl"
 #include "src/wgsl/wind.wgsl"
 #include "src/wgsl/lighting.wgsl"
+#include "src/wgsl/debug.wgsl"
 
 // NEAR FIELD (< ~8 m): a plant 1-3 m from the camera angularly overlaps
 // almost every screen tile, so per-tile lists would drown in near plants
@@ -23,7 +24,7 @@ const MAX_LOD: f32 = 3.0;
 
 struct StampParams {
   dims: vec4u,                 // x,y unused, z = seed, w = entry_count
-  tuning: vec4f,               // x = max_dist, y = tint_strength, z = debug, w unused
+  tuning: vec4f,               // x = max_dist, y = tint_strength, z = tile overlay, w unused
   entry_meta: array<vec4f, 4>, // impostor local center.xyz, bounding radius
   entry_info: array<vec4f, 4>, // species average albedo rgb, pad
 }
@@ -193,6 +194,10 @@ fn fs_main(in: VOut) -> @location(0) vec4f {
   if (dot(n_local, n_local) < 1e-4) { n_local = vec3f(0.0, 1.0, 0.0); }
   let n_ws = rot_y_v(normalize(n_local), yaw);
   var col = light_surface(albedo, n_ws, in.world);
-  col = apply_fog(col, in.world);
-  return vec4f(col, 1.0);
+  // Fog only in the normal view — debug views stay unfogged and honest.
+  if (debug_mode() == DEBUG_OFF) {
+    col = apply_fog(col, in.world);
+  }
+  // Alpha-tested opaque card: this fragment resolved to full coverage.
+  return vec4f(debug_shade(col, albedo, n_ws, 1.0, in.world), 1.0);
 }

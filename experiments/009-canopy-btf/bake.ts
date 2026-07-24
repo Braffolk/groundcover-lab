@@ -1,5 +1,5 @@
 import bakeShaderSrc from './shaders/bake.wgsl'
-import { asU32, commitBake, hash2, hashF32, speciesById, type ExperimentContext, type GcMesh } from '@harness'
+import { assetUrl, asU32, commitBake, hash2, hashF32, speciesById, type ExperimentContext, type GcMesh } from '@harness'
 import type { PARAMS } from './manifest.ts'
 
 /**
@@ -674,7 +674,9 @@ export async function loadOrBakeSpecies(
 ): Promise<BtfArtifact> {
   const key = `btf-v${BAKE_VERSION}-${speciesId}`
   try {
-    const res = await fetch(`/mesh/baked/${ctx.id}/${key}.bin`)
+    // assetUrl(): production builds live under a base path, so a root-absolute
+    // fetch would 404 there (CLAUDE.md).
+    const res = await fetch(assetUrl(`/mesh/baked/${ctx.id}/${key}.bin`))
     if (res.ok) {
       const buf = await res.arrayBuffer()
       if (buf.byteLength > HEADER_BYTES && new Uint32Array(buf, 0, 1)[0] === MAGIC) {

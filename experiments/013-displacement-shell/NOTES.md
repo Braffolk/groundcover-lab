@@ -14,14 +14,17 @@ canopy shell.
 
 Per frame:
 
-1. **cull** (compute, ~0.07 ms): walks the scatter cells of a camera-centered
+1. **cull** (compute): walks the scatter cells of a camera-centered
    region (bit-identical WGSL twin of the harness scatter — placement is
    evaluated in-shader, no CPU instance buffers ever), frustum-tests every
    existing plant and appends a 16 B record (pos + quantized yaw/scale/phase/
    entry) into one of three distance rings via atomics into the indirect-draw
    buffer. Work = region cells × 128 slots × stand entries, **independent of
-   total plant count**.
-2. **strands** (render, three `drawIndexedIndirect`): each ring draws ribbon
+   total plant count** — and a conservative per-CELL frustum AABB test drops
+   whole off-screen cells before any hashing or terrain sampling happens, so
+   the real work is view-bounded, not just region-bounded.
+2. **strands+shell** (ONE render pass): three `drawIndexedIndirect` for the
+   rings, then the far shell. Each ring draws ribbon
    patches of decreasing topology (12/8/5 stations; the station axis is
    sampled with the linear filter, so fewer stations = automatic curve
    simplification). Strand-count LOD is **continuous**: rows beyond
@@ -32,7 +35,8 @@ Per frame:
    per-species sway from the stand table. Lighting uses the baked mesh
    normals (flipped to the viewer + up-biased) and the baked per-station
    occlusion.
-3. **farshell** (render, ~2.7 k tris): beyond `rOuter` the meadow IS the
+3. **far shell** (~2.7 k tris, last draw of the same render pass): beyond
+   `rOuter` the meadow IS the
    shell — a camera-centered geometric-progression annulus draped on the
    terrain at density-weighted canopy height, colored by the baked per-species
    canopy albedos blended with world-anchored value-noise mottle, with a
@@ -87,7 +91,8 @@ species, cached in OPFS and committed via the bake endpoint.
 
 working — verified by headless screenshot at `grazing`, `topdown`,
 `inside-plant`, `far-horizon`, and `grazing` on `scaling-100m` (134.2 M
-plants; identical cost). All three species render.
+plants; identical cost). All three species render. All six global debug views
+(`view=` / `debug=`) are wired and were inspected — see Audit.
 
 ## Findings
 
@@ -95,9 +100,11 @@ plants; identical cost). All three species render.
   understory + tan calamagrostis plume tops emerge naturally from the traced
   colors (the plume stations are wide + pink because the source points there
   are wide-spread and tan — nothing species-specific is hard-coded).
-- 134.2 M plants (`stand=scaling-100m`) vs 557 k (default): cull 0.07 ms /
-  strands ~2.1 ms / farshell ~1.9 ms in both. Plant count is provably free;
-  the only VRAM/time driver is the region radius and strand budget params.
+- 134.2 M plants (`stand=scaling-100m`) vs 557 k (default): identical per-pass
+  cost in both. Plant count is provably free; the only VRAM/time driver is the
+  region radius and strand budget params. (Numbers from the first session are
+  no longer quoted here — the passes were merged, see Audit, and the GPU was
+  shared. Re-measure solo.)
 - NOT benchmarked with `#/bench` — 15 sibling experiments were hammering the
   same GPU during this session, so any recorded numbers would be
   contaminated. The timings quoted above are HUD p50s from the quietest runs
@@ -121,3 +128,84 @@ plants; identical cost). All three species render.
   floats ~1.5 m above plant bases; worth remembering for other experiments.
 - Harness wishlist: nothing blocking; a shared "committed-bake with magic
   validation" helper would remove the copy of 003's SPA-fallback workaround.
+
+## Audit (structural + debug-view pass)
+
+Debug views were **completely unwired** — `frame.debug_mode` was ignored by
+both shaders, so every `view=` mode rendered the normal image. Fixed:
+
+- both fragment shaders now `#include "src/wgsl/debug.wgsl"` and return
+  `debug_shade(shaded, albedo, normal_ws, coverage, world_pos)`; fog is applied
+  only when `debug_mode() == DEBUG_OFF`.
+- the baked occlusion (`mix(0.55, 1.0, ao)`) and the shell's `0.92` trim moved
+  from the lit result into the **albedo** term. Identical output (the shared
+  lighting model is multiplicative in albedo) but now `debug=lighting`'s
+  divide-out is exact and `debug=albedo` shows the real baked colour.
+- the shell paints opaquely in debug views (`out_alpha = 1`), otherwise its
+  normals/albedo would come back blended with the base pass behind it.
+- our own `debugRings` uniform field was called `debug_mode`; renamed to
+  `ring_debug` so it cannot be confused with the global selector. It stays the
+  method-specific view (ring tint + fixed width + no culling), as the task's
+  "expose extra state as your own param" rule asks.
+
+What the views exposed: normals and lighting were already real — per-fragment
+interpolated **baked** strand normals through the shared `light_surface()`,
+no constant-brightness cheat, so no lighting repair was needed and the normal
+view is unchanged in `off` mode. `debug=normals` shows full hue spread
+(including downward-facing undersides — the `UP_BIAS` nudge biases, it does not
+replace). `debug=albedo` does show one honest mismatch: from topdown the far
+shell's canopy albedo is noticeably more olive/desaturated than the plant
+field it takes over from (the shell is the width-weighted upper-canopy mean, the
+field is blades + dark gaps). `debug=coverage` is flat white over the plants —
+correct: every plant edge is hard opaque geometry, zero stochastic alpha — with
+the only grey being the shell's 32→40 m alpha ramp, which is exactly the band
+worth watching. `debug=depth` shows honest per-plant depth, no impostor walls.
+
+Structural waste found and fixed:
+
+1. **Two back-to-back render passes with identical attachments** (`strands`,
+   then `farshell`) — same colour/depth views, same load/store ops, no
+   dependency. Merged into one `strands+shell` pass: on a tile-based GPU (the
+   dev machine is Apple Silicon; the project targets low-mid devices) the split
+   cost a full colour+depth store and reload for nothing. Trade-off: the HUD now
+   shows one row instead of two, and old `results/*.json` have the old labels.
+2. **The cull evaluated all 128 scatter slots of every cell in the ±44 m
+   region, including cells nowhere near the frustum** — ~200 k slot
+   evaluations per frame, each 7 hashes + a bilinear terrain fetch, only to be
+   thrown away by the per-plant frustum test. Added a per-CELL conservative
+   frustum AABB test that runs *before* `scatter_candidate`. The box bounds
+   every plant sphere the per-plant test could accept (cell footprint + max
+   plant radius horizontally; full terrain amplitude + max plant height
+   vertically), and the AABB-vs-plane form is exact with unnormalized
+   view-proj rows, so the surviving plant set is provably unchanged. At
+   grazing this rejects the large majority of region cells for five dot
+   products each.
+
+Verified image-identical: `det=1&t=4` screenshots at `grazing`, `topdown` and
+`inside-plant` before vs after differ by 0–254 pixels out of 668 k — the same
+magnitude as running the *unchanged* build twice (atomic append order flips
+tie-break winners at coincident depths). No console/shader errors in any of the
+six debug modes.
+
+Deliberately NOT changed (would need measurement or would change the image —
+suggestions for whoever picks this up):
+
+- **Ring row budget vs coverage boost is inconsistent.** A ring draws
+  `ceil(s0·r0/r_ring_outer)` strand rows (the *minimum* over the ring) but the
+  width `boost` uses the continuous `f_cont = s0·r0/d`. Just past `r0` that is
+  64 rows' worth of boost applied to 28 drawn rows, so coverage drops ~35 % at
+  the ring-0→1 handoff — the "handoffs cannot pop" claim above is optimistic.
+  Fixing it means widening ribbons, i.e. changing the image; it is a quality
+  fix, not an audit fix.
+- Per-instance values (yaw/scale/phase decode, `f_cont`, `boost`, near/edge
+  fades, `sin`/`cos` of yaw) are recomputed by every one of a plant's up to
+  1536 vertices. Moving them into the cull pass would widen the 16 B instance
+  record (more VRAM, more bandwidth) for an unmeasured ALU win — not an
+  obvious call, left alone.
+- The 144 B globals UBO is rewritten every frame although only the region
+  corner/dims and a few params change. Splitting it into constant + per-frame
+  blocks is not worth a second buffer and a second bind at this size.
+- `SHELL_ROWS = 20` with a 1.285 geometric radius ratio reaches 3.7 km, so on
+  the ±128 m default stand roughly half the rows clamp onto the boundary and
+  contribute slivers. Harmless (2.7 k tris total) and needed by the ±384 m
+  stands; left as is.

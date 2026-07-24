@@ -14,7 +14,8 @@ struct Globals {
   shell_in: f32,          // far-shell inner radius
   shell_h: f32,           // far-shell canopy height (m, stand-mixed)
   stand_radius: f32,
-  debug_mode: f32,
+  ring_debug: f32,        // OUR `debugRings` param — not the global debug view
+                          // selector (that one lives in frame.debug_mode).
   shell_bob: f32,         // density-weighted mean sway for the shell wind bob
   cap0: u32,
   cap1: u32,
