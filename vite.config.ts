@@ -17,6 +17,7 @@ export default defineConfig({
       // bench results, bakes) must not trigger page reloads mid-session.
       ignored: [
         '**/experiments/*/thumbnail.png',
+        '**/experiments/*/rating.json',
         '**/goldens/**',
         '**/results/**',
         '**/mesh/baked/**',

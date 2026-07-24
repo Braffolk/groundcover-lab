@@ -8,7 +8,7 @@ TypeScript only. No `.js`/`.mjs` files anywhere, including tools. All tooling is
 2. Edit ONLY files inside your experiment directory. Never renumber; your ID is the full directory name.
 3. Run it: `npm run dev` → `http://localhost:5173/#/run/<your-id>`.
 
-Allowed write paths: your experiment dir, `mesh/baked/<your-id>/`, `results/` (new files only), `goldens/<your-id>/`.
+Allowed write paths: your experiment dir, `mesh/baked/<your-id>/`, `results/` (new files only), `goldens/<your-id>/`. Exception inside your own dir: `rating.json` is the OWNER'S visual verdict — never create, edit, or delete it.
 Forbidden: `src/**`, other experiments, `package.json`, any shared file. If the harness is missing something you need, write the need into your `NOTES.md` instead of patching shared code.
 
 ## Experiment rules
@@ -35,6 +35,10 @@ Forbidden: `src/**`, other experiments, `package.json`, any shared file. If the 
 - Bench before claiming numbers: `#/bench/<id>?stand=default&spline=orbit-low` at a standard cam/spline. Results record the stand and are only comparable within one; they auto-save to `results/` — link the JSON filenames in your `NOTES.md`. Scale tests use the `scaling-100m` stand, not custom placement.
 - `NOTES.md` required sections: Idea / VRAM budget math / Bake / Status / Findings.
 - Standard cameras (keys 1–4): `grazing` (impostor killer), `topdown`, `inside-plant` (fade check), `far-horizon` (scaling check).
+
+## Standing practice for the orchestrator
+
+After every large batch of experiment work (a wave of new experiments, or a major rework), run a **structural waste review**: one agent per experiment, auditing pipeline and shader STRUCTURE for wasteful decisions and fixing them. In scope: loops in shaders that shouldn't exist or shouldn't be loops, work recomputed per frame that belongs at bake/init/param-change time, redundant passes or copies, oversized or per-plant-scaling dispatches. Out of scope: ALU-level micro-optimization — structure only. Auditors must NOT trust frame-time numbers while other agents run in parallel (contaminated GPU); they reason from the code and verify correctness by screenshot. First-generation agents reliably leave a few structurally insane things behind; assume they exist and go find them.
 
 ## Repo map
 

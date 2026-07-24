@@ -1,4 +1,4 @@
-import { mkdirSync, readdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Plugin } from 'vite'
@@ -12,6 +12,7 @@ import type { Plugin } from 'vite'
  *   POST /__thumb?exp=<id>               PNG body -> experiments/<id>/thumbnail.png
  *   POST /__thumb?exp=<id>&cam=<name>    PNG body -> goldens/<id>/<name>.png
  *   POST /__bake?exp=<id>&key=<key>      binary body -> mesh/baked/<id>/<key>.bin
+ *   POST /__rating?exp=<id>              {"visual":1..5|null} -> experiments/<id>/rating.json (null deletes)
  */
 export function devSink(): Plugin {
   let root = process.cwd()
@@ -89,6 +90,20 @@ export function devSink(): Plugin {
               ? write(path.join('goldens', exp), `${segment(cam, 'cam')}.png`, body)
               : write(path.join('experiments', exp), 'thumbnail.png', body)
             json(res, 200, { saved })
+            return
+          }
+          if (route === '/__rating' && req.method === 'POST') {
+            const exp = segment(url.searchParams.get('exp'), 'exp')
+            const { visual } = JSON.parse((await readBody(req)).toString('utf8')) as { visual: number | null }
+            const file = path.join(root, 'experiments', exp, 'rating.json')
+            if (visual === null) {
+              rmSync(file, { force: true })
+              json(res, 200, { cleared: true })
+              return
+            }
+            if (!Number.isInteger(visual) || visual < 1 || visual > 5) throw new Error(`invalid rating ${visual}`)
+            writeFileSync(file, `${JSON.stringify({ visual })}\n`)
+            json(res, 200, { saved: path.relative(root, file) })
             return
           }
           if (route === '/__bake' && req.method === 'POST') {

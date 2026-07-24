@@ -429,6 +429,34 @@ code,
   border-color: var(--text);
 }
 
+.card .scores {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 2px;
+}
+
+.pips {
+  display: flex;
+  gap: 3px;
+  align-items: center;
+}
+
+.pip {
+  width: 11px;
+  height: 11px;
+  padding: 0;
+  border: 1px solid var(--border-strong);
+  background: transparent;
+  cursor: pointer;
+}
+
+.pip.filled {
+  background: var(--text);
+  border-color: var(--text);
+}
+
 .status {
   font-size: 10px;
   text-transform: uppercase;

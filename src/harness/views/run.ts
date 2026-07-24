@@ -4,6 +4,8 @@ import { Overlay } from '../../ui/overlay.ts'
 import { Hud } from '../../ui/hud.ts'
 import { buildParamsPanel } from '../../ui/panel.ts'
 import { captureViewPng, downloadBlob, uploadCapture } from '../capture.ts'
+import { fetchRating, saveRating } from '../ratings.ts'
+import { pipsRow } from '../../ui/pips.ts'
 import { LabApp } from '../loop.ts'
 import { paramsToQuery } from '../params.ts'
 import { findExperiment } from '../registry.ts'
@@ -139,6 +141,17 @@ export async function runView(root: HTMLElement, state: HashState): Promise<View
       }),
       standPicker(stand),
     )
+    if (!isReference) {
+      const pips = pipsRow({
+        value: await fetchRating(id),
+        onSet: (value) => {
+          void saveRating(id, value)
+            .then(() => overlay.toast(value === null ? 'rating cleared' : `rated ${value}/5`))
+            .catch(() => overlay.toast('rating needs the dev server', 'warn'))
+        },
+      })
+      toolbar.appendChild(pips.el)
+    }
     viewer.appendChild(toolbar)
 
     app.start()
