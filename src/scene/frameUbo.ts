@@ -19,6 +19,8 @@ export interface FrameData {
   frameIndex: number
   wind: WindParams
   viewport: [number, number]
+  /** Index into DEBUG_VIEW_MODES — see src/wgsl/debug.wgsl. */
+  debugMode: number
 }
 
 export const SUN_DIR: [number, number, number] = (() => {
@@ -29,7 +31,8 @@ export const SUN_DIR: [number, number, number] = (() => {
 export const SUN_COLOR: [number, number, number] = [1.15, 1.02, 0.82]
 export const AMBIENT: [number, number, number] = [0.21, 0.25, 0.32]
 
-const FLOATS = 88
+// 89 used + 3 pad — struct alignment rounds to a multiple of 16 bytes.
+const FLOATS = 92
 
 export class FrameGroup {
   readonly layout: GPUBindGroupLayout
@@ -91,6 +94,7 @@ export class FrameGroup {
     d[85] = this.terrain.desc.heightScale
     d[86] = this.terrain.desc.resolution
     d[87] = f.frameIndex
+    d[88] = f.debugMode
     queue.writeBuffer(this.buffer, 0, d)
   }
 }

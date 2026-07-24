@@ -1,6 +1,7 @@
 #include "src/wgsl/terrain.wgsl"
 #include "src/wgsl/lighting.wgsl"
 #include "src/wgsl/hash.wgsl"
+#include "src/wgsl/debug.wgsl"
 
 // Harness base-pass terrain: bufferless grid, vertices derived from
 // vertex_index and displaced by the shared heightmap. Draw 6*QUADS*QUADS.
@@ -44,6 +45,9 @@ fn fs_main(in: VOut) -> @location(0) vec4f {
   let soil = vec3f(0.26, 0.20, 0.14);
   let albedo = mix(grass, soil, clamp(slope * 6.0, 0.0, 1.0));
   var color = light_surface(albedo, n, in.world);
-  color = apply_fog(color, in.world);
-  return vec4f(color, 1.0);
+  // Fog only in the normal view — debug views stay unfogged and honest.
+  if (debug_mode() == DEBUG_OFF) {
+    color = apply_fog(color, in.world);
+  }
+  return vec4f(debug_shade(color, albedo, n, 1.0, in.world), 1.0);
 }

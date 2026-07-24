@@ -20,6 +20,13 @@ struct Frame {
   terrain_height_scale: f32,
   terrain_resolution: f32,
   frame_index: f32,
+  // Global debug view selector — see src/wgsl/debug.wgsl. EVERY renderer must
+  // honour it (CLAUDE.md requirement), so albedo/normals/lighting/coverage/
+  // depth can be inspected identically across methods.
+  debug_mode: f32,
+  _frame_pad0: f32,
+  _frame_pad1: f32,
+  _frame_pad2: f32,
 }
 
 // One row per species entry of the ACTIVE STAND (src/scene/stands.ts) —

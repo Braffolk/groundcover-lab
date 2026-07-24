@@ -1,6 +1,7 @@
 #include "src/wgsl/terrain.wgsl"
 #include "src/wgsl/wind.wgsl"
 #include "src/wgsl/lighting.wgsl"
+#include "src/wgsl/debug.wgsl"
 
 // Instance layout: two vec4 per plant — see SCATTER_INSTANCE_FLOATS.
 // [x, y, z, yaw] [scale, standEntryIndex, phase, 0]
@@ -73,7 +74,11 @@ fn fs_main(in: VOut) -> @location(0) vec4f {
   }
   let ground = terrain_normal(in.world.xz);
   let n = normalize(ground + vec3f(0.0, 1.2, 0.0));
-  var color = light_surface(in.color * (0.55 + 0.45 * in.uv.y), n, in.world);
-  color = apply_fog(color, in.world);
-  return vec4f(color, 1.0);
+  let albedo = in.color * (0.55 + 0.45 * in.uv.y);
+  var color = light_surface(albedo, n, in.world);
+  // Fog only in the normal view — debug views stay unfogged and honest.
+  if (debug_mode() == DEBUG_OFF) {
+    color = apply_fog(color, in.world);
+  }
+  return vec4f(debug_shade(color, albedo, n, 1.0, in.world), 1.0);
 }

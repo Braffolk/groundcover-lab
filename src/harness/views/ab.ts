@@ -9,6 +9,7 @@ import { findExperiment } from '../registry.ts'
 import {
   button,
   copyToClipboard,
+  debugPicker,
   el,
   readSeed,
   readStand,
@@ -205,6 +206,7 @@ export async function abView(root: HTMLElement, state: HashState): Promise<View>
         void copyToClipboard(location.href).then(() => overlay.toast('link copied'))
       }),
       standPicker(stand),
+      debugPicker(app, state.q.get('debug')),
     )
     viewer.appendChild(toolbar)
     setMode(compositor.mode)

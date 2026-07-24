@@ -13,6 +13,7 @@ import {
   button,
   copyToClipboard,
   currentBookmarkName,
+  debugPicker,
   el,
   readSeed,
   readStand,
@@ -140,6 +141,7 @@ export async function runView(root: HTMLElement, state: HashState): Promise<View
         location.hash = buildHash(['bench', id], { seed: String(seed), stand: stand.id })
       }),
       standPicker(stand),
+      debugPicker(app, state.q.get('debug')),
     )
     if (!isReference) {
       const pips = pipsRow({

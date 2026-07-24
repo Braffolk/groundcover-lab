@@ -111,6 +111,7 @@ export async function copyToClipboard(text: string): Promise<void> {
 import { serializePose } from '../../scene/camera.ts'
 import { saveUserBookmark } from '../../scene/bookmarks.ts'
 import { makeDebouncedQueryWriter } from '../../url/state.ts'
+import { DEBUG_VIEW_MODES, debugModeIndex, parseDebugMode } from '../debug.ts'
 import type { LabApp } from '../loop.ts'
 import type { Overlay } from '../../ui/overlay.ts'
 
@@ -160,6 +161,30 @@ export function setupCameraSync(app: LabApp, initialCam: string | null, overlay:
     clearInterval(interval)
     window.removeEventListener('keydown', onKey)
   }
+}
+
+/**
+ * The global debug-view dropdown. Applies live (it is just a uniform), so no
+ * reload — and it drives every renderer on the page identically.
+ */
+export function debugPicker(app: LabApp, initial: string | null): HTMLElement {
+  const mode = parseDebugMode(initial)
+  app.debugMode = debugModeIndex(mode)
+  const label = el('label', undefined, 'view')
+  const select = el('select')
+  for (const name of DEBUG_VIEW_MODES) {
+    const option = el('option', undefined, name)
+    option.value = name
+    option.selected = name === mode
+    select.appendChild(option)
+  }
+  select.addEventListener('change', () => {
+    const picked = parseDebugMode(select.value)
+    app.debugMode = debugModeIndex(picked)
+    updateQuery({ debug: picked === 'off' ? null : picked })
+  })
+  label.appendChild(select)
+  return label
 }
 
 /** Current cam name if the pose sits on a named bookmark. */

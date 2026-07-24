@@ -72,6 +72,8 @@ export class LabApp {
   time = 0
   frameIndex = 0
   paused = false
+  /** Global debug view (index into DEBUG_VIEW_MODES); applied next frame. */
+  debugMode = 0
   /** When set (bench), drives the camera instead of user input. */
   cameraDriver: ((time: number) => CameraPose) | null = null
   /** Bench/HUD hook — GPU timings arrive a few frames late, keyed by index. */
@@ -264,6 +266,7 @@ export class LabApp {
       frameIndex: this.frameIndex,
       wind: this.scene.wind,
       viewport: [this.width, this.height],
+      debugMode: this.debugMode,
     })
     const frame: FrameInfo = {
       frameIndex: this.frameIndex,
