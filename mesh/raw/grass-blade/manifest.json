@@ -1,0 +1,36 @@
+{
+  "schema": "procedural-species-mesh/v1",
+  "binary": "grass-blade-mesh-v1.bin",
+  "outputSha256": "22b6c360b5ef791242691f82f0653597205637c78971b4affce6a1c2f901d851",
+  "payloadSha256": "f0340d01a20a4ab844d19e119917b8460038e397cfe08572a0820fc0a92bc62f",
+  "outputBytes": 26112,
+  "vertexCount": 900,
+  "triangleCount": 720,
+  "boundsMin": [
+    -0.11698904483911059,
+    0,
+    -0.07990802118023364
+  ],
+  "boundsMax": [
+    0.5957641895541763,
+    0.6861724649672396,
+    0.6055464120276814
+  ],
+  "tileOrigin": [
+    0,
+    0
+  ],
+  "tileSize": [
+    0.5,
+    0.5
+  ],
+  "topH": 0.6861724649672396,
+  "offsets": {
+    "vertexOffset": 192,
+    "triangleOffset": 14592
+  },
+  "records": {
+    "vertexBytes": 16,
+    "triangleBytes": 16
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "schema": "procedural-species-mesh/v1",
+  "binary": "moss-patch-mesh-v1.bin",
+  "outputSha256": "a39b5b184f6fe5e3ed986ceffe9e54dd51d48f2d6f1dffa8b301fdfada805d8c",
+  "payloadSha256": "44a90f5f60133b45d4c99b74c5971315ad2a6ccd2b36416a7cb3671ffc9483ca",
+  "outputBytes": 28624,
+  "vertexCount": 625,
+  "triangleCount": 1152,
+  "boundsMin": [
+    0,
+    0.012600058582053522,
+    0
+  ],
+  "boundsMax": [
+    0.5,
+    0.039159554442060936,
+    0.5
+  ],
+  "tileOrigin": [
+    0,
+    0
+  ],
+  "tileSize": [
+    0.5,
+    0.5
+  ],
+  "topH": 0.039159554442060936,
+  "offsets": {
+    "vertexOffset": 192,
+    "triangleOffset": 10192
+  },
+  "records": {
+    "vertexBytes": 16,
+    "triangleBytes": 16
+  }
+}

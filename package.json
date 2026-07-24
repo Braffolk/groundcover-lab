@@ -1,0 +1,30 @@
+{
+  "name": "groundcover-experiments",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit",
+    "new": "tsx tools/new-experiment.ts",
+    "species:gen": "tsx tools/gen-species.ts",
+    "capture:thumbs": "tsx tools/capture.ts thumbs",
+    "capture:goldens": "tsx tools/capture.ts goldens",
+    "bench:all": "tsx tools/capture.ts bench"
+  },
+  "dependencies": {
+    "tweakpane": "^4.0.5",
+    "wgpu-matrix": "^3.4.0"
+  },
+  "devDependencies": {
+    "@tweakpane/core": "^2.0.5",
+    "@types/node": "^22.15.0",
+    "@webgpu/types": "^0.1.60",
+    "playwright": "^1.53.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.8.0",
+    "vite": "^7.0.0"
+  }
+}
