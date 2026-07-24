@@ -6,7 +6,7 @@ import { Overlay } from '../../ui/overlay.ts'
 import { LabApp } from '../loop.ts'
 import { paramsHash } from '../params.ts'
 import { findExperiment, HARNESS_API } from '../registry.ts'
-import { button, el, link, readSeed, topbar, type View } from './shared.ts'
+import { button, el, link, readCoverage, readSeed, topbar, type View } from './shared.ts'
 
 const CANVAS: [number, number] = [1600, 900]
 
@@ -29,13 +29,18 @@ export async function benchView(root: HTMLElement, state: HashState): Promise<Vi
   try {
     const entry = await findExperiment(id)
     const seed = readSeed(state.q)
+    const coverage = readCoverage(state.q)
     const splineName = state.q.get('spline') ?? 'orbit-low'
     const warmup = Math.max(1, Number(state.q.get('warmup')) || 120)
     const frames = Math.max(1, Number(state.q.get('frames')) || 600)
 
     page.appendChild(
       topbar(`bench: ${entry.manifest!.title}`, [
-        el('span', 'hint', `${splineName} · seed ${seed} · ${warmup}+${frames} frames · ${CANVAS[0]}×${CANVAS[1]}`),
+        el(
+          'span',
+          'hint',
+          `${splineName} · seed ${seed} · ±${coverage.radius}m ×${coverage.densityScale} · ${warmup}+${frames} frames · ${CANVAS[0]}×${CANVAS[1]}`,
+        ),
         link(buildHash(['results']), 'results table'),
       ]),
     )
@@ -54,6 +59,7 @@ export async function benchView(root: HTMLElement, state: HashState): Promise<Vi
     const app = await LabApp.create({
       canvas,
       seed,
+      coverage,
       experiments: [{ entry, ns: 'p', query: state.q }],
       onError: (m) => overlay.toast(m, 'error'),
       onShaderMessage: (m) => overlay.toast(m.text, m.kind === 'error' ? 'error' : 'info'),
@@ -111,7 +117,7 @@ export async function benchView(root: HTMLElement, state: HashState): Promise<Vi
         : null
       const result: BenchResult = {
         schemaVersion: BENCH_SCHEMA_VERSION,
-        experiment: { id, params: { ...view.params }, spline: splineName, seed },
+        experiment: { id, params: { ...view.params }, spline: splineName, seed, coverage },
         meta: {
           date: new Date().toISOString(),
           paramsHash: paramsHash(view.params),

@@ -37,6 +37,19 @@ export interface ExperimentModule<S extends ParamSchema = ParamSchema> {
   create(ctx: ExperimentContext<S>): Experiment | Promise<Experiment>
 }
 
+/**
+ * The workload contract, identical for every view on a page (URL-driven):
+ * experiments MUST render all plants of their species within `radius` meters
+ * of the origin, at species density × `densityScale`. This is what makes
+ * "render 100M plants in both" a fair A/B — both sides get the same numbers.
+ */
+export interface Coverage {
+  /** Half-size (m) of the square region around the origin to cover. */
+  radius: number
+  /** Global multiplier on species densities (scatter clamps at 8/m²). */
+  densityScale: number
+}
+
 export interface SceneServices {
   terrain: Terrain
   scatter: Scatter
@@ -85,6 +98,8 @@ export interface ExperimentContext<S extends ParamSchema = ParamSchema> {
   params: ParamValues<S>
   /** Placement seed (URL `seed`). Feed it to scatter / the shared hash. */
   seed: number
+  /** The workload this experiment must cover — same for every view on a page. */
+  coverage: Coverage
   meshes: MeshCatalog
   size(): { width: number; height: number }
 }

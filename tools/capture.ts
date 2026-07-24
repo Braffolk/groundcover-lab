@@ -79,7 +79,7 @@ for (const id of experiments) {
   console.log(id)
   if (mode === 'thumbs') {
     const url = `${BASE}/#/run/${id}?det=1&t=2&cam=grazing`
-    if (await settleAndClick(url, '📷 thumbnail', 2500)) console.log('  ✓ thumbnail')
+    if (await settleAndClick(url, 'thumbnail', 2500)) console.log('  ✓ thumbnail')
   } else if (mode === 'goldens') {
     for (const cam of STANDARD_CAMS) {
       const url = `${BASE}/#/run/${id}?det=1&t=2&cam=${cam}`

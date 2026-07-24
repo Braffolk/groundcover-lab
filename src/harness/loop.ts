@@ -15,6 +15,7 @@ import { builtinSplines } from '../scene/spline.ts'
 import { Terrain } from '../scene/terrain.ts'
 import { WIND_DEFAULTS } from '../scene/wind.ts'
 import type {
+  Coverage,
   Experiment,
   ExperimentContext,
   FrameInfo,
@@ -53,6 +54,7 @@ export interface Compositor {
 export interface LabAppOptions {
   canvas: HTMLCanvasElement
   seed: number
+  coverage: Coverage
   experiments: { entry: RegistryEntry; ns: 'p' | 'a' | 'b'; query: URLSearchParams }[]
   onError: (message: string) => void
   onShaderMessage: (msg: ShaderMessage) => void
@@ -163,6 +165,7 @@ export class LabApp {
       timing: new ScopedTimer(this.timer, name === 'solo' ? '' : `${name}/`),
       params,
       seed: this.opts.seed,
+      coverage: this.opts.coverage,
       meshes: meshCatalog,
       size: () => ({ width: app.width, height: app.height }),
     }

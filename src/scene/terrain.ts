@@ -13,7 +13,7 @@ export interface TerrainDesc {
   heightScale: number
 }
 
-export const TERRAIN_DEFAULTS: TerrainDesc = { seed: 1337, size: 256, resolution: 512, heightScale: 4 }
+export const TERRAIN_DEFAULTS: TerrainDesc = { seed: 1337, size: 256, resolution: 512, heightScale: 14 }
 
 /**
  * Seeded FBM heightfield. The rgba16float heightmap texture (r=height,
@@ -121,16 +121,26 @@ export class Terrain {
   }
 }
 
-/** CPU-only FBM value noise (generation is not mirrored in WGSL — the texture is the contract). */
+/**
+ * CPU-only FBM value noise (generation is not mirrored in WGSL — the texture
+ * is the contract). Octave 1 is ridged, giving proper steep hillsides so
+ * techniques get debugged against strong grazing angles, not just flats.
+ */
 function fbm(seed: number, x: number, z: number): number {
+  const octaves: [wavelength: number, amp: number, ridged: boolean][] = [
+    [150, 0.5, false],
+    [60, 0.28, true],
+    [24, 0.14, false],
+    [10, 0.06, false],
+    [4.5, 0.025, false],
+    [2, 0.01, false],
+  ]
   let sum = 0
-  let amp = 0.52
-  let wavelength = 96
-  for (let o = 0; o < 5; o++) {
-    sum += valueNoise(seed + o * 101, x / wavelength, z / wavelength) * amp
-    amp *= 0.5
-    wavelength *= 0.5
-  }
+  octaves.forEach(([wavelength, amp, ridged], o) => {
+    let n = valueNoise(seed + o * 101, x / wavelength, z / wavelength)
+    if (ridged) n = 1 - 2 * Math.abs(n)
+    sum += n * amp
+  })
   return sum
 }
 

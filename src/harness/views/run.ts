@@ -10,8 +10,12 @@ import { findExperiment } from '../registry.ts'
 import {
   button,
   copyToClipboard,
+  coverageControls,
   currentBookmarkName,
   el,
+  estimatePlants,
+  formatCount,
+  readCoverage,
   readSeed,
   resolveCam,
   setupCameraSync,
@@ -34,6 +38,7 @@ export async function runView(root: HTMLElement, state: HashState): Promise<View
     const entry = await findExperiment(id)
     const manifest = entry.manifest!
     const seed = readSeed(state.q)
+    const coverage = readCoverage(state.q)
 
     page.appendChild(
       topbar(manifest.title, [
@@ -53,6 +58,7 @@ export async function runView(root: HTMLElement, state: HashState): Promise<View
     const app = await LabApp.create({
       canvas,
       seed,
+      coverage,
       experiments: [{ entry, ns: 'p', query: state.q }],
       onError: (m) => overlay.toast(m, 'error'),
       onShaderMessage: (m) =>
@@ -84,6 +90,9 @@ export async function runView(root: HTMLElement, state: HashState): Promise<View
       stats: app.stats,
       vram: () => app.vramReport(),
       gpuTimingAvailable: app.gpu.hasTimestamps,
+      extraLines: () => [
+        `coverage ±${coverage.radius}m · density ×${coverage.densityScale} · ~${formatCount(estimatePlants(manifest.species, coverage))} plants`,
+      ],
     })
     cleanups.push(() => hud.dispose())
 
@@ -107,7 +116,7 @@ export async function runView(root: HTMLElement, state: HashState): Promise<View
       button('copy link', () => {
         void copyToClipboard(location.href).then(() => overlay.toast('link copied'))
       }),
-      button('📷 thumbnail', () => {
+      button('thumbnail', () => {
         void captureViewPng(app)
           .then((blob) => uploadCapture(id, blob))
           .then((saved) => overlay.toast(`saved ${saved} — shows on the browser card`))
@@ -127,9 +136,14 @@ export async function runView(root: HTMLElement, state: HashState): Promise<View
           .then((saved) => overlay.toast(`saved ${saved}`))
           .catch((err: unknown) => overlay.toast(String(err), 'error'))
       }),
-      button('bench →', () => {
-        location.hash = buildHash(['bench', id], { seed: String(seed) })
+      button('bench', () => {
+        location.hash = buildHash(['bench', id], {
+          seed: String(seed),
+          radius: String(coverage.radius),
+          dscale: String(coverage.densityScale),
+        })
       }),
+      ...coverageControls(coverage),
     )
     viewer.appendChild(toolbar)
 

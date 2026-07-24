@@ -1,7 +1,7 @@
 import { defineExperiment, HARNESS_API, p } from '@harness'
 
 export const PARAMS = {
-  tiles: p.num(3, { min: 1, max: 8, step: 1 }),
+  tiles: p.num(3, { min: 1, max: 16, step: 1 }),
   sway: p.num(1, { min: 0, max: 3, step: 0.05 }),
 }
 

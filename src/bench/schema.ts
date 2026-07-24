@@ -10,6 +10,8 @@ export interface BenchResult {
     params: Record<string, unknown>
     spline: string
     seed: number
+    /** Shared workload the run covered — part of comparability. */
+    coverage: { radius: number; densityScale: number }
   }
   meta: {
     date: string

@@ -56,7 +56,7 @@ export class Hud {
     }
     rows.push('</table>')
     if (this.opts.contended) {
-      rows.push(`<div class="section">⚠ A/B timings are contended — bench solo for real numbers</div>`)
+      rows.push(`<div class="section">A/B timings are contended — bench solo for real numbers</div>`)
     }
 
     const vram = this.opts.vram()

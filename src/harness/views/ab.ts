@@ -9,7 +9,11 @@ import { findExperiment } from '../registry.ts'
 import {
   button,
   copyToClipboard,
+  coverageControls,
   el,
+  estimatePlants,
+  formatCount,
+  readCoverage,
   readSeed,
   resolveCam,
   setupCameraSync,
@@ -36,9 +40,12 @@ export async function abView(root: HTMLElement, state: HashState): Promise<View>
   try {
     const [entryA, entryB] = await Promise.all([findExperiment(idA), findExperiment(idB)])
     const seed = readSeed(state.q)
+    const coverage = readCoverage(state.q)
 
     page.appendChild(
-      topbar(`A/B — timings contended, bench solo for truth`, [el('span', 'hint', `seed ${seed}`)]),
+      topbar(`A/B — timings contended, bench solo for truth`, [
+        el('span', 'hint', `seed ${seed} · ±${coverage.radius}m · density ×${coverage.densityScale}`),
+      ]),
     )
     const content = el('div', 'content')
     const viewer = el('div', 'viewer')
@@ -50,6 +57,7 @@ export async function abView(root: HTMLElement, state: HashState): Promise<View>
     const app = await LabApp.create({
       canvas,
       seed,
+      coverage,
       experiments: [
         { entry: entryA, ns: 'a', query: state.q },
         { entry: entryB, ns: 'b', query: state.q },
@@ -143,12 +151,15 @@ export async function abView(root: HTMLElement, state: HashState): Promise<View>
       gpuTimingAvailable: app.gpu.hasTimestamps,
       contended: true,
       extraLines: () => {
-        if (compositor.mode === 'flicker') return [`showing ${compositor.side === 0 ? 'A' : 'B'} — Space to swap`]
+        const lines = [
+          `coverage ±${coverage.radius}m · ×${coverage.densityScale} · A ~${formatCount(estimatePlants(entryA.manifest!.species, coverage))} · B ~${formatCount(estimatePlants(entryB.manifest!.species, coverage))} plants`,
+        ]
+        if (compositor.mode === 'flicker') lines.push(`showing ${compositor.side === 0 ? 'A' : 'B'} — Space to swap`)
         if (compositor.mode === 'diff' && compositor.lastDiff) {
           const d = compositor.lastDiff
-          return [`diff mean ${(d.mean * 255).toFixed(2)}/255 · ${(d.overFrac * 100).toFixed(2)}% px differ`]
+          lines.push(`diff mean ${(d.mean * 255).toFixed(2)}/255 · ${(d.overFrac * 100).toFixed(2)}% px differ`)
         }
-        return []
+        return lines
       },
     })
     cleanups.push(() => hud.dispose())
@@ -177,13 +188,14 @@ export async function abView(root: HTMLElement, state: HashState): Promise<View>
     const toolbar = el('div', 'toolbar')
     toolbar.append(
       ...modeButtons,
-      button('swap A↔B', () => {
+      button('swap A/B', () => {
         const q = Object.fromEntries(state.q)
         navigate(['ab', idB, idA], q)
       }),
       button('copy link', () => {
         void copyToClipboard(location.href).then(() => overlay.toast('link copied'))
       }),
+      ...coverageControls(coverage),
     )
     viewer.appendChild(toolbar)
     setMode(compositor.mode)

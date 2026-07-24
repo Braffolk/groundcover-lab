@@ -1,4 +1,8 @@
 import { parsePose, type CameraPose } from '../../scene/camera.ts'
+import { SPECIES } from '../../scene/species.ts'
+import { SCATTER_MAX_DENSITY } from '../../scene/scatter.ts'
+import { updateQuery } from '../../url/state.ts'
+import type { Coverage } from '../registry.ts'
 
 export interface View {
   dispose(): void
@@ -39,6 +43,59 @@ export function button(label: string, onClick: () => void, className = ''): HTML
 export function readSeed(q: URLSearchParams): number {
   const v = Number(q.get('seed'))
   return Number.isFinite(v) && v > 0 ? Math.floor(v) : 42
+}
+
+/** Workload from URL: `radius` (m, half-size) and `dscale` (density multiplier). */
+export function readCoverage(q: URLSearchParams): Coverage {
+  // Number(null) is 0 — treat absent params as absent, not zero.
+  const radius = q.has('radius') ? Number(q.get('radius')) : NaN
+  const dscale = q.has('dscale') ? Number(q.get('dscale')) : NaN
+  return {
+    radius: Number.isFinite(radius) && radius > 0 ? Math.min(radius, 8192) : 128,
+    densityScale: Number.isFinite(dscale) && dscale >= 0 ? Math.min(dscale, 64) : 1,
+  }
+}
+
+/** Estimated plant count for a species set under a coverage (scatter clamps at 8/m²). */
+export function estimatePlants(speciesIds: string[], coverage: Coverage): number {
+  const area = (coverage.radius * 2) ** 2
+  let total = 0
+  for (const id of speciesIds) {
+    const s = SPECIES.find((s) => s.id === id)
+    if (s) total += Math.min(s.density * coverage.densityScale, SCATTER_MAX_DENSITY) * area
+  }
+  return total
+}
+
+export function formatCount(n: number): string {
+  if (n >= 1e9) return `${(n / 1e9).toFixed(1)}B`
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`
+  if (n >= 1e3) return `${(n / 1e3).toFixed(0)}k`
+  return `${Math.round(n)}`
+}
+
+/**
+ * Toolbar inputs for the shared workload — writing them reloads the route so
+ * every experiment on the page rebuilds against the new coverage.
+ */
+export function coverageControls(coverage: Coverage): HTMLElement[] {
+  const make = (labelText: string, value: number, key: 'radius' | 'dscale', step: number): HTMLElement => {
+    const label = el('label', undefined, labelText)
+    const input = el('input')
+    input.type = 'number'
+    input.min = '0'
+    input.step = String(step)
+    input.value = String(value)
+    input.addEventListener('change', () => {
+      const v = Number(input.value)
+      if (!Number.isFinite(v) || v < 0) return
+      updateQuery({ [key]: String(v) })
+      location.reload()
+    })
+    label.appendChild(input)
+    return label
+  }
+  return [make('radius m', coverage.radius, 'radius', 16), make('density ×', coverage.densityScale, 'dscale', 0.25)]
 }
 
 /** `cam` param: a bookmark name or a serialized pose. */

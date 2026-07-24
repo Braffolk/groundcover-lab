@@ -11,9 +11,13 @@ import type { PARAMS } from './manifest.ts'
 export function create(ctx: ExperimentContext<typeof PARAMS>): Experiment {
   const { device } = ctx
   const species = speciesById('grass-blade')
-  const region = { minX: -48, minZ: -48, maxX: 48, maxZ: 48 }
+  // Honor the shared workload: cover ctx.coverage.radius at the shared
+  // density scale (times this experiment's own density param).
+  const r = ctx.coverage.radius
+  const region = { minX: -r, minZ: -r, maxX: r, maxZ: r }
+  const densityScale = (): number => ctx.params.density * ctx.coverage.densityScale
 
-  let instances = ctx.scene.scatter.instanceBuffer(ctx.res, device.queue, species, region, ctx.params.density)
+  let instances = ctx.scene.scatter.instanceBuffer(ctx.res, device.queue, species, region, densityScale())
 
   const paramsBuffer = ctx.res.createBuffer(
     { label: `${ctx.id}/params`, size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST },
@@ -87,7 +91,7 @@ export function create(ctx: ExperimentContext<typeof PARAMS>): Experiment {
     onParamsChanged(keys: ReadonlySet<string>): void {
       if (keys.has('density')) {
         instances.buffer.destroy()
-        instances = ctx.scene.scatter.instanceBuffer(ctx.res, device.queue, species, region, ctx.params.density)
+        instances = ctx.scene.scatter.instanceBuffer(ctx.res, device.queue, species, region, densityScale())
         makeBindGroup()
       }
     },

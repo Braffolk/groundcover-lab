@@ -7,6 +7,7 @@
 export {
   HARNESS_API,
   defineExperiment,
+  type Coverage,
   type Experiment,
   type ExperimentContext,
   type ExperimentManifest,

@@ -4,7 +4,7 @@ Rules:
 - No raycasting/raymarching - precomputed raycast is allowed - O(1)
 - Targeted for low-mid end devices
 - No actual geometry is handled per frame (processed or rendered)
-- Max VRAM extra usage per species of groundcover is 25MB (may increase on ultra detail setup)
+- Max VRAM extra usage per species of groundcover is 25MB (may increase on ultra detail setup). Treat as a strong default, not an absolute: stay within it in ~95% of cases, but a novel method may exceed it if it delivers great results — document why in the experiment's NOTES.md.
 - Wind swaying (varying by species, e.g none for moss)
 - Proper normals, lighting, etc effects applied on fake geometry
 - You may borrow ideas from things like impostors etc

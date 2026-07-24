@@ -72,6 +72,8 @@ export async function resultsView(root: HTMLElement): Promise<View> {
       return (
         row.r.experiment.spline === base.r.experiment.spline &&
         row.r.experiment.seed === base.r.experiment.seed &&
+        row.r.experiment.coverage?.radius === base.r.experiment.coverage?.radius &&
+        row.r.experiment.coverage?.densityScale === base.r.experiment.coverage?.densityScale &&
         row.r.meta.canvas.join() === base.r.meta.canvas.join() &&
         row.r.meta.timestampQuery === base.r.meta.timestampQuery
       )
@@ -114,7 +116,7 @@ export async function resultsView(root: HTMLElement): Promise<View> {
       const cls = row.name === baseline ? 'baseline' : ''
       parts.push(
         `<tr class="${cls}" data-name="${row.name}">` +
-          `<td>${row.r.experiment.id}<br><span class="hint mono">p-${row.r.meta.paramsHash} seed ${row.r.experiment.seed}</span></td>` +
+          `<td>${row.r.experiment.id}<br><span class="hint mono">p-${row.r.meta.paramsHash} seed ${row.r.experiment.seed}${row.r.experiment.coverage ? ` r${row.r.experiment.coverage.radius} d${row.r.experiment.coverage.densityScale}` : ''}</span></td>` +
           `<td>${row.r.meta.adapterSlug}${row.r.meta.timestampQuery ? '' : ' <span class="delta worse">no-ts</span>'}</td>` +
           `<td>${row.r.experiment.spline}</td>` +
           `<td>${row.r.meta.date.slice(0, 16).replace('T', ' ')}</td>` +
@@ -166,7 +168,7 @@ export async function resultsView(root: HTMLElement): Promise<View> {
     comparableOnly = comparableToggle.checked
     render()
   })
-  const lbl = el('label', 'hint', ' comparable to baseline only (same spline/seed/canvas/timing class)')
+  const lbl = el('label', 'hint', ' comparable to baseline only (same spline/seed/coverage/canvas/timing class)')
   lbl.htmlFor = 'cmp'
   controls.append(comparableToggle, lbl)
   container.insertBefore(controls, table)

@@ -15,9 +15,10 @@ Forbidden: `src/**`, other experiments, `package.json`, any shared file. If the 
 
 - Import only from `@harness` (plus your own files). Set `harnessApi` in your manifest.
 - The harness owns device/canvas/camera/terrain/scatter/wind and draws the terrain+sky base pass. You append compute/render passes via `ctx.timing.renderPass/computePass` (auto-timed) with `loadOp: 'load'` against the provided color/depth targets.
-- Allocate GPU memory only via `ctx.res` (the VRAM tracker) — pass `{ species }` so the 25MB/species budget bar in the HUD is meaningful. The budget is a hard rule from the README.
+- Allocate GPU memory only via `ctx.res` (the VRAM tracker) — pass `{ species }` so the 25MB/species budget bar in the HUD is meaningful. The budget is a strong default, not an absolute: stay within it in ~95% of cases; a genuinely novel method may exceed it when the results justify it — document the why and the actual numbers in `NOTES.md`.
 - Determinism: randomness only via the shared PCG hash (`@harness`), animation only from `frame.time`. Never `Math.random`/`Date.now` in render paths. The A/B diff view will expose you.
 - Plant placement must come from the shared scatter service (TS buffers or the bit-identical WGSL twin `src/wgsl/scatter.wgsl`) so all experiments place every plant identically.
+- **Honor `ctx.coverage`** ({ radius, densityScale }, from URL `radius`/`dscale`): render all plants of your species within ±radius meters of the origin at species density × densityScale. This is the fairness contract — it's what lets an A/B say "render 100M plants in both" and mean it. Estimated plant count shows in the HUD.
 - You MAY read the raw source mesh (`ctx` mesh catalog, GCMESH1) and invent any novel baked representation. Put baked artifacts in `mesh/baked/<your-id>/` via the bake flow; format is entirely yours.
 
 ## Comparing & claiming results
