@@ -1,3 +1,4 @@
+import { HAS_DEV_SINK } from '../util/env.ts'
 import type { LabApp } from './loop.ts'
 
 /**
@@ -53,7 +54,9 @@ export async function captureViewPng(app: LabApp, viewIndex = 0, maxWidth?: numb
   return canvas.convertToBlob({ type: 'image/png' })
 }
 
+/** Writes into the repo — dev server only; the buttons are hidden otherwise. */
 export async function uploadCapture(expId: string, blob: Blob, golden?: string): Promise<string> {
+  if (!HAS_DEV_SINK) throw new Error('captures cannot be saved on a static build')
   const url = `/__thumb?exp=${encodeURIComponent(expId)}${golden ? `&cam=${encodeURIComponent(golden)}` : ''}`
   const res = await fetch(url, { method: 'POST', body: blob })
   if (!res.ok) throw new Error(`upload failed: ${res.status} ${await res.text()}`)

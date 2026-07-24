@@ -11,6 +11,7 @@ import {
   copyToClipboard,
   debugPicker,
   el,
+  fatalDetail,
   readSeed,
   readStand,
   resolveCam,
@@ -214,7 +215,7 @@ export async function abView(root: HTMLElement, state: HashState): Promise<View>
     app.start()
     return { dispose }
   } catch (err) {
-    overlay.fatal(`Failed to start A/B ${idA} vs ${idB}`, err instanceof Error ? (err.stack ?? err.message) : String(err))
+    overlay.fatal(`Failed to start A/B ${idA} vs ${idB}`, fatalDetail(err))
     return { dispose }
   }
 }

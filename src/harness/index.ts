@@ -56,3 +56,12 @@ export { GcMesh, parseGcMesh, type GcMeshHeader } from '../mesh/gcmesh.ts'
 export { MeshCatalog, type MeshInfo } from '../mesh/catalog.ts'
 
 export { bakedArtifact, commitBake, type BakeContext } from '../bake/io.ts'
+
+/**
+ * Deploy-awareness. `assetUrl('/mesh/baked/...')` is the correct way to build
+ * a runtime asset URL (identity in dev, base-prefixed in a static build);
+ * HAS_DEV_SINK is false on static deployments, where nothing can be written
+ * back into the repo.
+ */
+export { assetUrl } from '../util/paths.ts'
+export { HAS_DEV_SINK, RAW_MESHES_AVAILABLE } from '../util/env.ts'

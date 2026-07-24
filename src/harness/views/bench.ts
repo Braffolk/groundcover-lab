@@ -2,11 +2,12 @@ import { BENCH_SCHEMA_VERSION, type BenchResult } from '../../bench/schema.ts'
 import { downloadResult, postBenchResult } from '../../bench/store.ts'
 import { summarize } from '../../gpu/timing.ts'
 import { buildHash, type HashState } from '../../url/state.ts'
+import { HAS_DEV_SINK } from '../../util/env.ts'
 import { Overlay } from '../../ui/overlay.ts'
 import { LabApp } from '../loop.ts'
 import { paramsHash } from '../params.ts'
 import { findExperiment, HARNESS_API } from '../registry.ts'
-import { button, el, link, readSeed, readStand, topbar, type View } from './shared.ts'
+import { button, el, fatalDetail, link, readSeed, readStand, topbar, type View } from './shared.ts'
 
 const CANVAS: [number, number] = [1600, 900]
 
@@ -14,7 +15,8 @@ const CANVAS: [number, number] = [1600, 900]
  * #/bench/<id>?spline=orbit-low&warmup=120&frames=600 — the ONLY
  * authoritative timing source. Fixed canvas size, fixed timestep, spline-
  * driven camera: every run of every experiment sees the same pixels.
- * The result auto-saves to results/ via the dev-server sink.
+ * The result auto-saves to results/ via the dev-server sink; on a static
+ * deployment there is no sink, so the JSON is downloaded instead.
  */
 export async function benchView(root: HTMLElement, state: HashState): Promise<View> {
   const id = state.path[1] ?? ''
@@ -150,11 +152,18 @@ export async function benchView(root: HTMLElement, state: HashState): Promise<Vi
       }
       status.textContent = summaryRows.join('\n')
 
-      try {
-        const saved = await postBenchResult(result)
-        overlay.toast(`saved ${saved}`)
-      } catch {
-        overlay.toast('dev server sink unavailable — downloading result instead', 'warn')
+      if (HAS_DEV_SINK) {
+        try {
+          const saved = await postBenchResult(result)
+          overlay.toast(`saved ${saved}`)
+        } catch {
+          overlay.toast('dev server sink unavailable — downloading result instead', 'warn')
+          downloadResult(result)
+        }
+      } else {
+        // Read-only deployment: nothing to save into, so go straight to the
+        // download (drag it onto the results table to compare it there).
+        overlay.toast('read-only deployment — downloading result JSON (drop it on the results table)', 'warn', 8000)
         downloadResult(result)
       }
 
@@ -204,7 +213,7 @@ export async function benchView(root: HTMLElement, state: HashState): Promise<Vi
     app.start()
     return { dispose }
   } catch (err) {
-    overlay.fatal(`Bench failed for "${id}"`, err instanceof Error ? (err.stack ?? err.message) : String(err))
+    overlay.fatal(`Bench failed for "${id}"`, fatalDetail(err))
     return { dispose }
   }
 }

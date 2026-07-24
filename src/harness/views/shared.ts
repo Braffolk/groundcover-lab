@@ -1,4 +1,5 @@
 import { parsePose, type CameraPose } from '../../scene/camera.ts'
+import { MESH_NOT_DEPLOYED } from '../../mesh/catalog.ts'
 import { standById, standPlantCounts, STANDS, type Stand } from '../../scene/stands.ts'
 import { updateQuery } from '../../url/state.ts'
 
@@ -104,6 +105,25 @@ export function resolveCam(
 
 export async function copyToClipboard(text: string): Promise<void> {
   await navigator.clipboard.writeText(text)
+}
+
+/**
+ * Detail text for overlay.fatal(). Normally the stack — but an experiment
+ * that wanted a raw source mesh on a deployment built without them fails for
+ * a boring, explainable reason, so say that instead of dumping a minified
+ * stack the visitor cannot act on.
+ */
+export function fatalDetail(err: unknown): string {
+  const message = err instanceof Error ? err.message : String(err)
+  if (message.includes(MESH_NOT_DEPLOYED)) {
+    return (
+      `${message}\n\n` +
+      'This view reads the raw GCMESH1 source mesh, and the ~357MB of source binaries are not part of ' +
+      'this deployment. Rebuild with GC_DEPLOY_MESHES=1, or run the lab locally (npm run dev). ' +
+      'Experiments with committed baked artifacts are unaffected.'
+    )
+  }
+  return err instanceof Error ? (err.stack ?? err.message) : String(err)
 }
 
 // ---------------------------------------------------------------------------
