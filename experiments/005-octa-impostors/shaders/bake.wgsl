@@ -1,64 +1,82 @@
-// Offscreen bake pass: renders the source mesh orthographically from one
-// hemi-octahedral view direction into a single atlas tile (set via viewport).
-// One draw per tile; the per-tile basis + framing come from the Tile uniform.
-// MRT: target0 = albedo(rgb) + coverage(a), target1 = local-frame normal.
+// Offline (in-browser, once) view-set bake: the raw GCMESH1 mesh rendered
+// orthographically, once per hemi-octahedral view node, into one atlas tile.
+// The projection basis is built by the SAME rule the runtime uses
+// (view_right() in impostor_info.wgsl), and each view gets its own extents —
+// the plant AABB projected onto that basis — so no tile wastes texels on
+// empty margin and the runtime can reproject into any view exactly.
+//
+//   target 0: rgb = authored albedo, a = coverage
+//   target 1: rgb = local-frame normal * 0.5 + 0.5, flipped toward the bake
+//             camera so the supersample average of a two-sided blade does not
+//             cancel to zero. a = 1.
+//
+// Self-contained: no @group(0) frame include.
 
-struct Tile {
-  center: vec3f, inv_r: f32,
-  right: vec3f, _p0: f32,
-  up: vec3f, _p1: f32,
-  fwd: vec3f, _p2: f32,
-  bmin: vec3f, _p3: f32,
-  bmax: vec3f, _p4: f32,
+struct BakeView {
+  right: vec4f,   // xyz view right axis, w = half extent u (m)
+  up: vec4f,      // xyz view up axis,    w = half extent v (m)
+  fwd: vec4f,     // xyz toward the camera, w = half extent along fwd (depth)
+  centre: vec4f,  // mesh-frame capture centre xyz
+  b_min: vec4f,   // mesh bounds min (dequantization)
+  b_range: vec4f, // mesh bounds max - min
 }
-@group(0) @binding(0) var<uniform> tile: Tile;
+@group(0) @binding(0) var<uniform> bake_view: BakeView;
 
 struct VOut {
   @builtin(position) pos: vec4f,
   @location(0) color: vec3f,
-  @location(1) normal: vec3f,
+  @location(1) nrm: vec3f,
 }
 
-// Standard octahedral normal decode (y up) — mirrors GcMesh.normalAt().
-fn oct_decode(e: vec2f) -> vec3f {
-  let y = 1.0 - abs(e.x) - abs(e.y);
+// Octahedral decode, y-primary — mirrors GcMesh.normalAt() in src/mesh/gcmesh.ts.
+fn oct_decode_mesh(e: vec2f) -> vec3f {
   var x = e.x;
   var z = e.y;
+  let y = 1.0 - abs(e.x) - abs(e.y);
   if (y < 0.0) {
-    x = (1.0 - abs(e.y)) * sign(e.x);
-    z = (1.0 - abs(e.x)) * sign(e.y);
+    x = (1.0 - abs(e.y)) * select(-1.0, 1.0, e.x >= 0.0);
+    z = (1.0 - abs(e.x)) * select(-1.0, 1.0, e.y >= 0.0);
   }
   return normalize(vec3f(x, y, z));
 }
 
 @vertex
-fn vs(@location(0) a0: vec4<u32>, @location(1) a1: vec4<u32>) -> VOut {
-  let q = vec3f(f32(a0.x), f32(a0.y), f32(a0.z)) / 65535.0;
-  let p = tile.bmin + q * (tile.bmax - tile.bmin);
-  let rel = p - tile.center;
-  // Orthographic projection onto the tile basis; z mapped to [0,1] depth
-  // (points nearer the capture camera get smaller z, so depthCompare 'less').
-  let cx = dot(rel, tile.right) * tile.inv_r;
-  let cy = dot(rel, tile.up) * tile.inv_r;
-  let cz = 0.5 - dot(rel, tile.fwd) * tile.inv_r * 0.5;
+fn vs(@location(0) q_pos: vec4<u32>, @location(1) q_attr: vec4<u32>) -> VOut {
+  // Vertex record: [x y z r] [g b octU octV], all u16 UNORM against bounds.
+  let p = bake_view.b_min.xyz + (vec3f(vec3<u32>(q_pos.xyz)) / 65535.0) * bake_view.b_range.xyz;
+  let color = vec3f(f32(q_pos.w), f32(q_attr.x), f32(q_attr.y)) / 65535.0;
+  let oct = (vec2f(f32(q_attr.z), f32(q_attr.w)) / 65535.0) * 2.0 - 1.0;
 
-  var o: VOut;
-  o.pos = vec4f(cx, cy, cz, 1.0);
-  o.color = vec3f(f32(a0.w), f32(a1.x), f32(a1.y)) / 65535.0;
-  let e = vec2f(f32(a1.z), f32(a1.w)) / 65535.0 * 2.0 - 1.0;
-  o.normal = oct_decode(e);
-  return o;
+  let off = p - bake_view.centre.xyz;
+  // Orthographic: +u right, +v up. NDC y points up, so framebuffer row 0 is
+  // the TOP of the tile — the runtime undoes that with tex_v = 0.5 - 0.5*v.
+  let u = dot(off, bake_view.right.xyz) / bake_view.right.w;
+  let v = dot(off, bake_view.up.xyz) / bake_view.up.w;
+  let d = 0.5 - 0.5 * dot(off, bake_view.fwd.xyz) / bake_view.fwd.w;
+
+  var out: VOut;
+  out.pos = vec4f(u, v, clamp(d, 0.0, 1.0), 1.0);
+  out.color = color;
+  out.nrm = oct_decode_mesh(oct);
+  return out;
 }
 
 struct FOut {
   @location(0) albedo: vec4f,
-  @location(1) normal: vec4f,
+  @location(1) nrm: vec4f,
 }
 
 @fragment
-fn fs(i: VOut) -> FOut {
-  var o: FOut;
-  o.albedo = vec4f(i.color, 1.0);
-  o.normal = vec4f(normalize(i.normal) * 0.5 + 0.5, 1.0);
-  return o;
+fn fs(in: VOut) -> FOut {
+  // Grass blades are single-sided sheets; store the face that looks at this
+  // view so the 2x2 supersample resolve averages agreeing normals instead of
+  // cancelling front against back.
+  var n = normalize(in.nrm);
+  if (dot(n, bake_view.fwd.xyz) < 0.0) {
+    n = -n;
+  }
+  var out: FOut;
+  out.albedo = vec4f(in.color, 1.0);
+  out.nrm = vec4f(n * 0.5 + 0.5, 1.0);
+  return out;
 }

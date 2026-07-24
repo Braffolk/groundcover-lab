@@ -169,43 +169,48 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
   const cellMin = Math.floor(-ctx.stand.radius / CELL)
   const cellMax = Math.floor(ctx.stand.radius / CELL)
   const info = new Float32Array(INFO_FLOATS)
+  const planes = new Float32Array(24)
   const indirectReset = new Uint32Array(4)
-  let side = 1
 
   return {
     update(frame: FrameInfo): void {
       const R = Math.min(ctx.params.regionRadius, REGION_MAX)
       const cam = frame.camera.pose
-      side = Math.ceil((2 * R) / CELL) + 1
-      const originX = Math.floor((cam.x - R) / CELL)
-      const originZ = Math.floor((cam.z - R) / CELL)
-      const planes = frustumPlanes(frame.camera.viewProj)
+      // Region cell rect, clamped to the stand's cell range on the CPU: cells
+      // outside the stand hold nothing, so they must not be dispatched (on a
+      // small stand — close-quality is ±24m — that is most of the region).
+      const x0 = Math.max(cellMin, Math.floor((cam.x - R) / CELL))
+      const z0 = Math.max(cellMin, Math.floor((cam.z - R) / CELL))
+      const x1 = Math.min(cellMax, Math.floor((cam.x + R) / CELL))
+      const z1 = Math.min(cellMax, Math.floor((cam.z + R) / CELL))
+      const sideX = Math.max(0, x1 - x0 + 1)
+      const sideZ = Math.max(0, z1 - z0 + 1)
+      frustumPlanes(frame.camera.viewProj, planes)
 
       indirectReset[0] = ctx.params.topCard ? 12 : 6
       entries.forEach((entry, entryIndex) => {
         const a = entry.gpu.atlas
         info.set(planes, 0)
-        info[24] = originX
-        info[25] = originZ
-        info[26] = side
-        info[27] = ctx.seed
-        info[28] = entryIndex
-        info[29] = R
-        info[30] = entry.capacity
-        info[31] = cellMin
-        info[32] = cellMax
-        info[33] = a.y0
-        info[34] = a.y1
-        info[35] = a.rXZ
-        info[36] = a.cx
-        info[37] = a.cz
-        info[38] = Math.max(a.rXZ, (a.y1 - a.y0) / 2) * 1.05
-        info[39] = ctx.params.alphaRef
-        info[40] = TOP_FRAC
-        info[41] = ctx.params.bottomShade
+        info[24] = x0
+        info[25] = z0
+        info[26] = sideX
+        info[27] = sideZ
+        info[28] = ctx.seed
+        info[29] = entryIndex
+        info[30] = R
+        info[31] = entry.capacity
+        info[32] = a.y0
+        info[33] = a.y1
+        info[34] = a.rXZ
+        info[35] = a.cx
+        info[36] = a.cz
+        info[37] = Math.max(a.rXZ, (a.y1 - a.y0) / 2) * 1.05
+        info[38] = ctx.params.alphaRef
+        info[39] = TOP_FRAC
+        info[40] = ctx.params.bottomShade
         device.queue.writeBuffer(entry.infoBuffer, 0, info)
         device.queue.writeBuffer(entry.indirectBuffer, 0, indirectReset)
-        entry.slotsPerFrame = side * side * SCATTER_MAX_PER_CELL
+        entry.slotsPerFrame = sideX * sideZ * SCATTER_MAX_PER_CELL
       })
     },
 
@@ -214,6 +219,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       cull.setPipeline(cullPipeline)
       cull.setBindGroup(0, ctx.frame.bindGroup)
       for (const entry of entries) {
+        if (entry.slotsPerFrame === 0) continue // camera outside the stand
         cull.setBindGroup(1, entry.cullBindGroup)
         cull.dispatchWorkgroups(Math.ceil(entry.slotsPerFrame / 64))
       }
@@ -321,8 +327,7 @@ function uploadAtlas(ctx: ExperimentContext<typeof PARAMS>, speciesId: string, a
 }
 
 /** Gribb–Hartmann frustum planes from a column-major view-proj matrix. */
-function frustumPlanes(m: Float32Array | number[]): Float32Array {
-  const out = new Float32Array(24)
+function frustumPlanes(m: Float32Array | number[], out: Float32Array): void {
   const row = (r: number): [number, number, number, number] => [m[r]!, m[4 + r]!, m[8 + r]!, m[12 + r]!]
   const r0 = row(0)
   const r1 = row(1)
@@ -343,5 +348,4 @@ function frustumPlanes(m: Float32Array | number[]): Float32Array {
     out[i * 4 + 2] = p[2] / len
     out[i * 4 + 3] = p[3] / len
   })
-  return out
 }

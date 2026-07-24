@@ -1,5 +1,6 @@
 #include "src/wgsl/wind.wgsl"
 #include "src/wgsl/lighting.wgsl"
+#include "src/wgsl/debug.wgsl"
 #include "./entry_info.wgsl"
 
 // Billboard cards over baked imagery. Each culled instance draws 12 vertices:
@@ -120,7 +121,17 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
   }
 
   var out: VOut;
-  out.pos = frame.view_proj * vec4f(world, 1.0);
+  // A card whose fade dropped below the alpha reference has erode > 1, so
+  // EVERY one of its fragments discards — emit it behind the near plane
+  // instead of rasterizing a guaranteed-empty quad. This is exactly the set
+  // the fragment shader was already throwing away (fully faded top cards at
+  // low elevations, cards the camera is standing inside, the region rim), and
+  // those are precisely the ones that cover the most screen area.
+  if (fade < info.alpha_ref) {
+    out.pos = vec4f(0.0, 0.0, -1.0, 1.0);
+  } else {
+    out.pos = frame.view_proj * vec4f(world, 1.0);
+  }
   out.uv = uv;
   out.world = world;
   out.yaw_cs = vec2f(cos(yaw), sin(yaw));
@@ -156,7 +167,15 @@ fn fs_main(in: VOut) -> @location(0) vec4f {
     n_mesh.y,
     -in.yaw_cs.y * n_mesh.x + in.yaw_cs.x * n_mesh.z,
   );
+  // in.shade is a fake grounding occlusion, so it belongs to the light term:
+  // the albedo view then shows the baked atlas colour exactly as captured and
+  // the lighting view shows sun+ambient x grounding.
   var color = light_surface(alb.rgb * in.shade, n, in.world);
-  color = apply_fog(color, in.world);
-  return vec4f(color, 1.0);
+  // Fog only in the normal view — debug views stay unfogged and honest.
+  if (debug_mode() == DEBUG_OFF) {
+    color = apply_fog(color, in.world);
+  }
+  // Coverage = the baked alpha this fragment resolved to; with a hard alpha
+  // test that is also the alpha-test margin (everything below `erode` is gone).
+  return vec4f(debug_shade(color, alb.rgb, n, alb.a, in.world), 1.0);
 }

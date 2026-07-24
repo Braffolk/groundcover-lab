@@ -2,6 +2,7 @@
 #include "src/wgsl/wind.wgsl"
 #include "src/wgsl/lighting.wgsl"
 #include "src/wgsl/hash.wgsl"
+#include "src/wgsl/debug.wgsl"
 
 // Axis-locked slice-stack volume impostors.
 //
@@ -48,7 +49,7 @@ struct VOut {
   @builtin(position) pos: vec4f,
   @location(0) uvw: vec3f,
   @location(1) world: vec3f,
-  // x: alpha scale, y: slab thickness in voxels, z: mip level, w: axis id
+  // x: alpha scale, y: slab optical depth (slabVox^0.7), z: mip level, w: axis id
   @location(2) @interpolate(flat) misc: vec4f,
   // cos/sin of plant yaw for rotating baked normals to world.
   @location(3) @interpolate(flat) rot: vec2f,
@@ -150,22 +151,28 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
 
   out.world = world;
   out.pos = frame.view_proj * vec4f(world, 1.0);
-  out.misc = vec4f(inside, slab_vox, lod, f32(axis));
+  // pow(slab_vox, 0.7) is constant over the whole slice quad — resolve it here
+  // (6 vertices) instead of in every fragment the quad covers.
+  out.misc = vec4f(inside, pow(slab_vox, 0.7), lod, f32(axis));
   out.rot = vec2f(c, s);
   return out;
 }
 
-fn oct_decode(e: vec2f) -> vec3f {
-  let u = e.x * 2.0 - 1.0;
-  let v = e.y * 2.0 - 1.0;
-  var x = u;
-  var z = v;
-  let y = 1.0 - abs(u) - abs(v);
-  if (y < 0.0) {
-    x = (1.0 - abs(v)) * select(-1.0, 1.0, u >= 0.0);
-    z = (1.0 - abs(u)) * select(-1.0, 1.0, v >= 0.0);
+/**
+ * vox_aux.rgb holds `mean_normal * occupancy`, offset-encoded so that 128 is
+ * exactly zero (see buildAuxTexture in bake.ts). Linear filtering and mips of
+ * that ARE the occupancy-weighted mean normal of the tap footprint — empty
+ * voxels contribute a zero vector instead of poisoning the direction — so the
+ * decode is a rescale plus a renormalize.
+ */
+fn decode_normal(e: vec3f) -> vec3f {
+  let v = (e * 255.0 - 128.0) / 127.0;
+  let l = length(v);
+  // All-empty footprint: nothing to average, fall back to canopy-up.
+  if (l < 1.0e-4) {
+    return vec3f(0.0, 1.0, 0.0);
   }
-  return normalize(vec3f(x, y, z));
+  return v / l;
 }
 
 @fragment
@@ -173,9 +180,10 @@ fn fs_main(in: VOut) -> @location(0) vec4f {
   let s0 = textureSampleLevel(vox_color, linear_sampler, in.uvw, in.misc.z);
   let cov = s0.a;
   // Slab opacity: coverage integrated over the slab thickness this slice
-  // stands in for. Sub-linear in the thickness (pow 0.7) — full linear
-  // integration turns fluffy low-coverage regions into solid blobs.
-  let a_eff = (1.0 - exp(-band.sigma * cov * pow(in.misc.y, 0.7))) * in.misc.x;
+  // stands in for. Sub-linear in the thickness (pow 0.7, folded in by the
+  // vertex stage) — full linear integration turns fluffy low-coverage
+  // regions into solid blobs.
+  let a_eff = (1.0 - exp(-band.sigma * cov * in.misc.y)) * in.misc.x;
   // Dithered alpha test, keyed in plant volume space (camera-stable): fluffy
   // semi-transparent regions render as sparse pixels instead of solid blobs.
   let dq = vec3u(in.uvw * 512.0);
@@ -186,7 +194,7 @@ fn fs_main(in: VOut) -> @location(0) vec4f {
 
   let albedo = s0.rgb / max(cov, 0.004);
   let s1 = textureSampleLevel(vox_aux, linear_sampler, in.uvw, in.misc.z);
-  let nl = oct_decode(s1.xy);
+  let nl = decode_normal(s1.rgb);
   let c = in.rot.x;
   let s = in.rot.y;
   var n = vec3f(c * nl.x - s * nl.z, nl.y, s * nl.x + c * nl.z);
@@ -199,20 +207,28 @@ fn fs_main(in: VOut) -> @location(0) vec4f {
 
   // Baked sky visibility = canopy self-occlusion (precomputed raycast),
   // plus high-frequency value dither so voxel fluff reads as texture.
-  let occ = mix(0.42, 1.0, s1.z) * (0.8 + 0.4 * dither);
-  var color = light_surface(albedo * occ, n, in.world);
+  let occ = mix(0.42, 1.0, s1.a) * (0.8 + 0.4 * dither);
+  // The occluded albedo is what the shared lighting model multiplies, so it
+  // is also what the albedo/lighting debug views must be told about.
+  let surf_albedo = albedo * occ;
+  var color = light_surface(surf_albedo, n, in.world);
 
-  if (band.debug_axis > 0.5) {
-    let ax = u32(in.misc.w);
-    var tint = vec3f(1.0, 0.35, 0.35);
-    if (ax == 1u) {
-      tint = vec3f(0.35, 1.0, 0.35);
-    } else if (ax == 2u) {
-      tint = vec3f(0.35, 0.45, 1.0);
+  // Fog and the experiment's own axis tint only in the normal view — debug
+  // views stay unfogged and honest.
+  if (debug_mode() == DEBUG_OFF) {
+    if (band.debug_axis > 0.5) {
+      let ax = u32(in.misc.w);
+      var tint = vec3f(1.0, 0.35, 0.35);
+      if (ax == 1u) {
+        tint = vec3f(0.35, 1.0, 0.35);
+      } else if (ax == 2u) {
+        tint = vec3f(0.35, 0.45, 1.0);
+      }
+      color = mix(color, tint, 0.5);
     }
-    color = mix(color, tint, 0.5);
+    color = apply_fog(color, in.world);
   }
-
-  color = apply_fog(color, in.world);
-  return vec4f(color, 1.0);
+  // Coverage = the slab opacity this fragment resolved to before the alpha
+  // test, i.e. how much canopy this pixel actually stands for.
+  return vec4f(debug_shade(color, surf_albedo, n, a_eff, in.world), 1.0);
 }

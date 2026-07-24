@@ -118,7 +118,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         meta[0] = b.center[0]; meta[1] = b.center[1]; meta[2] = b.center[2]; meta[3] = b.radius
         meta[4] = originCellX; meta[5] = originCellZ; meta[6] = side; meta[7] = ctx.seed
         meta[8] = R; meta[9] = ctx.params.alphaGain; meta[10] = ctx.params.dither; meta[11] = entry.entryIndex
-        meta[12] = ctx.params.colorView; meta[13] = 0; meta[14] = 0; meta[15] = 0
+        meta[12] = ctx.params.colorView; meta[13] = b.extXZ; meta[14] = b.extY; meta[15] = ctx.params.ringTint
         device.queue.writeBuffer(entry.metaBuffer, 0, meta)
       }
     },

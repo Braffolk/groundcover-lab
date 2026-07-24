@@ -2,6 +2,9 @@ import bakeShaderSrc from './shaders/bake.wgsl'
 import type { ExperimentContext, GcMesh } from '@harness'
 import type { PARAMS } from './manifest.ts'
 
+/** Bump with manifest.bakeVersion — part of the artifact cache key. */
+export const BAKE_VERSION = 1
+
 /**
  * Bake the 8-view fin atlas from a GCMESH1 source mesh.
  *
@@ -48,6 +51,64 @@ export interface BakedFins {
 }
 
 type V3 = [number, number, number]
+
+// --- artifact (de)serialization -------------------------------------------
+// The bake is expensive (up to ~135 MB of source mesh uploaded, 8 ortho
+// captures over ~2M triangles, two 8 MB readbacks and CPU mip chains), and it
+// depends on nothing but the mesh — so it goes through the harness cache
+// (OPFS + mesh/baked/) and runs at most ONCE per species, not once per page
+// load. Layout: header, then all albedo mip levels, then all normal levels.
+
+const MAGIC = 0x314e4946 // 'FIN1'
+const HEADER_BYTES = 64
+const MIP_BYTES = (() => {
+  let total = 0
+  for (let level = 0; level < MIPS; level++) {
+    total += Math.max(1, ATLAS_W >> level) * Math.max(1, ATLAS_H >> level) * 4
+  }
+  return total
+})()
+const ARTIFACT_BYTES = HEADER_BYTES + 2 * MIP_BYTES
+
+function splitMips(buf: ArrayBuffer, offset: number): Uint8Array<ArrayBuffer>[] {
+  const out: Uint8Array<ArrayBuffer>[] = []
+  let at = offset
+  for (let level = 0; level < MIPS; level++) {
+    const n = Math.max(1, ATLAS_W >> level) * Math.max(1, ATLAS_H >> level) * 4
+    out.push(new Uint8Array(buf, at, n))
+    at += n
+  }
+  return out
+}
+
+export function packFins(baked: BakedFins): ArrayBuffer {
+  const buf = new ArrayBuffer(ARTIFACT_BYTES)
+  new Uint32Array(buf, 0, 2).set([MAGIC, BAKE_VERSION])
+  const m = baked.meta
+  new Float32Array(buf, 8, 8).set([m.cx, m.yc, m.cz, m.halfW, m.halfH, m.yLow, m.yHigh, m.radius])
+  const bytes = new Uint8Array(buf)
+  let at = HEADER_BYTES
+  for (const mips of [baked.albedoMips, baked.normalMips]) {
+    for (const level of mips) {
+      bytes.set(level, at)
+      at += level.byteLength
+    }
+  }
+  return buf
+}
+
+/** Null on any size/magic mismatch (e.g. an SPA-fallback HTML response). */
+export function unpackFins(buf: ArrayBuffer): BakedFins | null {
+  if (buf.byteLength !== ARTIFACT_BYTES) return null
+  const head = new Uint32Array(buf, 0, 2)
+  if (head[0] !== MAGIC || head[1] !== BAKE_VERSION) return null
+  const f = new Float32Array(buf, 8, 8)
+  return {
+    meta: { cx: f[0]!, yc: f[1]!, cz: f[2]!, halfW: f[3]!, halfH: f[4]!, yLow: f[5]!, yHigh: f[6]!, radius: f[7]! },
+    albedoMips: splitMips(buf, HEADER_BYTES),
+    normalMips: splitMips(buf, HEADER_BYTES + MIP_BYTES),
+  }
+}
 
 /**
  * Premultiplied mip chain. Level 0 rgb is multiplied by its 0/1 coverage;

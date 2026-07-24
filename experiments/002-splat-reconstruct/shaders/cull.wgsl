@@ -1,11 +1,13 @@
 #include "src/wgsl/scatter.wgsl"
 #include "./common.wgsl"
 
-// Pass 1: procedural cull. One thread per (cell, slot) inside a fixed
-// camera-centered cell window; evaluates scatter_candidate for every stand
-// entry, frustum-tests it, picks a distance LOD and appends a 16B plant
-// record into that (entry, lod) bucket. Work is bounded by the window size —
-// never by the stand's total plant count.
+// Pass 1: procedural cull. One workgroup per cell of a fixed camera-centered
+// window, one thread per candidate slot. The workgroup first rejects the whole
+// cell against the frustum + fade distance (uniform branch, no scatter work at
+// all for the ~80% of the window that cannot contribute), then evaluates
+// scatter_candidate for every stand entry, frustum-tests it, picks a distance
+// LOD and appends a 16B plant record into that (entry, lod) bucket. Work is
+// bounded by the window size — never by the stand's total plant count.
 
 @group(1) @binding(0) var<uniform> params: SrParams;
 @group(1) @binding(1) var<storage, read_write> counts: array<atomic<u32>, 15>;
@@ -26,6 +28,26 @@ fn cs_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_id) lid:
   planes[2] = m[3] + m[1];
   planes[3] = m[3] - m[1];
   planes[4] = m[2]; // near (WebGPU z in [0,1])
+
+  // --- Whole-cell reject ---------------------------------------------------
+  // Every plant this cell can ever produce lives inside one SCATTER_CELL_SIZE
+  // column, bounded in y by the terrain height range (|fbm| <= 1.015) and
+  // padded by cell_pad (tallest plant + sway + footprint margin). Testing that
+  // one box per workgroup skips 128 x num_entries scatter evaluations for
+  // every cell behind the camera / off to the side / past the fade distance —
+  // i.e. for most of the square window, which circumscribes a fade_end disc
+  // while only the frustum wedge inside it can contribute.
+  let pad = params.cell_pad;
+  let ty = frame.terrain_height_scale * 1.15;
+  let box_lo = vec3f(f32(cell.x) * SCATTER_CELL_SIZE - pad, -ty - pad, f32(cell.y) * SCATTER_CELL_SIZE - pad);
+  let box_hi = box_lo + vec3f(SCATTER_CELL_SIZE + 2.0 * pad, 2.0 * (ty + pad), SCATTER_CELL_SIZE + 2.0 * pad);
+  let box_c = 0.5 * (box_lo + box_hi);
+  let box_e = 0.5 * (box_hi - box_lo);
+  if (length(max(abs(frame.camera_pos - box_c) - box_e, vec3f(0.0))) > params.fade_end) { return; }
+  for (var p = 0u; p < 5u; p++) {
+    let pl = planes[p];
+    if (dot(pl.xyz, box_c) + pl.w < -dot(abs(pl.xyz), box_e)) { return; }
+  }
 
   for (var e = 0u; e < params.num_entries; e++) {
     let cand = scatter_candidate(params.seed, e, cell, slot);
@@ -76,16 +98,23 @@ fn cs_cull(@builtin(workgroup_id) wid: vec3u, @builtin(local_invocation_id) lid:
   }
 }
 
-// Pass 1b: clamp bucket counts into indirect draw args.
-// Indirect slot i = entry*5 + lod: [6 * splats(lod), min(count, cap), 0, 0].
+// Pass 1b: clamp bucket counts into drawIndexedIndirect args.
+// Slot i = entry*5 + lod, 5 u32 each:
+//   [indexCount = 6 * splats(lod), instanceCount = min(count, cap),
+//    firstIndex, baseVertex, firstInstance].
 
 @group(1) @binding(5) var<storage, read> counts_ro: array<u32, 15>;
-@group(1) @binding(6) var<storage, read_write> indirect: array<vec4u, 15>;
+@group(1) @binding(6) var<storage, read_write> indirect: array<u32, 75>;
 
 @compute @workgroup_size(16)
 fn cs_finalize(@builtin(global_invocation_id) gid: vec3u) {
   let i = gid.x;
   if (i >= 15u) { return; }
   let lod = i % 5u;
-  indirect[i] = vec4u(6u * SR_LOD_COUNTS[lod], min(counts_ro[i], SR_BUCKET_CAPS[lod]), 0u, 0u);
+  let o = i * 5u;
+  indirect[o] = 6u * SR_LOD_COUNTS[lod];
+  indirect[o + 1u] = min(counts_ro[i], SR_BUCKET_CAPS[lod]);
+  indirect[o + 2u] = 0u;
+  indirect[o + 3u] = 0u;
+  indirect[o + 4u] = 0u;
 }

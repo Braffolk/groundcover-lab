@@ -1,6 +1,7 @@
-#include "src/wgsl/scatter.wgsl"
 #include "src/wgsl/wind.wgsl"
 #include "src/wgsl/lighting.wgsl"
+#include "src/wgsl/debug.wgsl"
+#include "./fin_shared.wgsl"
 
 // Trig-weighted crossed fins. Every plant is 5 STATIC quads in world space:
 // 3 vertical fins crossed at 60° through the plant axis + 2 horizontal slab
@@ -16,30 +17,19 @@
 //   * looking down, the fins (and their star-shaped crossing) dissolve via a
 //     vd.y smoothstep while two top-down slab cards (lower/upper half of the
 //     plant, baked separately) take over with genuine inter-card parallax.
-// Placement is the shared scatter twin evaluated over a bounded cell region
-// around the camera — per-frame cost is independent of total plant count.
+// Placement comes from the cull compute pass (shaders/cull.wgsl), which
+// compacts the camera-bounded scatter region into this indirect draw — cost
+// is bounded by the region, never by the stand's plant count.
 
-struct Meta {
-  cx: f32, yc: f32, cz: f32, half_w: f32,
-  half_h: f32, y_low: f32, y_high: f32, radius: f32,
-  origin_cell_x: f32, origin_cell_z: f32, side: f32, seed: f32,
-  max_dist: f32, entry_index: f32, edge_fade: f32, top_blend: f32,
-  alpha_sharp: f32, _p0: f32, _p1: f32, _p2: f32,
-}
-@group(1) @binding(0) var<uniform> fin: Meta;
-@group(1) @binding(1) var atlas_albedo: texture_2d<f32>;
-@group(1) @binding(2) var atlas_normal: texture_2d<f32>;
-@group(1) @binding(3) var atlas_samp: sampler;
+@group(1) @binding(0) var<uniform> fin: FinCfg;
+@group(1) @binding(1) var<storage, read> plants: array<FinPlant>;
+@group(1) @binding(2) var atlas_albedo: texture_2d<f32>;
+@group(1) @binding(3) var atlas_normal: texture_2d<f32>;
+@group(1) @binding(4) var atlas_samp: sampler;
 
 const TILE_COLS = 4.0;
 const TILE_ROWS = 2.0;
 const TILE_PX = 512.0;
-
-fn rot_y(v: vec3f, a: f32) -> vec3f {
-  let c = cos(a);
-  let s = sin(a);
-  return vec3f(c * v.x + s * v.z, v.y, -s * v.x + c * v.z);
-}
 
 struct VOut {
   @builtin(position) pos: vec4f,
@@ -59,30 +49,18 @@ fn degenerate() -> VOut {
 
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut {
-  let side = u32(fin.side);
-  let slot = ii % SCATTER_MAX_PER_CELL;
-  let cell_lin = ii / SCATTER_MAX_PER_CELL;
-  let cxi = i32(fin.origin_cell_x) + i32(cell_lin % side);
-  let czi = i32(fin.origin_cell_z) + i32(cell_lin / side);
+  // Every instance is a plant the cull pass already proved exists, is inside
+  // the stand region and is inside the fade envelope — no placement work here.
+  let plant = plants[ii];
+  let base = vec3f(plant.px, plant.py, plant.pz);
+  let scale = plant.scale;
+  let yaw = plant.yaw;
   let entry_index = u32(fin.entry_index);
-
-  let sp = scatter_candidate(u32(fin.seed), entry_index, vec2i(cxi, czi), slot);
-  if (!sp.exists) { return degenerate(); }
-
-  let scale = sp.scale;
-  let yaw = sp.yaw;
-  let center = sp.pos + rot_y(vec3f(fin.cx, fin.yc, fin.cz) * scale, yaw);
+  let center = fin_center(base, scale, yaw, fin);
 
   let to_cam = frame.camera_pos - center;
   let dcam = length(to_cam);
-  let r_world = fin.radius * scale;
-  // Fade far cards out toward the region boundary; fade out (collapse) when
-  // the camera moves inside the plant.
-  let far_fade = 1.0 - smoothstep(fin.max_dist * 0.72, fin.max_dist * 0.97, dcam);
-  let near_fade = smoothstep(r_world * 0.35, r_world * 0.95, dcam);
-  let fade = far_fade * near_fade;
-  if (fade < 0.004) { return degenerate(); }
-
+  let fade = fin_fade(dcam, fin.radius * scale, fin.max_dist);
   let vd = to_cam / max(dcam, 1e-4);
 
   let quad = vi / 6u;
@@ -129,7 +107,7 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
     tile = select(7u, 6u, low);
     let x_w = rot_y(vec3f(1.0, 0.0, 0.0), yaw);
     let z_w = rot_y(vec3f(0.0, 0.0, 1.0), yaw);
-    world = sp.pos + rot_y(vec3f(fin.cx, 0.0, fin.cz) * scale, yaw)
+    world = base + rot_y(vec3f(fin.cx, 0.0, fin.cz) * scale, yaw)
       + vec3f(0.0, y_card * scale, 0.0)
       + x_w * (c.x * fin.half_w * scale)
       + z_w * (c.y * fin.half_w * scale);
@@ -145,7 +123,7 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
   if (alpha < 0.004) { return degenerate(); }
 
   // Wind: shared sway, tips move, roots pinned.
-  world += wind_sway(sp.pos, frame.time, stand_table[entry_index].sway, sp.phase) * height_norm;
+  world += wind_sway(base, frame.time, stand_table[entry_index].sway, plant.phase) * height_norm;
 
   var out: VOut;
   out.pos = frame.view_proj * vec4f(world, 1.0);
@@ -155,13 +133,19 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
   out.yaw = yaw;
   out.alpha = alpha;
   // Decorrelate the dissolve pattern between overlapping cards and plants.
-  out.dither_seed = f32(tile) * 23.7 + sp.phase * 41.3 + sp.yaw * 13.1;
+  out.dither_seed = f32(tile) * 23.7 + plant.phase * 41.3 + yaw * 13.1;
   return out;
 }
 
 // Interleaved gradient noise — stable per-pixel dissolve, no sorting needed.
 fn ign(p: vec2f) -> f32 {
   return fract(52.9829189 * fract(dot(p, vec2f(0.06711056, 0.00583715))));
+}
+
+// `cardTint` param: 8 distinct hues, one per baked view, so you can see which
+// fin side / slab card actually covers each pixel.
+fn tile_tint(t: u32) -> vec3f {
+  return 0.35 + 0.45 * cos(6.2831853 * (f32(t) * 0.125 + vec3f(0.0, 0.33, 0.67)));
 }
 
 @fragment
@@ -177,17 +161,24 @@ fn fs_main(in: VOut) -> @location(0) vec4f {
   let alb = textureSample(atlas_albedo, atlas_samp, auv);
   let nrm = textureSample(atlas_normal, atlas_samp, auv);
 
-  let coverage = min(alb.a * fin.alpha_sharp, 1.0);
-  let a = coverage * in.alpha;
+  let coverage = min(alb.a * fin.alpha_sharp, 1.0) * in.alpha;
   let d = ign(in.pos.xy + vec2f(in.dither_seed, in.dither_seed * 1.618));
-  if (a < clamp(d, 0.002, 0.998)) { discard; }
+  if (coverage < clamp(d, 0.002, 0.998)) { discard; }
 
-  let albedo = alb.rgb / max(alb.a, 1e-3);
+  var albedo = alb.rgb / max(alb.a, 1e-3);
+  if (fin.card_tint > 0.5) { albedo = tile_tint(in.tile); }
   var n_local = nrm.xyz / max(nrm.a, 1e-3) * 2.0 - 1.0;
   if (dot(n_local, n_local) < 1e-4) { n_local = vec3f(0.0, 1.0, 0.0); }
-  let n_world = rot_y(normalize(n_local), in.yaw);
+  var n_world = rot_y(normalize(n_local), in.yaw);
+  // Thin foliage is lit from both sides — same rule as 000-ground-truth. The
+  // atlas stores the authored mesh normal, which points away from the viewer
+  // wherever the capture caught a leaf's far face.
+  if (dot(n_world, frame.camera_pos - in.world) < 0.0) { n_world = -n_world; }
 
   var color = light_surface(albedo, n_world, in.world);
-  color = apply_fog(color, in.world);
-  return vec4f(color, 1.0);
+  // Fog only in the normal view — debug views stay unfogged and honest.
+  if (debug_mode() == DEBUG_OFF) {
+    color = apply_fog(color, in.world);
+  }
+  return vec4f(debug_shade(color, albedo, n_world, coverage, in.world), 1.0);
 }

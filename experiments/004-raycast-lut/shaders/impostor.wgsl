@@ -1,6 +1,7 @@
 #include "src/wgsl/wind.wgsl"
 #include "src/wgsl/lighting.wgsl"
 #include "src/wgsl/hash.wgsl"
+#include "src/wgsl/debug.wgsl"
 #include "./rayfield-common.wgsl"
 
 // Ray-LUT impostor: one camera-facing quad per plant; each fragment builds
@@ -25,7 +26,7 @@ struct EntryParams {
   height_ao: f32,
   entry_index: f32,
   sway_mul: f32,
-  debug_mode: f32,
+  show_cells: f32, // method-specific view: tint by baked direction cell
   _pad: f32,
 }
 @group(1) @binding(0) var<storage, read> plants: array<vec4f>;
@@ -164,30 +165,35 @@ fn fs_main(in: VOut) -> FOut {
   }
 
   let cov = surf.a;
+  let inv_cov = 1.0 / max(cov, 1e-3);
+  let depth01 = geom.r * inv_cov;
+  // The baked hit in local space — used both for the clutter hash and for the
+  // true-depth reprojection below, so reconstruct it exactly once.
+  let hitp = ep.center + r_ax * sp.x + u_ax * sp.y + dv * ((depth01 * 2.0 - 1.0) * ep.radius);
+
   // Sharpened coverage: fuzzy half-covered LUT texels would screen-door the
   // whole plant; remapping keeps interiors solid and dithers only rims.
   var cov_sharp = clamp((cov - 0.26) * 1.9, 0.0, 1.0);
+  var albedo = surf.rgb * inv_cov;
   // Plant-local clutter noise: LUT texels are ~2.4cm, pure magnification
   // turns close plants into smooth blobs. A hash keyed to the (stable,
   // unsheared) local hit cell restores leafy high-frequency structure.
-  let d0_pm = geom.r;
-  let hit_est = ep.center + r_ax * sp.x + u_ax * sp.y
-    + dv * ((d0_pm / max(cov, 1e-3) * 2.0 - 1.0) * ep.radius);
-  let cell3 = vec3i(floor(hit_est * 44.0)) + vec3i(1024);
-  let clutter = hash_f32(hash3(u32(cell3.x), u32(cell3.y), u32(cell3.z)));
-  let near_w = clamp(1.0 - cam_d * 0.12, 0.0, 1.0); // only matters close up
-  cov_sharp *= 1.0 - near_w * (0.75 - 1.1 * clutter);
+  // Its weight is zero past ~8m, so the whole hash is skipped out there
+  // instead of being computed and multiplied by 0 for every far fragment.
+  let near_w = clamp(1.0 - cam_d * 0.12, 0.0, 1.0);
+  if (near_w > 0.0) {
+    let cell3 = vec3i(floor(hitp * 44.0)) + vec3i(1024);
+    let clutter = hash_f32(hash3(u32(cell3.x), u32(cell3.y), u32(cell3.z)));
+    cov_sharp *= 1.0 - near_w * (0.75 - 1.1 * clutter);
+    albedo *= 1.0 - near_w * (0.28 - 0.56 * clutter);
+  }
   if (cov_sharp * fade <= dither) {
     discard;
   }
-  let inv_cov = 1.0 / max(cov, 1e-3);
-  let albedo = (surf.rgb * inv_cov) * (1.0 - near_w * (0.28 - 0.56 * clutter));
-  let depth01 = geom.r * inv_cov;
   let oct = clamp(geom.gb * inv_cov, vec2f(0.0), vec2f(1.0));
   let height01 = clamp(geom.a * inv_cov, 0.0, 1.0);
 
-  // Reconstruct the world hit point for true depth.
-  let hitp = ep.center + r_ax * sp.x + u_ax * sp.y + dv * ((depth01 * 2.0 - 1.0) * ep.radius);
+  // Reproject the baked hit onto the true eye ray for real world depth.
   let p_l = o_l + d_l * dot(hitp - o_l, d_l);
   let pxz = rot_fwd(p_l.xz, cy, sy);
   let p_w = in.plant_pos + vec3f(pxz.x, p_l.y, pxz.y) * scale + k * (p_l.y / ep.top_h);
@@ -203,21 +209,26 @@ fn fs_main(in: VOut) -> FOut {
   if (dot(n, frame.camera_pos - p_w) < 0.0) {
     n = -n;
   }
+  // Method-specific inspection view: flat tint per baked direction cell, so
+  // the 24x24 direction quantization (and its popping) is directly visible.
+  if (ep.show_cells > 0.5) {
+    let ci = u32(cellf.x + cellf.y * RF_VIEWS);
+    albedo = vec3f(
+      hash_f32(hash2(ci, 7u)),
+      hash_f32(hash2(ci, 11u)),
+      hash_f32(hash2(ci, 13u)),
+    ) * 0.6 + 0.2;
+  }
+
   let ao = mix(1.0 - ep.height_ao, 1.0, height01);
   var color = light_surface(albedo * ao, n, p_w);
-  color = apply_fog(color, p_w);
-
-  let dbg = u32(ep.debug_mode);
-  if (dbg == 1u) {
-    color = albedo;
-  } else if (dbg == 2u) {
-    color = n * 0.5 + vec3f(0.5);
-  } else if (dbg == 3u) {
-    color = vec3f(cov);
+  // Fog only in the normal view — debug views stay unfogged and honest.
+  if (debug_mode() == DEBUG_OFF) {
+    color = apply_fog(color, p_w);
   }
 
   var out: FOut;
-  out.color = vec4f(color, 1.0);
+  out.color = vec4f(debug_shade(color, albedo, n, cov_sharp * fade, p_w), 1.0);
   out.depth = clamp(clip.z / clip.w, 0.0, 1.0);
   return out;
 }

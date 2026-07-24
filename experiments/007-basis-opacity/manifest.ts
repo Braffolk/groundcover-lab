@@ -12,6 +12,11 @@ export const PARAMS = {
   dither: p.num(0.4, { min: 0, max: 1, step: 0.05 }),
   // View-dependent luminance modulation strength (order-1 color Fourier).
   colorView: p.num(1, { min: 0, max: 2, step: 0.05 }),
+  // Inspection aid (method-specific state; the global `view` dropdown owns
+  // albedo/normals/lighting/coverage/depth). Tints each fragment by the
+  // elevation ring it sampled — hue = ring index 0..3, green = the lerp
+  // fraction to the next ring. 0 = off; only affects the normal view.
+  ringTint: p.num(0, { min: 0, max: 1, step: 0.05 }),
 }
 
 export default defineExperiment({

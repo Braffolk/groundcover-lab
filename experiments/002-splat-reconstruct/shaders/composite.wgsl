@@ -1,5 +1,6 @@
 #include "src/wgsl/fullscreen.wgsl"
 #include "src/wgsl/lighting.wgsl"
+#include "src/wgsl/debug.wgsl"
 #include "./common.wgsl"
 
 // Pass 3: screen-space reconstruction. The half-res splat buffer is a sparse,
@@ -10,6 +11,10 @@
 // (surface_tol). Weighted coverage becomes a soft alpha (gap_fill closes the
 // dither holes), and lighting + fog are applied ONCE per output pixel from
 // the reconstructed normal and depth.
+//
+// This is also the single place the method produces colour, so it is where
+// the global debug views (frame.debug_mode) are answered: albedo / normals /
+// lighting / coverage / depth all come out of the reconstructed G-buffer.
 
 @group(1) @binding(0) var<uniform> params: SrParams;
 @group(1) @binding(1) var splat_color: texture_2d<f32>;
@@ -27,6 +32,13 @@ fn ray_dir(ndc: vec2f) -> vec3f {
 
 @fragment
 fn fs_main(in: FullscreenOut) -> @location(0) vec4f {
+  let dbg = debug_mode();
+  // "No groundcover here": blending is premultiplied, so writing a transparent
+  // pixel is a no-op that still costs a full-screen ROP read-modify-write —
+  // discard instead. DEBUG_COVERAGE is the one mode that wants those pixels
+  // written, as the zero end of the coverage map.
+  let empty = select(vec4f(0.0), vec4f(0.0, 0.0, 0.0, 1.0), dbg == DEBUG_COVERAGE);
+
   let dims = vec2i(textureDimensions(splat_aux));
   let q = vec2i(in.pos.xy) / 2;
 
@@ -45,7 +57,10 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4f {
       k++;
     }
   }
-  if (dmin > 1e8) { return vec4f(0.0); }
+  if (dmin > 1e8) {
+    if (dbg != DEBUG_COVERAGE) { discard; }
+    return empty;
+  }
 
   let reconstruct = (params.flags & 1u) != 0u;
   var alpha: f32;
@@ -92,14 +107,20 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4f {
   } else {
     // Raw mode: nearest half-res sample, no filtering (for A/B-ing the idea).
     let a4 = aux[4];
-    if (a4.w <= 0.01) { return vec4f(0.0); }
+    if (a4.w <= 0.01) {
+      if (dbg != DEBUG_COVERAGE) { discard; }
+      return empty;
+    }
     alpha = 1.0;
     albedo = col[4].rgb;
     normal = a4.xyz;
     hf = col[4].a;
     depth = a4.w;
   }
-  if (alpha < 0.004) { return vec4f(0.0); }
+  if (alpha < 0.004) {
+    if (dbg != DEBUG_COVERAGE) { discard; }
+    return empty;
+  }
 
   let nl = length(normal);
   var n = vec3f(0.0, 1.0, 0.0);
@@ -119,15 +140,24 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4f {
     let sw4 = frame.inv_view_proj * vec4f(ndc, ds, 1.0);
     let svz = dot(sw4.xyz / sw4.w - frame.camera_pos, fwd);
     alpha *= clamp(1.0 - (depth - svz - 0.06) / 0.25, 0.0, 1.0);
-    if (alpha < 0.004) { return vec4f(0.0); }
+    if (alpha < 0.004) {
+      if (dbg != DEBUG_COVERAGE) { discard; }
+      return empty;
+    }
   }
 
-  if (params.debug_mode == 1u) { return vec4f(alpha, alpha * 0.6, 0.0, 1.0); }
-  if (params.debug_mode == 2u) { return vec4f(n * 0.5 + 0.5, 1.0); }
-  if (params.debug_mode == 3u) { return vec4f(vec3f(fract(depth * 0.1)), 1.0); }
-
+  // Height-fraction ambient occlusion: an occlusion term, so it belongs in the
+  // lighting view, not the albedo view.
   let ao = mix(0.5, 1.0, pow(hf, 0.7));
   var color = light_surface(albedo * ao, n, world);
-  color = apply_fog(color, world);
+  // Fog only in the normal view — debug views stay unfogged and honest.
+  if (dbg == DEBUG_OFF) {
+    color = apply_fog(color, world);
+  }
+  color = debug_shade(color, albedo, n, alpha, world);
+  // Coverage is drawn opaque: this pass is the only groundcover contribution,
+  // so blending a grey coverage value over the terrain's white (coverage = 1)
+  // would wash the map out into uniform white.
+  if (dbg == DEBUG_COVERAGE) { return vec4f(color, 1.0); }
   return vec4f(color * alpha, alpha);
 }

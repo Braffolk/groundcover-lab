@@ -10,7 +10,13 @@ export const PARAMS = {
   heightAO: p.num(0.35, { min: 0, max: 0.8, step: 0.05 }),
   /** Wind shear multiplier on top of the stand's per-species sway. */
   swayMul: p.num(1, { min: 0, max: 2, step: 0.1 }),
-  debugView: p.enum('lit', ['lit', 'albedo', 'normal', 'coverage'] as const),
+  /**
+   * Method-specific inspection view (the global `view` dropdown covers
+   * albedo/normals/lighting/coverage/depth): flat-tint every fragment by the
+   * baked direction cell it answered from, exposing the 24x24 direction
+   * quantization and its popping. Composes with the global debug views.
+   */
+  showCells: p.bool(false),
 }
 
 export default defineExperiment({

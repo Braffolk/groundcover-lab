@@ -15,7 +15,8 @@ import type { PARAMS } from './manifest.ts'
  */
 
 const MAX_DIST_CAP = 96 // must match PARAMS.maxDist max — sizes the buffers
-const DEBUG_MODES = ['lit', 'albedo', 'normal', 'coverage'] as const
+const CULL_UBO_BYTES = 128
+const DRAW_UBO_BYTES = 48
 
 interface EntryState {
   speciesId: string
@@ -136,11 +137,19 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       { species: speciesId, tag: 'culled-instances' },
     )
     const cullUbo = ctx.res.createBuffer(
-      { label: `${ctx.id}/cull-ubo-${entryIndex}`, size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST },
+      {
+        label: `${ctx.id}/cull-ubo-${entryIndex}`,
+        size: CULL_UBO_BYTES,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      },
       { species: speciesId, tag: 'params' },
     )
     const drawUbo = ctx.res.createBuffer(
-      { label: `${ctx.id}/draw-ubo-${entryIndex}`, size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST },
+      {
+        label: `${ctx.id}/draw-ubo-${entryIndex}`,
+        size: DRAW_UBO_BYTES,
+        usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+      },
       { species: speciesId, tag: 'params' },
     )
     const atlas = atlases.get(speciesId)!
@@ -174,50 +183,100 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
 
   const drawArgsReset = new Uint32Array(entryCount * 4)
   for (let i = 0; i < entryCount; i++) drawArgsReset[i * 4] = 6
-  const cullData = new ArrayBuffer(32)
+  // Cull UBO: 4 frustum planes, baked sphere, region + entry constants.
+  const cullData = new ArrayBuffer(CULL_UBO_BYTES)
   const cullI32 = new Int32Array(cullData)
   const cullU32 = new Uint32Array(cullData)
   const cullF32 = new Float32Array(cullData)
-  const drawData = new Float32Array(12)
+  const drawData = new Float32Array(DRAW_UBO_BYTES / 4)
 
-  let cellsX = 1
-  let cellsZ = 1
+  let cellsX = 0
+  let cellsZ = 0
+  // The draw UBO holds only bake constants + params, so it is uploaded once
+  // and then only when a param actually changes — never per frame.
+  let drawUboDirty = true
+
+  const writeDrawUbos = (): void => {
+    const maxDist = Math.min(ctx.params.maxDist, MAX_DIST_CAP)
+    entries.forEach((entry, entryIndex) => {
+      const rf = entry.rayField
+      drawData[0] = rf.center[0]
+      drawData[1] = rf.center[1]
+      drawData[2] = rf.center[2]
+      drawData[3] = rf.radius
+      drawData[4] = rf.topH
+      drawData[5] = maxDist
+      drawData[6] = ctx.params.fadeBand
+      drawData[7] = ctx.params.heightAO
+      drawData[8] = entryIndex
+      drawData[9] = ctx.params.swayMul
+      drawData[10] = ctx.params.showCells ? 1 : 0
+      drawData[11] = 0
+      device.queue.writeBuffer(entry.drawUbo, 0, drawData)
+    })
+  }
 
   return {
+    onParamsChanged(): void {
+      drawUboDirty = true
+    },
+
     update(frame: FrameInfo): void {
+      if (drawUboDirty) {
+        writeDrawUbos()
+        drawUboDirty = false
+      }
       const maxDist = Math.min(ctx.params.maxDist, MAX_DIST_CAP)
       const cam = frame.camera.pose
-      const c0x = Math.floor((cam.x - maxDist) / SCATTER_CELL_SIZE)
-      const c0z = Math.floor((cam.z - maxDist) / SCATTER_CELL_SIZE)
-      cellsX = Math.floor((cam.x + maxDist) / SCATTER_CELL_SIZE) - c0x + 1
-      cellsZ = Math.floor((cam.z + maxDist) / SCATTER_CELL_SIZE) - c0z + 1
+      // Region walked by the cull dispatch, clamped to the stand's own cell
+      // range — the shader rejects out-of-stand cells anyway, so dispatching
+      // them is pure waste on small stands.
+      const lo = Math.floor(-ctx.stand.radius / SCATTER_CELL_SIZE)
+      const hi = Math.floor(ctx.stand.radius / SCATTER_CELL_SIZE)
+      const c0x = Math.max(lo, Math.floor((cam.x - maxDist) / SCATTER_CELL_SIZE))
+      const c0z = Math.max(lo, Math.floor((cam.z - maxDist) / SCATTER_CELL_SIZE))
+      const c1x = Math.min(hi, Math.floor((cam.x + maxDist) / SCATTER_CELL_SIZE))
+      const c1z = Math.min(hi, Math.floor((cam.z + maxDist) / SCATTER_CELL_SIZE))
+      cellsX = Math.max(0, c1x - c0x + 1)
+      cellsZ = Math.max(0, c1z - c0z + 1)
+
+      // Side frustum planes (Gribb–Hartmann) from the shared view-projection,
+      // normalized so the cull shader can test them against a plant radius.
+      const vp = frame.camera.viewProj
+      const rowSum = (r: number, sign: number, out: number): void => {
+        const x = vp[3]! + sign * vp[r]!
+        const y = vp[7]! + sign * vp[4 + r]!
+        const z = vp[11]! + sign * vp[8 + r]!
+        const w = vp[15]! + sign * vp[12 + r]!
+        const inv = 1 / (Math.hypot(x, y, z) || 1)
+        cullF32[out] = x * inv
+        cullF32[out + 1] = y * inv
+        cullF32[out + 2] = z * inv
+        cullF32[out + 3] = w * inv
+      }
+      rowSum(0, 1, 0) // left
+      rowSum(0, -1, 4) // right
+      rowSum(1, 1, 8) // bottom
+      rowSum(1, -1, 12) // top
 
       device.queue.writeBuffer(drawArgs, 0, drawArgsReset)
       entries.forEach((entry, entryIndex) => {
-        cullI32[0] = c0x
-        cullI32[1] = c0z
-        cullU32[2] = entryIndex
-        cullU32[3] = ctx.seed >>> 0
-        cullF32[4] = maxDist
-        cullF32[5] = ctx.stand.radius
-        cullU32[6] = entry.capacity
-        cullU32[7] = 0
-        device.queue.writeBuffer(entry.cullUbo, 0, cullData)
-
         const rf = entry.rayField
-        drawData[0] = rf.center[0]
-        drawData[1] = rf.center[1]
-        drawData[2] = rf.center[2]
-        drawData[3] = rf.radius
-        drawData[4] = rf.topH
-        drawData[5] = maxDist
-        drawData[6] = ctx.params.fadeBand
-        drawData[7] = ctx.params.heightAO
-        drawData[8] = entryIndex
-        drawData[9] = ctx.params.swayMul
-        drawData[10] = Math.max(0, DEBUG_MODES.indexOf(ctx.params.debugView))
-        drawData[11] = 0
-        device.queue.writeBuffer(entry.drawUbo, 0, drawData)
+        cullF32[16] = rf.center[0]
+        cullF32[17] = rf.center[1]
+        cullF32[18] = rf.center[2]
+        cullF32[19] = rf.radius
+        cullI32[20] = c0x
+        cullI32[21] = c0z
+        cullU32[22] = entryIndex
+        cullU32[23] = ctx.seed >>> 0
+        cullF32[24] = maxDist
+        cullF32[25] = ctx.stand.radius
+        cullU32[26] = entry.capacity
+        cullF32[27] = rf.topH
+        cullF32[28] = ctx.params.fadeBand
+        cullF32[29] = ctx.params.swayMul
+        device.queue.writeBuffer(entry.cullUbo, 0, cullData)
       })
     },
 

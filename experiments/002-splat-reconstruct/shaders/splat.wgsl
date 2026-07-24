@@ -2,9 +2,11 @@
 #include "src/wgsl/hash.wgsl"
 #include "./common.wgsl"
 
-// Pass 2: half-res splat scatter. One indirect draw per (stand entry, LOD);
-// instances are the culled plant records, vertices enumerate that LOD's
-// splats (6 verts per splat). Each splat is an anisotropic quad spanned by
+// Pass 2: half-res splat scatter. One indexed indirect draw per (stand entry,
+// LOD); instances are the culled plant records, vertices enumerate that LOD's
+// splats (4 unique corners per splat, 6 shared indices — a quad only has four
+// corners, so shading six would waste a third of this pass's vertex work
+// across the ~1M splats a frame draws). Each splat is an anisotropic quad spanned by
 // its baked elongation axis and the view-perpendicular, dither-discarded to
 // its elliptical footprint so depth stays exact. Outputs an albedo+height
 // target and a normal+viewdepth target for the reconstruction pass.
@@ -26,7 +28,7 @@ struct VOut {
   @location(0) color: vec3f,
   @location(1) uv_hf: vec3f,      // ellipse uv, height fraction
   @location(2) normal_vz: vec4f,  // world normal, linear view depth
-  @location(3) misc: vec3f,       // fade, colorVar, per-splat rnd
+  @location(3) misc: vec2f,       // colorVar, per-splat rnd
 }
 
 fn rot_y(v: vec3f, c: f32, s: f32) -> vec3f {
@@ -36,12 +38,13 @@ fn rot_y(v: vec3f, c: f32, s: f32) -> vec3f {
 @vertex
 fn vs_splat(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut {
   let rec = records[di.idx.z + ii];
-  let s = vi / 6u;
-  var corners = array<vec2f, 6>(
-    vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(-1.0, 1.0),
-    vec2f(1.0, -1.0), vec2f(1.0, 1.0), vec2f(-1.0, 1.0),
+  // Indexed quads: 4 corners per splat, the index buffer spans the two
+  // triangles (0,1,2, 1,3,2) — same triangles as an unindexed 6-vertex quad.
+  let s = vi / 4u;
+  var corners = array<vec2f, 4>(
+    vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(-1.0, 1.0), vec2f(1.0, 1.0),
   );
-  let c = corners[vi % 6u];
+  let c = corners[vi % 4u];
 
   let w = splats[di.idx.x + s];
   let local = di.bounds_min.xyz + vec3f(
@@ -120,7 +123,7 @@ fn vs_splat(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) ->
   out.uv_hf = vec3f(c, hf);
   let vz = -(frame.view * vec4f(world, 1.0)).z;
   out.normal_vz = vec4f(rot_y(n_local, cy, sy), vz);
-  out.misc = vec3f(1.0, cvar, rnd);
+  out.misc = vec2f(cvar, rnd);
   return out;
 }
 
@@ -137,12 +140,12 @@ fn fs_splat(in: VOut) -> FragOut {
   // reconstruction pass into smooth alpha. Screen-hash keeps it static.
   let p = vec2u(in.pos.xy);
   let noise = hash_f32(hash2(p.x, p.y ^ 0x517cc1b7u));
-  let cover = in.misc.x * clamp((1.0 - r2) * 2.4, 0.0, 1.0);
-  if (cover <= fract(noise + in.misc.z)) { discard; }
+  let cover = clamp((1.0 - r2) * 2.4, 0.0, 1.0);
+  if (cover <= fract(noise + in.misc.y)) { discard; }
 
   var albedo = in.color;
   let vn = hash_f32(hash2(p.x * 3u + 1u, p.y ^ 0x9e3779b9u)) - 0.5;
-  albedo = albedo * (1.0 + vn * in.misc.y * params.var_amt * 2.0);
+  albedo = albedo * (1.0 + vn * in.misc.x * params.var_amt * 2.0);
 
   var out: FragOut;
   out.color = vec4f(albedo, in.uv_hf.z);

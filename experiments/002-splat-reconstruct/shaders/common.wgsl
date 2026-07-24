@@ -17,7 +17,7 @@ struct SrParams {
   var_amt: f32,
   surface_tol: f32,     // depth affinity tolerance (m)
   gap_fill: f32,
-  debug_mode: u32,      // 0 off, 1 coverage, 2 normals, 3 depth
+  cell_pad: f32,        // conservative whole-cell cull margin (m), stand-derived
   flags: u32,           // bit0 = reconstruct enabled
 }
 

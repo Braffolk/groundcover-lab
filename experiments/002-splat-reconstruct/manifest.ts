@@ -14,7 +14,8 @@ export const PARAMS = {
   variance: p.num(1.0, { min: 0.0, max: 2.5, step: 0.05 }),
   /** Bypass the reconstruction filter (shows the raw dithered splats). */
   reconstruct: p.bool(true),
-  debug: p.enum('off', ['off', 'coverage', 'normals', 'depth'] as const),
+  // No local debug enum: the renderer answers the ONE global `view` selector
+  // (frame.debug_mode / URL debug=) in the reconstruction pass instead.
 }
 
 export default defineExperiment({

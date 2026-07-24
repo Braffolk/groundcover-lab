@@ -29,6 +29,16 @@ export interface BakedSpecies {
   coeffD: GPUTexture
   center: [number, number, number]
   radius: number
+  /**
+   * Card crop, in bounding-radius units. The baked tile spans ±radius on both
+   * card axes, but the mesh bbox can only project into
+   *   |x| ≤ extXZ,  |y| ≤ cos(phi)·extY + sin(phi)·extXZ
+   * of it (`right` is horizontal, `up` tilts by the view elevation). Outside
+   * that the fitted coverage is exactly zero, so the runtime card is cropped
+   * to it — pure overdraw removal, identical image.
+   */
+  extXZ: number
+  extY: number
 }
 
 type V3 = [number, number, number]
@@ -53,6 +63,8 @@ export function bakeSpecies(
   const center: V3 = [(bmin[0] + bmax[0]) / 2, (bmin[1] + bmax[1]) / 2, (bmin[2] + bmax[2]) / 2]
   const radius = 0.5 * Math.hypot(bmax[0] - bmin[0], bmax[1] - bmin[1], bmax[2] - bmin[2])
   const invR = 1 / radius
+  const extXZ = (0.5 * Math.hypot(bmax[0] - bmin[0], bmax[2] - bmin[2])) / radius
+  const extY = (0.5 * (bmax[1] - bmin[1])) / radius
 
   // --- persistent coefficient array textures (the whole species footprint) --
   const coeffTex = (tag: string): GPUTexture =>
@@ -244,5 +256,5 @@ export function bakeSpecies(
   // Safe immediately after submit — WebGPU defers actual release.
   for (const r of [vbuf, ibuf, capColor, capNormal, capDepth, uni]) r.destroy()
 
-  return { coeffA, coeffB, coeffC, coeffD, center, radius }
+  return { coeffA, coeffB, coeffC, coeffD, center, radius, extXZ, extY }
 }

@@ -2,6 +2,7 @@
 #include "src/wgsl/wind.wgsl"
 #include "src/wgsl/lighting.wgsl"
 #include "src/wgsl/hash.wgsl"
+#include "src/wgsl/debug.wgsl"
 
 // The far canopy shell: beyond the per-plant slice region the entire
 // meadow collapses into ONE terrain-draped translucent layer at canopy
@@ -82,7 +83,7 @@ fn vs_main(@builtin(vertex_index) vi: u32) -> VOut {
   return out;
 }
 
-fn sample_top(tex: texture_2d<f32>, world_xz: vec2f, inv_tile: f32, salt: u32, lod: f32) -> vec4f {
+fn sample_top(tex: texture_2d<f32>, world_xz: vec2f, inv_tile: f32, lod: f32) -> vec4f {
   // Straight periodic tiling — the textures are seamless by construction
   // (per-tile rotation would break continuity into a visible grid). The
   // species mottle noise hides the repetition.
@@ -111,35 +112,31 @@ fn fs_main(in: VOut) -> @location(0) vec4f {
   var rgb = vec3f(0.0);
   var cov = 0.0;
   var wsum = 0.0;
-  {
+  // Branch on the stand weight FIRST: a species the stand does not use has
+  // weight 0, and then its mottle noise (4 hashes) is pure waste.
+  if (shell.weights.x > 0.0) {
     let wt = shell.weights.x * (0.3 + 0.7 * value_noise(w.xz * 0.31, 11u));
-    if (wt > 0.0) {
-      let lod = clamp(log2(max(dist * shell.px_factor * shell.inv_tiles.x, 1.0)), 0.0, shell.mip_max);
-      let s = sample_top(top0, w.xz, shell.inv_tiles.x, 101u, lod);
-      rgb += wt * s.rgb;
-      cov += wt * s.a;
-      wsum += wt;
-    }
+    let lod = clamp(log2(max(dist * shell.px_factor * shell.inv_tiles.x, 1.0)), 0.0, shell.mip_max);
+    let s = sample_top(top0, w.xz, shell.inv_tiles.x, lod);
+    rgb += wt * s.rgb;
+    cov += wt * s.a;
+    wsum += wt;
   }
-  {
+  if (shell.weights.y > 0.0) {
     let wt = shell.weights.y * (0.3 + 0.7 * value_noise(w.xz * 0.27, 12u));
-    if (wt > 0.0) {
-      let lod = clamp(log2(max(dist * shell.px_factor * shell.inv_tiles.y, 1.0)), 0.0, shell.mip_max);
-      let s = sample_top(top1, w.xz, shell.inv_tiles.y, 102u, lod);
-      rgb += wt * s.rgb;
-      cov += wt * s.a;
-      wsum += wt;
-    }
+    let lod = clamp(log2(max(dist * shell.px_factor * shell.inv_tiles.y, 1.0)), 0.0, shell.mip_max);
+    let s = sample_top(top1, w.xz, shell.inv_tiles.y, lod);
+    rgb += wt * s.rgb;
+    cov += wt * s.a;
+    wsum += wt;
   }
-  {
+  if (shell.weights.z > 0.0) {
     let wt = shell.weights.z * (0.3 + 0.7 * value_noise(w.xz * 0.23, 13u));
-    if (wt > 0.0) {
-      let lod = clamp(log2(max(dist * shell.px_factor * shell.inv_tiles.z, 1.0)), 0.0, shell.mip_max);
-      let s = sample_top(top2, w.xz, shell.inv_tiles.z, 103u, lod);
-      rgb += wt * s.rgb;
-      cov += wt * s.a;
-      wsum += wt;
-    }
+    let lod = clamp(log2(max(dist * shell.px_factor * shell.inv_tiles.z, 1.0)), 0.0, shell.mip_max);
+    let s = sample_top(top2, w.xz, shell.inv_tiles.z, lod);
+    rgb += wt * s.rgb;
+    cov += wt * s.a;
+    wsum += wt;
   }
   if (wsum <= 0.0) {
     discard;
@@ -154,6 +151,9 @@ fn fs_main(in: VOut) -> @location(0) vec4f {
   let tn = terrain_normal(w.xz);
   let n = normalize(mix(tn, vec3f(0.0, 1.0, 0.0), 0.5));
   var color = light_surface(col, n, w);
-  color = apply_fog(color, w);
-  return vec4f(color, 1.0);
+  // Fog only in the normal view — debug views stay unfogged and honest.
+  if (debug_mode() == DEBUG_OFF) {
+    color = apply_fog(color, w);
+  }
+  return vec4f(debug_shade(color, col, n, coverage, w), 1.0);
 }

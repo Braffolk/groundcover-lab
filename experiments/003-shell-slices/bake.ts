@@ -324,8 +324,53 @@ export function parseVolume(buf: ArrayBuffer): Volume {
 }
 
 // ---------------------------------------------------------------------------
-// Load-time derived data: 3D mips (slab integration) + far-shell top view
+// Load-time derived data: aux transcode, 3D mips (slab integration),
+// far-shell top view
 // ---------------------------------------------------------------------------
+
+/**
+ * Transcode the stored aux channel into the texture the runtime samples.
+ *
+ * The artifact stores the mean normal octahedrally (2×u8) — compact, but
+ * FILTER-HOSTILE: the volume is 99% empty, empty voxels hold the oct pair
+ * (0,0), and (0,0) decodes to straight DOWN. Trilinear taps and every mip
+ * average 7-8 of those into each sample, so the sampled normal was dominated
+ * by empty space rather than by the plant.
+ *
+ * The runtime texture instead stores `n * occupancy` in rgb (offset-encoded
+ * n*0.5+0.5, so empty voxels sit at the neutral 0.5 = zero vector) and the
+ * baked sky visibility in a. Plain linear filtering of that IS the
+ * occupancy-weighted mean normal, which the shader just renormalizes; empty
+ * voxels contribute nothing, exactly as they should. It is also more precise
+ * than oct at the same 8 bits/channel.
+ */
+export function buildAuxTexture(vol: Volume): Uint8Array {
+  const { nx, ny, nz } = vol.header
+  const n = nx * ny * nz
+  const src = vol.tex1
+  const cov = vol.tex0
+  const out = new Uint8Array(n * 4)
+  const nrm: [number, number, number] = [0, 0, 0]
+  for (let i = 0; i < n; i++) {
+    const o = i * 4
+    out[o + 3] = src[o + 2]! // sky visibility, defined for every voxel
+    if (cov[o + 3] === 0) {
+      // Empty: neutral (zero vector) so it drops out of every filtered tap.
+      out[o] = 128
+      out[o + 1] = 128
+      out[o + 2] = 128
+      continue
+    }
+    // 128 == exactly zero, so the neutral above is exactly the zero vector
+    // and deep mips of near-empty regions stay unbiased. Shader decode:
+    // n = (sample * 255 - 128) / 127.
+    octDecode((src[o]! * 65535) / 255, (src[o + 1]! * 65535) / 255, nrm)
+    out[o] = 128 + Math.round(nrm[0]! * 127)
+    out[o + 1] = 128 + Math.round(nrm[1]! * 127)
+    out[o + 2] = 128 + Math.round(nrm[2]! * 127)
+  }
+  return out
+}
 
 export interface MipLevel {
   nx: number

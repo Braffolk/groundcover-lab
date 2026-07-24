@@ -14,6 +14,10 @@ export const PARAMS = {
   // Coverage sharpening applied to the (premultiplied-mip) atlas alpha before
   // the hashed-alpha test; >1 compensates coverage thinning in the mip chain.
   alphaSharp: p.num(1.35, { min: 0.7, max: 2.5, step: 0.05 }),
+  // Inspection aid: replace albedo with a per-tile hue so you can see WHICH of
+  // the 8 baked views (3 fins x 2 sides, 2 top-down slabs) covers each pixel.
+  // Complements the global `view` debug modes — it is this method's own state.
+  cardTint: p.bool(false),
 }
 
 export default defineExperiment({

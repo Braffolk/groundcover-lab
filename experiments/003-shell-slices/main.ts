@@ -1,11 +1,12 @@
 import slicesSrc from './shaders/slices.wgsl'
 import farshellSrc from './shaders/farshell.wgsl'
 import { SPECIES, commitBake, speciesById } from '@harness'
-import type { Aabb2, Experiment, ExperimentContext, FrameInfo, ScatterPoint, ViewTargets } from '@harness'
+import type { Aabb2, Experiment, ExperimentContext, FrameInfo, ViewTargets } from '@harness'
 import {
   BAKE_VERSION,
   TOP_RES,
   bakeVolume,
+  buildAuxTexture,
   buildMips2D,
   buildMips3D,
   buildTopView,
@@ -180,7 +181,10 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       return tex
     }
     const texColor = make3D('vox-color', volume.tex0)
-    const texAux = make3D('vox-aux', volume.tex1)
+    // Transcoded from the stored oct pair so linear/mip filtering of the
+    // 99%-empty volume yields the occupancy-weighted mean normal — see
+    // buildAuxTexture().
+    const texAux = make3D('vox-aux', buildAuxTexture(volume))
 
     // Far-shell top view (2D, mipped, tileable over the species' period).
     const top = buildTopView(volume)
@@ -248,7 +252,10 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
   // Per-entry instance buffers (camera-region bounded, rebuilt on movement)
   // -------------------------------------------------------------------------
   const entries: EntryState[] = stand.species.map((e, entryIndex) => {
-    const half = Math.min(96, stand.radius)
+    // Size for the region actually in use (rRegion), not the param's max —
+    // the rebuild path already grows the buffer if the region is widened.
+    // The 1.15 slack also covers the 4 m cell rounding of scatter.region().
+    const half = Math.min(ctx.params.rRegion, stand.radius)
     const area = 4 * half * half
     const cap = Math.ceil(area * Math.min(e.density, 8) * 1.15) + 256
     const buffer = ctx.res.createBuffer(
@@ -391,14 +398,18 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
 
     for (let entryIndex = 0; entryIndex < entries.length; entryIndex++) {
       const st = entries[entryIndex]!
-      const buckets: [ScatterPoint[], ScatterPoint[], ScatterPoint[]] = [[], [], []]
       const pts = aabb.minX < aabb.maxX && aabb.minZ < aabb.maxZ ? ctx.scene.scatter.region(entryIndex, aabb) : []
+      // Counting sort into the scratch: count per band, then scatter straight
+      // into the band's slot. No intermediate per-band point arrays.
+      let nNear = 0
+      let nMid = 0
       for (const pt of pts) {
         const dx = pt.x - camX
         const dy = pt.y - camY
         const dz = pt.z - camZ
         const d2 = dx * dx + dy * dy + dz * dz
-        buckets[d2 < rNear2 ? 0 : d2 < rMid2 ? 1 : 2].push(pt)
+        if (d2 < rNear2) nNear++
+        else if (d2 < rMid2) nMid++
       }
       if (pts.length > st.cap) {
         st.cap = Math.ceil(pts.length * 1.3)
@@ -418,23 +429,38 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         })
         st.scratch = new Float32Array(st.cap * 8)
       }
-      let o = 0
-      for (let b = 0; b < 3; b++) {
-        st.offsets[b as 0 | 1 | 2] = o / 8
-        st.counts[b as 0 | 1 | 2] = buckets[b as 0 | 1 | 2].length
-        for (const pt of buckets[b as 0 | 1 | 2]) {
-          st.scratch[o] = pt.x
-          st.scratch[o + 1] = pt.y
-          st.scratch[o + 2] = pt.z
-          st.scratch[o + 3] = pt.yaw
-          st.scratch[o + 4] = pt.scale
-          st.scratch[o + 5] = pt.entry
-          st.scratch[o + 6] = pt.phase
-          st.scratch[o + 7] = 0
-          o += 8
+      st.counts = [nNear, nMid, pts.length - nNear - nMid]
+      st.offsets = [0, nNear, nNear + nMid]
+      let oNear = 0
+      let oMid = nNear * 8
+      let oFar = (nNear + nMid) * 8
+      const s = st.scratch
+      for (const pt of pts) {
+        const dx = pt.x - camX
+        const dy = pt.y - camY
+        const dz = pt.z - camZ
+        const d2 = dx * dx + dy * dy + dz * dz
+        let o: number
+        if (d2 < rNear2) {
+          o = oNear
+          oNear += 8
+        } else if (d2 < rMid2) {
+          o = oMid
+          oMid += 8
+        } else {
+          o = oFar
+          oFar += 8
         }
+        s[o] = pt.x
+        s[o + 1] = pt.y
+        s[o + 2] = pt.z
+        s[o + 3] = pt.yaw
+        s[o + 4] = pt.scale
+        s[o + 5] = pt.entry
+        s[o + 6] = pt.phase
+        s[o + 7] = 0
       }
-      if (o > 0) device.queue.writeBuffer(st.buffer, 0, st.scratch, 0, o)
+      if (pts.length > 0) device.queue.writeBuffer(st.buffer, 0, s, 0, pts.length * 8)
     }
     lastX = camX
     lastZ = camZ
@@ -446,6 +472,15 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
   // -------------------------------------------------------------------------
   const bandData = new Float32Array(12)
   const shellData = new Float32Array(16)
+  /** Slices per plant per band — kept in lockstep with the band uniforms. */
+  const bandK = [0, 0, 1]
+  // Near slices under-integrate on purpose: up close real grass is
+  // see-through; full slab compensation there reads as solid blobs.
+  const sigmaScale = [0.5, 0.85, 1]
+  // The band/shell uniforms depend ONLY on params + fov + viewport height —
+  // never on time or camera pose. Rewrite them when those change, not per frame.
+  let uniformsDirty = true
+  let lastMpp1 = -1
 
   return {
     update(frame: FrameInfo): void {
@@ -459,12 +494,13 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
 
       const { height } = ctx.size()
       const mpp1 = (2 * Math.tan((cam.fov * Math.PI) / 360)) / Math.max(height, 1)
-      const ks = [p.kNear, p.kMid, 1]
-      // Near slices under-integrate on purpose: up close real grass is
-      // see-through; full slab compensation there reads as solid blobs.
-      const sigmaScale = [0.5, 0.85, 1]
+      if (!uniformsDirty && mpp1 === lastMpp1) return
+      uniformsDirty = false
+      lastMpp1 = mpp1
+      bandK[0] = p.kNear
+      bandK[1] = p.kMid
       for (let b = 0; b < 3; b++) {
-        bandData[0] = ks[b]!
+        bandData[0] = bandK[b]!
         bandData[1] = p.alphaThresh
         bandData[2] = p.sigma * sigmaScale[b]!
         bandData[3] = p.axisBiasY
@@ -502,10 +538,9 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       })
       pass.setPipeline(slicesPipeline)
       pass.setBindGroup(0, ctx.frame.bindGroup)
-      const ks = [ctx.params.kNear, ctx.params.kMid, 1]
       for (let b = 0; b < 3; b++) {
         pass.setBindGroup(3, bandGroups[b]!)
-        const k = ks[b]!
+        const k = bandK[b]!
         for (const st of entries) {
           const count = st.counts[b as 0 | 1 | 2]
           if (count === 0) continue
@@ -533,6 +568,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
 
     onParamsChanged(keys: ReadonlySet<string>): void {
       if (keys.has('rNear') || keys.has('rMid') || keys.has('rRegion')) rebuildDirty = true
+      uniformsDirty = true
     },
 
     dispose(): void {

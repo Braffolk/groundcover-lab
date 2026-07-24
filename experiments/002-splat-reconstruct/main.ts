@@ -43,6 +43,8 @@ const RINGS = [3, 7, 16, 36] as const
 const FADE_END = 80
 const LODS = LOD_COUNTS.length
 const RECORD_BYTES = 16
+/** drawIndexedIndirect args: indexCount, instanceCount, firstIndex, baseVertex, firstInstance. */
+const DRAW_ARGS_BYTES = 20
 const DRAWINFO_STRIDE = 256
 const COLOR_FMT: GPUTextureFormat = 'rgba8unorm'
 const AUX_FMT: GPUTextureFormat = 'rgba16float'
@@ -130,11 +132,29 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
   const indirectBuf = ctx.res.createBuffer(
     {
       label: `${ctx.id}/indirect`,
-      size: 3 * LODS * 16,
+      size: 3 * LODS * DRAW_ARGS_BYTES,
       usage: GPUBufferUsage.INDIRECT | GPUBufferUsage.STORAGE,
     },
     { tag: 'cull' },
   )
+  // Shared quad index buffer: 6 indices over the 4 corners of each splat, for
+  // the largest LOD (all smaller LODs just use a prefix of it). Static.
+  const quadIndexBuf = ctx.res.createBuffer(
+    {
+      label: `${ctx.id}/quad-indices`,
+      size: LOD_COUNTS[0]! * 6 * 2,
+      usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST,
+    },
+    { tag: 'quad-indices' },
+  )
+  {
+    const idx = new Uint16Array(LOD_COUNTS[0]! * 6)
+    const pattern = [0, 1, 2, 1, 3, 2]
+    for (let s = 0; s < LOD_COUNTS[0]!; s++) {
+      for (let k = 0; k < 6; k++) idx[s * 6 + k] = s * 4 + pattern[k]!
+    }
+    device.queue.writeBuffer(quadIndexBuf, 0, idx)
+  }
   const paramsBuf = ctx.res.createBuffer(
     { label: `${ctx.id}/params`, size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST },
     { tag: 'params' },
@@ -412,7 +432,11 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
   const pdv = new DataView(paramsData)
   let dimX = 0
   let dimZ = 0
-  const debugModes = { off: 0, coverage: 1, normals: 2, depth: 3 } as const
+  // Conservative margin for the whole-cell cull in cs_cull: nothing a cell can
+  // grow reaches further than the tallest plant plus its sway/footprint slack.
+  // Stand-derived, so it is computed once here and never per frame.
+  const cellPad =
+    2 * Math.max(...entries.map((e) => speciesById(e.species).heightScale * e.scaleMax)) + 0.8
 
   return {
     update(frame: FrameInfo): void {
@@ -443,7 +467,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       pdv.setFloat32(44, p.variance, true)
       pdv.setFloat32(48, p.surfaceTol, true)
       pdv.setFloat32(52, p.gapFill, true)
-      pdv.setUint32(56, debugModes[p.debug], true)
+      pdv.setFloat32(56, cellPad, true)
       pdv.setUint32(60, p.reconstruct ? 1 : 0, true)
       device.queue.writeBuffer(paramsBuf, 0, paramsData)
     },
@@ -483,11 +507,15 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       splat.draw(3)
       if (active) {
         splat.setPipeline(splatPipeline)
-        for (let e = 0; e < entryCount; e++) {
-          for (let l = 0; l < LODS; l++) {
+        splat.setIndexBuffer(quadIndexBuf, 'uint16')
+        // LOD-major, i.e. near-to-far: LOD n covers a strictly nearer ring than
+        // LOD n+1, so the nearest plants of every species lay down depth first
+        // and early-z rejects the field behind them instead of shading it.
+        for (let l = 0; l < LODS; l++) {
+          for (let e = 0; e < entryCount; e++) {
             const i = e * LODS + l
             splat.setBindGroup(1, splatBGs[e]!, [i * DRAWINFO_STRIDE])
-            splat.drawIndirect(indirectBuf, i * 16)
+            splat.drawIndexedIndirect(indirectBuf, i * DRAW_ARGS_BYTES)
           }
         }
       }

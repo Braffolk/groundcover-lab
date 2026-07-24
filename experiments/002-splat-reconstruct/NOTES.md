@@ -17,14 +17,20 @@ automatically because their chunks are bigger. Whole species = 2558 splats =
 
 Per frame, three window/screen-bounded passes:
 
-1. **cull** (compute): one thread per (cell, slot) in a fixed camera-centered
-   cell window (fade_end 80m -> 41x41 cells), evaluating the shared
-   `scatter_candidate` — the WGSL twin of the stand scatter, so placement is
-   bit-identical to every other renderer. Frustum + distance culled plants are
-   appended as 16B records into per-(entry, LOD) buckets. Work is bounded by
-   the window, never by stand size.
-2. **splats** (render, HALF-RES): one indirect draw per (entry, LOD); vertices
-   enumerate that LOD's splats. Each splat is a quad spanned by its baked
+1. **cull** (compute): one workgroup per cell of a fixed camera-centered cell
+   window (fade_end 80m -> 43x43 cells), one thread per candidate slot. The
+   workgroup first rejects the whole cell (its 4x4m column, padded by terrain
+   height range + tallest plant) against the frustum and the fade distance, so
+   the majority of the square window — which circumscribes the fade disc while
+   only the frustum wedge inside it can contribute — costs nothing. Surviving
+   cells evaluate the shared `scatter_candidate` — the WGSL twin of the stand
+   scatter, so placement is bit-identical to every other renderer. Frustum +
+   distance culled plants are appended as 16B records into per-(entry, LOD)
+   buckets. Work is bounded by the window, never by stand size.
+2. **splats** (render, HALF-RES): one indexed indirect draw per (entry, LOD),
+   issued LOD-major so the nearest ring of every species lays down depth
+   first; vertices enumerate that LOD's splats (4 corners each, 6 shared
+   indices). Each splat is a quad spanned by its baked
    elongation axis (projected off the view dir, floor at end-on) and the
    view-perpendicular; elliptical footprint via dithered discard so depth
    stays exact (no OIT). Wind = shared `wind_sway` scaled by baked height
@@ -58,8 +64,9 @@ Per species (HUD-tagged, 2.9MB each, budget 25MB):
 
 Shared (species-independent, screen-bounded): half-res albedo rgba8 +
 normal/depth rgba16f + depth32float = 16B/half-res px ~= 3.7MB at 1280x720,
-14.7MB at 4K; plus <10KB of counts/indirect/uniform buffers. Species total
-stays ~12% of budget.
+14.7MB at 4K; plus a 24KB static quad index buffer (2048 splats x 6 u16, the
+largest LOD; smaller LODs use a prefix) and <10KB of counts/indirect/uniform
+buffers. Species total stays ~12% of budget.
 
 ## Bake
 
@@ -76,7 +83,9 @@ OPFS-repaired if poisoned (see `isValidSplatBake`).
 
 working — verified by headless screenshots at grazing / topdown /
 inside-plant / far-horizon on `default`, plus `scaling-100m` and
-`close-quality`. All three species covered by the same pipeline.
+`close-quality`. All three species covered by the same pipeline. Post-audit
+re-verified at grazing/topdown/inside-plant/far-horizon + `scaling-100m` +
+`reconstruct=false` and in all five debug views; console clean.
 
 ## Findings
 
@@ -107,3 +116,91 @@ inside-plant / far-horizon on `default`, plus `scaling-100m` and
 - Not done yet: bench JSONs on an uncontended machine; sub-pixel temporal
   jitter of the half-res grid (would recover some silhouette resolution);
   per-species tuning of KR/radius floors in the bake.
+
+## Debug views
+
+The reconstruction pass is the single place this method produces colour, so it
+answers the global `view` selector (`frame.debug_mode`, URL `debug=`) there,
+from the reconstructed G-buffer: albedo = weighted cluster albedo before
+lighting, normals = the reconstructed splat normal actually fed to
+`light_surface()`, lighting = that light term with the height-fraction AO
+folded in (AO is occlusion, not albedo), depth = the reconstructed surface
+distance. Fog is applied only in `off`.
+
+`coverage` is drawn **opaque** and full-screen, unlike the other modes: this
+pass is a premultiplied-alpha overlay, and blending a grey coverage value over
+the terrain's own coverage (a constant 1.0 = white) would wash the map out to
+uniform white and tell you nothing. As a full-screen map it reads directly —
+black = no groundcover resolved, white = fully covered — and the fade_end ring
+and the reconstruction's soft silhouettes are both visible in one image.
+
+What the views exposed: coverage is essentially binary (alpha saturates to 1
+wherever the field is dense at default `gapFill`, softening only on
+silhouettes), which is the wanted behaviour — hard edges, not a screen-door.
+Normals are genuinely per-fragment and varied (blade/shell mix rotated per
+plant); the top-down normal view is correctly dominated by +y. Nothing needed
+repairing in the shading itself: albedo is raw baked cluster colour (never
+premultiplied by light at bake time) and lighting goes through the shared
+`light_surface()` exactly once, in the full-res pass.
+
+The old per-experiment `debug` enum param (off/coverage/normals/depth) is gone
+— it was a strictly weaker duplicate of the global selector.
+
+## Audit
+
+Found and fixed:
+
+- **The cull pass evaluated the entire cell window every frame.** 43x43 cells
+  x 128 slots x 3 entries = ~710k `scatter_candidate` evaluations (each a
+  handful of hashes plus a bilinear terrain sample) per frame, with the
+  frustum/distance test applied only *after* the candidate was fully built.
+  The window is a square circumscribing the fade_end disc, so at any normal
+  camera the great majority of it is behind the camera or off to the side.
+  Added a whole-cell reject at the top of `cs_cull`: one conservative AABB
+  (the cell column, y-bounded by `terrain_height_scale * 1.15` since
+  |fbm| <= 1.015, padded by `cell_pad` = 2x tallest plant + 0.8m) tested
+  against the 5 frustum planes and the fade distance, in a uniform branch, so
+  a rejected cell costs one box test for the whole workgroup instead of 384
+  candidate evaluations. The pad is stand-derived and computed once at init,
+  not per frame. Verified live (not dead code) by temporarily shrinking the
+  reject distance to `fade_end * 0.25` — the field visibly stopped at ~20m —
+  then reverting.
+- **The splat pass shaded 6 vertices per quad.** A quad has 4 corners; the
+  pass draws ~1M splats a frame, so that was ~2M wasted vertex-shader
+  invocations of a not-cheap VS (splat decode, oct decodes, wind sway, two
+  view transforms). Switched to a static 24KB u16 index buffer (pattern
+  0,1,2,1,3,2 per splat) and `drawIndexedIndirect`; `cs_finalize` now writes
+  5-u32 indexed args. Same triangles, same winding, same corner attributes.
+- **Draw order was entry-major.** LOD n covers a strictly nearer ring than LOD
+  n+1, so entry0's 80m ring was drawn before entry1's 3m ring — far fragments
+  shaded then overwritten. The loop is now LOD-major (near-to-far across all
+  species), which is what lets early-z reject the field behind the near
+  plants. Free reorder; depth ties between distinct splats are measure-zero.
+- **Empty pixels in the reconstruction wrote transparent black.** With
+  premultiplied blending that is an exact no-op that still costs a full-screen
+  read-modify-write; they `discard` now (except in the coverage view, which
+  wants them as its zero level). At a grazing camera that is roughly a third
+  of the frame; at far-horizon much more.
+- **A dead interpolant.** `misc.x` was plumbed vertex->fragment as the
+  constant 1.0 and multiplied into the coverage term. Removed (multiplying by
+  exactly 1.0 is bit-exact, so the image is untouched).
+
+Deliberately left alone:
+
+- **The 3x3 reconstruction gather is 4x redundant.** All four full-res pixels
+  of a 2x2 block load the same 9 half-res texels and differ only in their
+  sub-texel weights. Fixing that means reconstructing at half res and
+  upsampling, which changes the silhouette quality — a redesign, not an audit
+  fix.
+- **The dithered discard in the splat pass defeats early-z.** That dither *is*
+  the coverage mechanism this method resolves in pass 3 (see the taste rule in
+  CLAUDE.md); removing it is the technique, not waste. The LOD-major reorder
+  and the depth-init seed are the honest structural mitigations available.
+- **The params UBO is rewritten every frame** (64B). `base_cell` genuinely
+  tracks the camera; skipping the write on unchanged frames is not worth a
+  dirty-flag.
+- **`ray_dir` does an inv_view_proj mat-vec per pixel** and could be an
+  interpolated varying off the fullscreen triangle. ALU-level, out of scope.
+- Untested suggestion for later (needs a bench, so not done here): the splat
+  pass could get a cheap depth prepass for the LOD0/LOD1 rings only, since
+  those are the ones with real overdraw depth.
