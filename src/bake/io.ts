@@ -26,8 +26,11 @@ export async function bakedArtifact(ctx: BakeContext, bake: () => Promise<ArrayB
   const cached = await bakeCacheGet(fullKey)
   if (cached) return cached
 
+  // Vite's SPA fallback answers missing files with index.html at HTTP 200 —
+  // never treat an HTML response as a baked artifact (found by three
+  // experiment agents independently; their caches got poisoned).
   const committed = await fetch(`/mesh/baked/${ctx.expId}/${ctx.key}.bin`).catch(() => null)
-  if (committed?.ok) {
+  if (committed?.ok && !(committed.headers.get('content-type') ?? '').includes('text/html')) {
     const data = await committed.arrayBuffer()
     void bakeCachePut(fullKey, data)
     return data
