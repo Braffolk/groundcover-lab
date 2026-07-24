@@ -163,8 +163,8 @@ code,
   font-family: ui-monospace, 'SF Mono', Menlo, monospace;
   font-size: 11px;
   min-width: 230px;
+  max-width: 340px;
   pointer-events: none;
-  white-space: pre;
 }
 
 .hud table {
@@ -359,6 +359,8 @@ code,
 
 .card .thumb {
   aspect-ratio: 16 / 9;
+  position: relative;
+  overflow: hidden;
   background: var(--panel-2);
   display: flex;
   align-items: center;
@@ -368,7 +370,11 @@ code,
   cursor: pointer;
 }
 
+/* Absolutely positioned so an image's intrinsic ratio can never stretch the
+   box — every thumbnail displays at exactly 16:9, cropped to cover. */
 .card .thumb img {
+  position: absolute;
+  inset: 0;
   width: 100%;
   height: 100%;
   object-fit: cover;
