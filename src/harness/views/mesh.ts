@@ -36,7 +36,8 @@ export async function meshView(root: HTMLElement, state: HashState): Promise<Vie
         el(
           'span',
           'hint',
-          `${(info.vertexCount / 1e6).toFixed(2)}M verts · ${(info.triangleCount / 1e6).toFixed(2)}M tris · ${(info.bytes / 1e6).toFixed(1)}MB`,
+          `${(info.vertexCount / 1e6).toFixed(2)}M verts · ${(info.triangleCount / 1e6).toFixed(2)}M tris · ` +
+            `${(info.bytes / 1e6).toFixed(1)}MB · ${info.tileSize ? 'periodic tile' : 'single specimen'}`,
         ),
         el('span', 'hint', 'drag=orbit · wheel=zoom · Tab=fly'),
       ]),
@@ -134,12 +135,15 @@ export async function meshView(root: HTMLElement, state: HashState): Promise<Vie
       mode = (mode + 1) % 3
       modeBtn.textContent = `view: ${['color', 'normals', 'lit'][mode]}`
     })
-    const repeatBtn = button('tile ×1', () => {
-      repeat = !repeat
-      repeatBtn.textContent = repeat ? 'tile ×9' : 'tile ×1'
-    })
     const toolbar = el('div', 'toolbar')
-    toolbar.append(modeBtn, repeatBtn)
+    toolbar.append(modeBtn)
+    if (info.tileSize) {
+      const repeatBtn = button('tile ×1', () => {
+        repeat = !repeat
+        repeatBtn.textContent = repeat ? 'tile ×9' : 'tile ×1'
+      })
+      toolbar.append(repeatBtn)
+    }
     viewer.appendChild(toolbar)
 
     loading.remove()

@@ -145,12 +145,14 @@ function meshCard(mesh: MeshInfo): HTMLElement {
   head.appendChild(el('span', 'status reference', 'gcmesh1'))
   body.appendChild(head)
   const size = mesh.bytes >= 1e6 ? `${(mesh.bytes / 1e6).toFixed(1)}MB` : `${(mesh.bytes / 1e3).toFixed(0)}KB`
+  const extent = mesh.tileSize
+    ? `tile ${mesh.tileSize[0].toFixed(2)}×${mesh.tileSize[1].toFixed(2)}m`
+    : 'single specimen'
   body.appendChild(
     el(
       'div',
       'desc',
-      `${formatCount(mesh.vertexCount)} verts · ${formatCount(mesh.triangleCount)} tris · ${size} · ` +
-        `tile ${mesh.tileSize[0].toFixed(2)}×${mesh.tileSize[1].toFixed(2)}m`,
+      `${formatCount(mesh.vertexCount)} verts · ${formatCount(mesh.triangleCount)} tris · ${size} · ${extent}`,
     ),
   )
   const foot = el('div', 'foot')

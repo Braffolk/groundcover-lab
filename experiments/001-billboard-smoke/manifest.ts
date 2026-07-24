@@ -11,7 +11,7 @@ export default defineExperiment({
   description: 'TODO: one-line description of the technique idea.',
   status: 'idea',
   harnessApi: HARNESS_API,
-  species: ['calamagrostis-canescens', 'grass-blade', 'moss-patch'],
+  species: ['calamagrostis-canescens', 'elymus-repens', 'poa-pratensis'],
   params: PARAMS,
   load: () => import('./main.ts'),
 })

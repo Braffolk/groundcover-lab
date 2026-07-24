@@ -17,8 +17,8 @@ export interface SpeciesDesc {
 
 export const SPECIES: readonly SpeciesDesc[] = [
   { id: 'calamagrostis-canescens', index: 0, meshId: 'calamagrostis-canescens', heightScale: 1.18 },
-  { id: 'grass-blade', index: 1, meshId: 'grass-blade', heightScale: 0.6 },
-  { id: 'moss-patch', index: 2, meshId: 'moss-patch', heightScale: 0.15 },
+  { id: 'elymus-repens', index: 1, meshId: 'elymus-repens', heightScale: 1.21 },
+  { id: 'poa-pratensis', index: 2, meshId: 'poa-pratensis', heightScale: 0.75 },
 ]
 
 export function speciesById(id: string): SpeciesDesc {

@@ -1,0 +1,125 @@
+{
+  "schema": "laas-poa-pratensis-source-mesh/v1",
+  "species": {
+    "scientific": "Poa pratensis",
+    "common": "smooth meadow-grass / common meadow-grass",
+    "family": "Poaceae"
+  },
+  "buildSha256": "a05c978d0ffbfb9c1b045bc615ef839a7b8fff88c6f0ce8acf323444b2541d8c",
+  "generator": {
+    "id": "laas-procedural-poa-pratensis-flowering-clone-v1",
+    "seed": 1353284209,
+    "source": "tools/groundcover-bake/PoaPratensisSource.ts",
+    "sha256": "901fab23f4737a15957f89e0ecab847af6db871d407279e39cb372a18cae1dac"
+  },
+  "exporter": {
+    "source": "tools/groundcover-bake/export-poa-pratensis-source-mesh.ts",
+    "sha256": "097c10820ef0f9a08f254c75a62074ac0796ff7fcdf14e3fc1049d8303faf100"
+  },
+  "previewRenderer": [
+    {
+      "source": "tools/groundcover-bake/render-poa-pratensis-source.ts",
+      "sha256": "57e34cde5f6997553c2b12546a65c8b1b2b44939e6bb2b63ec3c1c1fa7f5aecf"
+    },
+    {
+      "source": "tools/groundcover-bake/poa-pratensis-source-preview-page.ts",
+      "sha256": "381cdf224e9a37cfb778335588432e4fc5221b78ce4a4348601619e76d05cfa8"
+    },
+    {
+      "source": "tools/groundcover-bake/poa-pratensis-source-preview.html",
+      "sha256": "9b992926c621f5d7c6571102a2d99460c97e6ff99daa54e2b0ffdeb660baea54"
+    }
+  ],
+  "binary": {
+    "file": "poa-pratensis-mesh-v1.bin",
+    "format": "GCMESH1",
+    "version": 1,
+    "sha256": "4150c6879acda8e81279fd8afde9c5b1bbce5714a58548ad0bb7f94cf66129ef",
+    "payloadSha256": "640347b65dc9deb5e205bcf59066962bf28da581632148397189ade72da8503c",
+    "bytes": 239776064,
+    "vertexBytes": 16,
+    "triangleBytes": 16
+  },
+  "geometry": {
+    "units": "metres",
+    "coordinateSystem": "+Y up, +X/+Z horizontal, right-handed",
+    "finiteSpecimen": true,
+    "periodic": false,
+    "vertexCount": 8463892,
+    "triangleCount": 6522100,
+    "boundsMin": [
+      -0.16343141885775228,
+      -0.02106527747834089,
+      -0.16721924504631341
+    ],
+    "boundsMax": [
+      0.14413516303982174,
+      0.7494113163413998,
+      0.14311464210271138
+    ],
+    "vertexOffset": 192,
+    "triangleOffset": 135422464
+  },
+  "audit": {
+    "ramets": 5,
+    "rhizomes": 4,
+    "basalLeaves": 120,
+    "caulineLeaves": 18,
+    "sheaths": 18,
+    "ligules": 18,
+    "culms": 6,
+    "panicleBranches": 369,
+    "spikelets": 2163,
+    "florets": 7543,
+    "glumes": 4326,
+    "lemmas": 7543,
+    "paleas": 7543,
+    "callusHairs": 60344,
+    "anthers": 20037
+  },
+  "sources": [
+    {
+      "name": "Kew Plants of the World Online / GrassBase — Poa pratensis",
+      "url": "https://powo.science.kew.org/taxon/urn:lsid:ipni.org:names:417792-1/general-information"
+    },
+    {
+      "name": "World Flora Online — Poa pratensis",
+      "url": "https://www.worldfloraonline.org/taxon/wfo-0000893396"
+    },
+    {
+      "name": "Flora of North America — Poa treatment",
+      "url": "https://repository.si.edu/bitstream/handle/10088/3372/Poa_in_Fl_Nth_Am_2007.pdf"
+    }
+  ],
+  "previews": [
+    {
+      "file": "qa/front.png",
+      "sha256": "b56f0a8214b8e0b17fc06fc32fe2858a1710fb40c8e64a8b3df3ae7408600e29"
+    },
+    {
+      "file": "qa/right.png",
+      "sha256": "297ddfa2fa82811de2fd5bacf4005084b786acfdfb9401e83de77213cc6d3ec6"
+    },
+    {
+      "file": "qa/back.png",
+      "sha256": "bfba4cdfff2d2f80c3faf0adc6df5b46ad2fc9a310fe99c650497652b1c5c7b6"
+    },
+    {
+      "file": "qa/left.png",
+      "sha256": "b293c5d55bfe6bf5bb2640ce9e4b409433ef818c80c8827a266cf591c0abef8b"
+    },
+    {
+      "file": "qa/panicle-close-front.png",
+      "sha256": "40d8a32b89a1fb2b4c7f00ebb008763ff8ae0665ffa0f807eaa8886a1f5bba73"
+    },
+    {
+      "file": "qa/panicle-close-threeq.png",
+      "sha256": "1955e8102af08d1b7c837b55f406835e6d066cd3e5f45c2d423a1b644db1a4ef"
+    },
+    {
+      "file": "qa/cardinal-contact-labeled.png",
+      "sha256": "3b0adc367475121bc735bf7de0766441c0e02460665be0c77557960bf1f3b18e"
+    }
+  ],
+  "claimBoundary": "Species-grounded flowering architecture and explicit organs; deterministic procedural reference, not a scan or a reconstruction of one Estonian genotype, cultivar, soil state, or phenological specimen."
+}

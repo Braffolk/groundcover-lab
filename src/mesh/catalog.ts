@@ -1,22 +1,62 @@
 import { parseGcMesh, type GcMesh } from './gcmesh.ts'
 
-interface RawManifest {
+/**
+ * Source-mesh manifests come in two shapes:
+ *  - flat (calamagrostis): { binary: "file.bin", vertexCount, tileSize, outputBytes, ... }
+ *  - nested (elymus, poa): { binary: { file, bytes }, geometry: { vertexCount,
+ *    tile?: { sizeX, sizeZ } | absent for finite specimens, ... } }
+ * Normalize both here; nothing else in the app looks at raw manifests.
+ */
+interface FlatManifest {
   binary: string
   vertexCount: number
   triangleCount: number
-  boundsMin: number[]
-  boundsMax: number[]
   tileSize: number[]
   outputBytes: number
 }
+
+interface NestedManifest {
+  binary: { file: string; bytes: number }
+  geometry: {
+    vertexCount: number
+    triangleCount: number
+    tile?: { sizeX: number; sizeZ: number }
+  }
+}
+
+type RawManifest = FlatManifest | NestedManifest
 
 export interface MeshInfo {
   id: string
   url: string
   vertexCount: number
   triangleCount: number
-  tileSize: [number, number]
+  /** Periodic community tile size (m), or null for finite single specimens. */
+  tileSize: [number, number] | null
   bytes: number
+}
+
+function normalize(id: string, m: RawManifest): MeshInfo {
+  if ('geometry' in m) {
+    const g = m.geometry
+    return {
+      id,
+      url: `/mesh/raw/${id}/${m.binary.file}`,
+      vertexCount: g.vertexCount,
+      triangleCount: g.triangleCount,
+      tileSize: g.tile ? [g.tile.sizeX, g.tile.sizeZ] : null,
+      bytes: m.binary.bytes,
+    }
+  }
+  const tile: [number, number] = [m.tileSize[0] ?? 0, m.tileSize[1] ?? 0]
+  return {
+    id,
+    url: `/mesh/raw/${id}/${m.binary}`,
+    vertexCount: m.vertexCount,
+    triangleCount: m.triangleCount,
+    tileSize: tile[0] > 0 && tile[1] > 0 ? tile : null,
+    bytes: m.outputBytes,
+  }
 }
 
 const manifests = import.meta.glob<RawManifest>('/mesh/raw/*/manifest.json', {
@@ -33,17 +73,7 @@ export class MeshCatalog {
 
   list(): MeshInfo[] {
     return Object.entries(manifests)
-      .map(([path, m]) => {
-        const id = path.split('/')[3]!
-        return {
-          id,
-          url: `/mesh/raw/${id}/${m.binary}`,
-          vertexCount: m.vertexCount,
-          triangleCount: m.triangleCount,
-          tileSize: [m.tileSize[0] ?? 0, m.tileSize[1] ?? 0] as [number, number],
-          bytes: m.outputBytes,
-        }
-      })
+      .map(([path, m]) => normalize(path.split('/')[3]!, m))
       .sort((a, b) => a.id.localeCompare(b.id))
   }
 

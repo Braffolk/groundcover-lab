@@ -41,8 +41,8 @@ const CALAMAGROSTIS: Omit<StandSpecies, 'density'> = {
   scaleMax: 1.25,
   sway: 0.6,
 }
-const GRASS: Omit<StandSpecies, 'density'> = { species: 'grass-blade', scaleMin: 0.7, scaleMax: 1.3, sway: 1 }
-const MOSS: Omit<StandSpecies, 'density'> = { species: 'moss-patch', scaleMin: 0.8, scaleMax: 1.6, sway: 0 }
+const ELYMUS: Omit<StandSpecies, 'density'> = { species: 'elymus-repens', scaleMin: 0.8, scaleMax: 1.2, sway: 0.65 }
+const POA: Omit<StandSpecies, 'density'> = { species: 'poa-pratensis', scaleMin: 0.75, scaleMax: 1.3, sway: 0.85 }
 
 export const STANDS: readonly Stand[] = [
   {
@@ -52,8 +52,8 @@ export const STANDS: readonly Stand[] = [
     radius: 128,
     species: [
       { ...CALAMAGROSTIS, density: 3 },
-      { ...GRASS, density: 4 },
-      { ...MOSS, density: 1.5 },
+      { ...ELYMUS, density: 2.5 },
+      { ...POA, density: 3 },
     ],
   },
   {
@@ -70,8 +70,8 @@ export const STANDS: readonly Stand[] = [
     radius: 24,
     species: [
       { ...CALAMAGROSTIS, density: 3 },
-      { ...GRASS, density: 4 },
-      { ...MOSS, density: 1.5 },
+      { ...ELYMUS, density: 2.5 },
+      { ...POA, density: 3 },
     ],
   },
   {
@@ -81,8 +81,8 @@ export const STANDS: readonly Stand[] = [
     radius: 384,
     species: [
       { ...CALAMAGROSTIS, density: 5 },
-      { ...GRASS, density: 6 },
-      { ...MOSS, density: 2 },
+      { ...ELYMUS, density: 4 },
+      { ...POA, density: 4 },
     ],
   },
   {
@@ -92,8 +92,8 @@ export const STANDS: readonly Stand[] = [
     radius: 2048,
     species: [
       { ...CALAMAGROSTIS, density: 3 },
-      { ...GRASS, density: 4 },
-      { ...MOSS, density: 1 },
+      { ...ELYMUS, density: 2.5 },
+      { ...POA, density: 2.5 },
     ],
   },
 ]

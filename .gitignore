@@ -5,8 +5,4 @@ dist/
 
 # Massive source-mesh binaries stay out of git — drop them into
 # mesh/raw/<species>/ locally (manifest.json + format docs ARE committed).
-# The tiny procedural species from `npm run species:gen` are kept so a fresh
-# clone works standalone.
 mesh/raw/**/*.bin
-!mesh/raw/grass-blade/*.bin
-!mesh/raw/moss-patch/*.bin

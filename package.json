@@ -9,7 +9,6 @@
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
     "new": "tsx tools/new-experiment.ts",
-    "species:gen": "tsx tools/gen-species.ts",
     "capture:thumbs": "tsx tools/capture.ts thumbs",
     "capture:goldens": "tsx tools/capture.ts goldens",
     "bench:all": "tsx tools/capture.ts bench"

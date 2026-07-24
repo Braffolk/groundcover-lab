@@ -1,0 +1,124 @@
+{
+  "schema": "laas-elymus-repens-source-mesh/v1",
+  "species": {
+    "scientific": "Elymus repens",
+    "common": "common couch grass / couch-grass",
+    "family": "Poaceae"
+  },
+  "buildSha256": "ccaac3440f47fd0615893ceab9ce0ba0f4c463d0d33db19e5c35254b743da3f1",
+  "generator": {
+    "id": "original-procedural-elymus-repens-v1-high-detail-distichous-multifloret-spike",
+    "source": "tools/groundcover-bake/ElymusRepens.ts",
+    "sha256": "6cc83dc8009388c93c9d9cc666edca23d29c9cf08c08d259f7db3b159af996c9"
+  },
+  "exporter": {
+    "source": "tools/groundcover-bake/export-elymus-repens-source-mesh.ts",
+    "sha256": "7f7f13f101d40a33748df83b2809b416d0ed14120a44d688f9b145f29bc2d4d6"
+  },
+  "previewer": {
+    "source": "tools/groundcover-bake/render-elymus-repens-review.ts",
+    "sha256": "e7fe077018c9335b296fb9ca46cab59eb915e7c606b7a188330fac1e69561416"
+  },
+  "binary": {
+    "file": "elymus-repens-mesh-v1.bin",
+    "format": "GCMESH1",
+    "version": 1,
+    "sha256": "ba719956b889a8f337e0f018cb35eea648c09abd43f39bef8200f9a2706606dc",
+    "payloadSha256": "fd81590fcf6869e3286cc3c6ff1034c33422c9aab9318b59ad4d7ab4ad5f3b0e",
+    "bytes": 67225776,
+    "vertexBytes": 16,
+    "triangleBytes": 16
+  },
+  "geometry": {
+    "units": "metres",
+    "coordinateSystem": "+Y up, +X/+Z horizontal, right-handed",
+    "periodicCommunity": true,
+    "tile": {
+      "originX": 0,
+      "originZ": 0,
+      "sizeX": 0.62,
+      "sizeZ": 0.62,
+      "topH": 1.2129519662398422
+    },
+    "vertexCount": 1481345,
+    "triangleCount": 2720254,
+    "boundsMin": [
+      -0.1937683785561766,
+      0.0010019990530031552,
+      -0.20918311187310532
+    ],
+    "boundsMax": [
+      0.7633617883827354,
+      1.1879519662398423,
+      0.7677836594669364
+    ],
+    "vertexOffset": 192,
+    "triangleOffset": 23701712,
+    "maximumNormalLengthError": 4.440892098500626e-16
+  },
+  "structure": {
+    "shootAnchors": 12,
+    "floweringCulms": 18,
+    "basalLeaves": 203,
+    "caulineLeaves": 54,
+    "spikelets": 391,
+    "florets": 2137,
+    "glumes": 782,
+    "lemmas": 2137,
+    "paleas": 2137,
+    "anthers": 2466,
+    "ligules": 54,
+    "auricles": 108,
+    "rhizomes": 12
+  },
+  "sources": [
+    {
+      "name": "Kew Plants of the World Online / GrassBase — Elymus repens",
+      "url": "https://powo.science.kew.org/taxon/urn:lsid:ipni.org:names:90320-2/general-information"
+    },
+    {
+      "name": "World Flora Online — Elymus repens",
+      "url": "https://www.worldfloraonline.org/taxon/wfo-0000866643"
+    },
+    {
+      "name": "Royal Horticultural Society — Elymus repens",
+      "url": "https://www.rhs.org.uk/plants/6342/elymus-repens/details"
+    }
+  ],
+  "sourceKeys": [
+    "powo-elymus-repens-grassbase",
+    "world-flora-online-elymus-repens",
+    "rhs-elymus-repens"
+  ],
+  "previews": [
+    {
+      "file": "qa/detail-front.png",
+      "sha256": "c69d16a43bd1b3a5300b817ac2832c9ae480bf125ac6024510b705da1ce373fe"
+    },
+    {
+      "file": "qa/detail-right.png",
+      "sha256": "3cea27a39fb1cc15618e3afe4cb5b8b79ed7e517dc3e11c2d721d411ceeb60a5"
+    },
+    {
+      "file": "qa/detail-back.png",
+      "sha256": "4d63c51316d3ad3d4fbe3e3bc202b9d92b1257f3347db519bc2972efff80ecbf"
+    },
+    {
+      "file": "qa/detail-left.png",
+      "sha256": "857df13e3ebb7a378a8f43d4cb5024dfbc2a4b48554048526fe45c47f29a2782"
+    },
+    {
+      "file": "qa/01-cardinal-detail.png",
+      "sha256": "79b9401a0f06703b10bba68659db5af75fdc140a3bdf9f286b1bb731617d2ce9"
+    },
+    {
+      "file": "qa/02-cardinal-metric-1.6m.png",
+      "sha256": "ac02b99a33713de45b368fe26fd192b7e74c83b58a84ea6fa0d6f87a345ae8f6"
+    },
+    {
+      "file": "qa/03-cardinal-spike-detail.png",
+      "sha256": "4973017f6e1758cc24353f7bc88c828af8f26e748129b86454097c3a792d226e"
+    }
+  ],
+  "claimBoundary": "Species-grounded flowering architectural community with explicit rhizomes, sheaths, ligules, auricles, glumes, lemmas, paleas, florets, and anthers. It is a deterministic reference mesh, not a scan of one Estonian genotype or phenological specimen."
+}
