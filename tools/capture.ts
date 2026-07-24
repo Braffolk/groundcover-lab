@@ -35,15 +35,19 @@ if (experiments.length === 0) {
 }
 
 try {
-  await fetch(`${BASE}/__bench/list`)
+  // Must be OUR dev server (its sink returns a JSON array) — another Vite app
+  // on the same port would return index.html with a 200.
+  const body = await (await fetch(`${BASE}/__bench/list`)).text()
+  if (!Array.isArray(JSON.parse(body))) throw new Error('not the groundcover sink')
 } catch {
-  console.error(`dev server not reachable at ${BASE} — run \`npm run dev\` first`)
+  console.error(`${BASE} is not the groundcover dev server — run \`npm run dev\` and check the port (GC_BASE_URL=... to override)`)
   process.exit(1)
 }
 
 const headless = mode !== 'bench'
 const browser = await chromium.launch({
   headless,
+  channel: 'chrome', // system Chrome — no playwright browser download needed
   args: ['--enable-unsafe-webgpu', '--enable-features=WebGPU', '--hide-scrollbars'],
 })
 const page = await browser.newPage({ viewport: { width: 1600, height: 950 } })
@@ -63,7 +67,7 @@ async function settleAndClick(url: string, buttonText: string, settleMs: number)
   await page.waitForTimeout(settleMs) // let bakes/warmup settle
   await button.click()
   try {
-    await page.locator('.toast', { hasText: 'saved' }).waitFor({ timeout: 60_000 })
+    await page.locator('.toast', { hasText: 'saved' }).first().waitFor({ timeout: 60_000 })
     return true
   } catch {
     console.log(`  ✗ save toast never appeared — ${url}`)
@@ -84,7 +88,7 @@ for (const id of experiments) {
   } else {
     await page.goto(`${BASE}/#/bench/${id}`)
     try {
-      await page.locator('.toast', { hasText: 'saved' }).waitFor({ timeout: 300_000 })
+      await page.locator('.toast', { hasText: 'saved' }).first().waitFor({ timeout: 300_000 })
       console.log('  ✓ bench saved')
     } catch {
       console.log('  ✗ bench did not finish within 5min')

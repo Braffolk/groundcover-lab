@@ -83,13 +83,15 @@ export function builtinSplines(terrain: Terrain): Record<string, CameraSpline> {
   }
   const flythrough: CameraPose[] = []
   for (let z = 40; z >= -40; z -= 10) {
-    flythrough.push({ x: 5, y: h(5, z) + 1.1, z, yaw: Math.PI, pitch: -0.08, fov: 60 })
+    // Moving toward -z, facing -z (yaw 0).
+    flythrough.push({ x: 5, y: h(5, z) + 1.1, z, yaw: 0, pitch: -0.08, fov: 60 })
   }
+  const QUARTER = -Math.PI / 4 // at (+x, +z), faces the origin
   const pullBack: CameraPose[] = [
-    { x: 1.6, y: h(1.6, 1.6) + 0.5, z: 1.6, yaw: -2.4, pitch: -0.05, fov: 60 },
-    { x: 6, y: h(6, 6) + 1.6, z: 6, yaw: -2.4, pitch: -0.18, fov: 60 },
-    { x: 16, y: h(16, 16) + 6, z: 16, yaw: -2.36, pitch: -0.35, fov: 60 },
-    { x: 34, y: h(34, 34) + 16, z: 34, yaw: -2.36, pitch: -0.5, fov: 60 },
+    { x: 1.6, y: h(1.6, 1.6) + 0.5, z: 1.6, yaw: QUARTER, pitch: -0.05, fov: 60 },
+    { x: 6, y: h(6, 6) + 1.6, z: 6, yaw: QUARTER, pitch: -0.18, fov: 60 },
+    { x: 16, y: h(16, 16) + 6, z: 16, yaw: QUARTER, pitch: -0.35, fov: 60 },
+    { x: 34, y: h(34, 34) + 16, z: 34, yaw: QUARTER, pitch: -0.5, fov: 60 },
   ]
   return {
     'orbit-low': new CameraSpline(orbitLow, true),

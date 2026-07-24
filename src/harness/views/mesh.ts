@@ -124,7 +124,7 @@ export async function meshView(root: HTMLElement, state: HashState): Promise<Vie
     shaders.onReload(build)
 
     const center = mesh.header.boundsMin.map((v, i) => (v + mesh.header.boundsMax[i]!) / 2) as [number, number, number]
-    const camera = new CameraController({ x: center[0] + 0.9, y: center[1] + 0.5, z: center[2] + 0.9, yaw: -2.36, pitch: -0.25, fov: 55 })
+    const camera = new CameraController({ x: center[0] + 0.9, y: center[1] + 0.5, z: center[2] + 0.9, yaw: -Math.PI / 4, pitch: -0.35, fov: 55 })
     camera.mode = 'orbit'
     camera.attach(canvas)
 
@@ -154,6 +154,7 @@ export async function meshView(root: HTMLElement, state: HashState): Promise<Vie
       if (disposed) return
       raf = requestAnimationFrame(tick)
       const now = performance.now()
+      const dt = Math.min((now - last) / 1000, 0.1)
       frameMsAvg = frameMsAvg * 0.95 + (now - last) * 0.05
       last = now
 
@@ -171,7 +172,7 @@ export async function meshView(root: HTMLElement, state: HashState): Promise<Vie
           usage: GPUTextureUsage.RENDER_ATTACHMENT,
         })
       }
-      camera.update((now - last) / 1000 + 1e-6)
+      camera.update(dt)
       const { viewProj } = poseMatrices(camera.pose, w / h)
       uniforms.set(viewProj, 0)
       uniforms.set(mesh.header.boundsMin, 16)

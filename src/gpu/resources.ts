@@ -75,6 +75,20 @@ export class VramTracker {
     return new VramScope(this, owner)
   }
 
+  /**
+   * Run `fn` with the untracked-allocation warning suppressed — for tiny
+   * harness-internal buffers (timers, compositors, readbacks) that would
+   * only add noise to the budget meter.
+   */
+  exempt<T>(fn: () => T): T {
+    this.inTracker = true
+    try {
+      return fn()
+    } finally {
+      this.inTracker = false
+    }
+  }
+
   /** @internal */
   allocBuffer(owner: string, desc: GPUBufferDescriptor, attr?: VramAttr): { resource: GPUBuffer; entry: VramEntry } {
     this.inTracker = true
@@ -185,13 +199,12 @@ export class VramScope {
     return resource
   }
 
-  /** Destroys every resource this scope still holds; warns about leaks. */
+  /**
+   * Destroys every resource this scope still holds. This IS the sanctioned
+   * cleanup path — experiments are not required to destroy their own
+   * allocations on dispose.
+   */
   dispose(): void {
-    const leaked = this.mine.filter((e) => e.alive)
-    if (leaked.length > 0) {
-      const mb = (leaked.reduce((a, e) => a + e.bytes, 0) / (1024 * 1024)).toFixed(1)
-      console.warn(`[vram] ${this.owner}: ${leaked.length} resources (${mb}MB) still alive at dispose — destroying`)
-    }
     for (const r of this.resources) r.destroy()
     this.resources = []
     this.mine = []

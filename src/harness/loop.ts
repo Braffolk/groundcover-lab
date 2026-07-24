@@ -105,7 +105,7 @@ export class LabApp {
     const { device } = gpu
     const tracker = new VramTracker(device)
     const shaders = new ShaderRegistry(device, opts.onShaderMessage)
-    const timer = new PassTimer(device, gpu.hasTimestamps, opts.timerRingSize ?? 4)
+    const timer = tracker.exempt(() => new PassTimer(device, gpu.hasTimestamps, opts.timerRingSize ?? 4))
 
     const sceneScope = tracker.scope('scene')
     const terrain = Terrain.generate(sceneScope, device.queue)

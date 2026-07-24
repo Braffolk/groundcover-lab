@@ -42,10 +42,14 @@ function card(entry: RegistryEntry, selected: Set<string>, onSelect: () => void)
   const c = el('div', m ? 'card' : 'card broken')
 
   const thumb = el('div', 'thumb')
-  if (entry.thumbnailUrl) {
+  if (entry.thumbnailUrl && m) {
     const img = el('img')
     img.src = entry.thumbnailUrl
     img.alt = entry.id
+    img.addEventListener('error', () => {
+      img.remove()
+      thumb.textContent = 'no thumbnail yet — 📷 in the runner'
+    })
     thumb.appendChild(img)
   } else {
     thumb.textContent = m ? 'no thumbnail yet — 📷 in the runner' : '⚠ broken'

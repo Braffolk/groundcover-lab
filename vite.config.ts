@@ -12,5 +12,16 @@ export default defineConfig({
   },
   server: {
     port: 5173,
+    watch: {
+      // Artifacts written by the dev-sink endpoints (thumbnails, goldens,
+      // bench results, bakes) must not trigger page reloads mid-session.
+      ignored: [
+        '**/experiments/*/thumbnail.png',
+        '**/goldens/**',
+        '**/results/**',
+        '**/mesh/baked/**',
+        '**/mesh/raw/**',
+      ],
+    },
   },
 })

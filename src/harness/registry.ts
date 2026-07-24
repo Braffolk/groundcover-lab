@@ -119,11 +119,6 @@ export interface RegistryEntry {
 }
 
 const manifestLoaders = import.meta.glob('/experiments/*/manifest.ts')
-const thumbnails = import.meta.glob<string>('/experiments/*/thumbnail.png', {
-  eager: true,
-  query: '?url',
-  import: 'default',
-})
 
 function dirOf(path: string): string {
   return path.split('/')[2]!
@@ -134,8 +129,9 @@ export async function discoverExperiments(): Promise<RegistryEntry[]> {
   for (const [path, loader] of Object.entries(manifestLoaders)) {
     const id = dirOf(path)
     if (id.startsWith('_')) continue
-    const thumbnailUrl = thumbnails[`/experiments/${id}/thumbnail.png`]
-    const entry: RegistryEntry = { id, manifest: null, ...(thumbnailUrl && { thumbnailUrl }) }
+    // Conventional URL, not a glob import — the dev server serves it directly,
+    // so fresh captures appear without rebundling (cards fall back on 404).
+    const entry: RegistryEntry = { id, manifest: null, thumbnailUrl: `/experiments/${id}/thumbnail.png` }
     entries.push(entry)
     try {
       const mod = (await loader()) as { default?: ExperimentManifest }

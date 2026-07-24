@@ -64,7 +64,7 @@ export async function abView(root: HTMLElement, state: HashState): Promise<View>
     })
     cleanups.push(() => app.dispose())
 
-    const compositor = new CompareCompositor(app.gpu.device, app.shaders, app.gpu.format)
+    const compositor = app.tracker.exempt(() => new CompareCompositor(app.gpu.device, app.shaders, app.gpu.format))
     app.setCompositor(compositor)
     const initialMode = state.q.get('mode')
     if (initialMode === 'flicker' || initialMode === 'diff') compositor.mode = initialMode

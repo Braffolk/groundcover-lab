@@ -11,11 +11,13 @@ export async function captureViewPng(app: LabApp, viewIndex = 0): Promise<Blob> 
   const { width, height } = view.color
   const bytesPerRow = Math.ceil((width * 4) / 256) * 256
 
-  const readback = device.createBuffer({
-    label: 'capture/readback',
-    size: bytesPerRow * height,
-    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
-  })
+  const readback = app.tracker.exempt(() =>
+    device.createBuffer({
+      label: 'capture/readback',
+      size: bytesPerRow * height,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    }),
+  )
   const enc = device.createCommandEncoder({ label: 'capture' })
   enc.copyTextureToBuffer({ texture: view.color }, { buffer: readback, bytesPerRow }, [width, height])
   device.queue.submit([enc.finish()])
