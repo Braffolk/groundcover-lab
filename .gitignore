@@ -6,3 +6,12 @@ dist/
 # Massive source-mesh binaries stay out of git — drop them into
 # mesh/raw/<species>/ locally (manifest.json + format docs ARE committed).
 mesh/raw/**/*.bin
+
+# Agent worktrees / local Claude state
+.claude/
+
+# Stale / oversized bake variants. Only the variant an experiment's code
+# actually loads belongs in git; the rest are regenerable in-browser, and
+# anything over 100MB is rejected by GitHub outright.
+mesh/baked/005-octa-impostors/views-v2-11x512-*.bin
+mesh/baked/005-octa-impostors/views-v2-11x128-*.bin
