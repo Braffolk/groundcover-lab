@@ -1,0 +1,43 @@
+{
+  "schema": "laas-calamagrostis-source-mesh/v1",
+  "binary": "calamagrostis-canescens-mesh-v1.bin",
+  "outputSha256": "875624ad5a41051750ac754d7c0e06f2af636ab05735373a8897e523de4cb680",
+  "payloadSha256": "ca98a3941055a04bb414ab0db98913a7db5a9280ff62912066b48a9a9ce7a0d1",
+  "outputBytes": 67538096,
+  "source": {
+    "path": "src/assets/groundcover/calamagrostis-canescens.gcrp",
+    "gcrpVersion": 4,
+    "sha256": "e3e0a4175b151b89a1a4bb58089aed2e809da337a04ce024240be8decdacb0be",
+    "bytes": 119462112
+  },
+  "profileId": 2,
+  "vertexCount": 2049985,
+  "triangleCount": 2171134,
+  "boundsMin": [
+    -0.07772284001111984,
+    0.001295100199058652,
+    -0.08573390543460846
+  ],
+  "boundsMax": [
+    0.6704205274581909,
+    1.151517629623413,
+    0.6076181530952454
+  ],
+  "tileOrigin": [
+    0,
+    0
+  ],
+  "tileSize": [
+    0.5199999809265137,
+    0.5199999809265137
+  ],
+  "topH": 1.1765177249908447,
+  "offsets": {
+    "vertexOffset": 192,
+    "triangleOffset": 32799952
+  },
+  "records": {
+    "vertexBytes": 16,
+    "triangleBytes": 16
+  }
+}
