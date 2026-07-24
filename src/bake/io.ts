@@ -1,3 +1,5 @@
+import { HAS_DEV_SINK } from '../util/env.ts'
+import { assetUrl } from '../util/paths.ts'
 import { bakeCacheGet, bakeCachePut } from './cache.ts'
 
 /**
@@ -29,7 +31,7 @@ export async function bakedArtifact(ctx: BakeContext, bake: () => Promise<ArrayB
   // Vite's SPA fallback answers missing files with index.html at HTTP 200 —
   // never treat an HTML response as a baked artifact (found by three
   // experiment agents independently; their caches got poisoned).
-  const committed = await fetch(`/mesh/baked/${ctx.expId}/${ctx.key}.bin`).catch(() => null)
+  const committed = await fetch(assetUrl(`/mesh/baked/${ctx.expId}/${ctx.key}.bin`)).catch(() => null)
   if (committed?.ok && !(committed.headers.get('content-type') ?? '').includes('text/html')) {
     const data = await committed.arrayBuffer()
     void bakeCachePut(fullKey, data)
@@ -42,6 +44,9 @@ export async function bakedArtifact(ctx: BakeContext, bake: () => Promise<ArrayB
 }
 
 export async function commitBake(expId: string, key: string, data: ArrayBuffer): Promise<string> {
+  // Static deployment: there is no repo to commit into. Reject without ever
+  // issuing the request — every caller already treats this as best-effort.
+  if (!HAS_DEV_SINK) throw new Error('commitBake needs the dev server (static build — artifact stays in the OPFS cache)')
   const res = await fetch(`/__bake?exp=${encodeURIComponent(expId)}&key=${encodeURIComponent(key)}`, {
     method: 'POST',
     body: data,

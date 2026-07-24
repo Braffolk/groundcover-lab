@@ -25,3 +25,41 @@ This task requires out of the box brilliant graphical engineering thinking - pro
 Build different experiments in different subdirectories. Testable in browser. Work must be duable for parallel subagents, each working on a different experiment. Needs exact frame times to be able to compare results (not just the quality of effect).
 
 See `CLAUDE.md` for the exact recipe for adding an experiment without touching shared code.
+
+## Static deploy
+
+The lab builds to a plain static site (S3 + CloudFront, GitHub Pages, any file host).
+It is hash-routed (`#/run/<id>`, `#/ab/...`, `#/bench/...`), so **no server rewrite rules are needed** —
+one `index.html` is enough.
+
+```bash
+npx vite build                      # → dist/, ~267MB (base path /groundcover-lab/)
+GC_DEPLOY_MESHES=1 npx vite build   # → dist/, ~624MB (adds the raw GCMESH1 source meshes)
+npx vite preview --port 5199        # serve dist/ locally at /groundcover-lab/
+```
+
+- **Base path.** Production builds are served under `/groundcover-lab/` (`base` in `vite.config.ts`);
+  the dev server stays at `/`. Runtime asset URLs go through `assetUrl()` (`src/util/paths.ts`), which
+  resolves against `import.meta.env.BASE_URL` — use it (exported from `@harness`) for any hand-written
+  fetch of `/mesh/...`, `/experiments/...` or `/results/...`. To deploy at a different path, change
+  `base`; to deploy at the domain root, set it to `/`.
+- **What gets uploaded** (`tools/vite-plugin-static-deploy.ts` copies these into `dist/`):
+  the JS/CSS bundle (~1MB), `mesh/baked/**` (~255MB of committed baked artifacts — without them a
+  visitor would have to re-bake from raw meshes in-browser), `experiments/*/thumbnail.png` +
+  `rating.json` (~9MB), `results/*.json` plus a generated `results/index.json`, and
+  `mesh/raw/*/manifest.json`. `goldens/` is never uploaded (nothing fetches it at runtime).
+- **Raw source meshes are OFF by default.** They are ~357MB (poa-pratensis alone is 229MB) and only
+  the `#/mesh/<id>` inspector and reference renders need them. Build with `GC_DEPLOY_MESHES=1` to
+  include them; without them the mesh cards say "source .bin not deployed" and the inspector shows a
+  plain "source mesh not included in this deployment" message instead of failing.
+- **WebGPU requires a secure context**, i.e. HTTPS (or localhost). An S3 *website* endpoint is
+  HTTP-only and will therefore **not** work — use the S3 REST endpoint over TLS
+  (`https://<bucket>.s3.<region>.amazonaws.com/groundcover-lab/index.html`) or, better, put CloudFront
+  in front of the bucket. Serve `.bin` as `application/octet-stream` and enable compression for
+  JS/CSS/JSON only (the `.bin` artifacts are already dense).
+- **The deployed site is read-only.** The `/__bench`, `/__thumb`, `/__bake`, `/__rating` endpoints are
+  dev-server middleware and do not exist in a build, so: rating pips display the owner's verdict (and
+  still drive the visual/balance sorts) but cannot be clicked, the runner has no thumbnail/golden
+  capture buttons, a bench run downloads its JSON instead of saving it (drop it onto `#/results` to
+  compare), and bakes stay in the browser's OPFS cache instead of being committed. Everything else —
+  browsing, running experiments, A/B, benching, the results table — works exactly as it does locally.

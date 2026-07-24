@@ -3,6 +3,7 @@ import { meshCatalog, type MeshInfo } from '../../mesh/catalog.ts'
 import { fetchAllRatings, saveRating } from '../ratings.ts'
 import { balanceScore, loadPerfIndex } from '../scoring.ts'
 import { currentState, navigate, updateQuery } from '../../url/state.ts'
+import { HAS_DEV_SINK, RAW_MESHES_AVAILABLE } from '../../util/env.ts'
 import { pipsRow } from '../../ui/pips.ts'
 import { button, el, formatCount, link, topbar, type View } from './shared.ts'
 
@@ -162,6 +163,11 @@ export async function browserView(root: HTMLElement): Promise<View> {
 
   if (references.length > 0) {
     browser.appendChild(el('h2', undefined, 'references — ignore the stand'))
+    if (!RAW_MESHES_AVAILABLE) {
+      browser.appendChild(
+        el('div', 'hint', 'raw source meshes are not part of this deployment — references that render them cannot start here'),
+      )
+    }
     const refGrid = el('div', 'cards')
     browser.appendChild(refGrid)
     for (const entry of references) {
@@ -220,7 +226,9 @@ function experimentCard(
   const scoreLabel = el('span', 'mono hint')
   if (rating) {
     const scores = el('div', 'scores')
-    scores.appendChild(pipsRow({ value: rating.rating, onSet: rating.onRate }).el)
+    // Read-only deployment: pips still show the owner's verdict (and still
+    // drive the `visual`/`balance` sorts) but cannot be clicked.
+    scores.appendChild(pipsRow({ value: rating.rating, onSet: rating.onRate, readOnly: !HAS_DEV_SINK }).el)
     scores.appendChild(scoreLabel)
     body.appendChild(scores)
   }
@@ -260,6 +268,10 @@ function meshCard(mesh: MeshInfo): HTMLElement {
       `${formatCount(mesh.vertexCount)} verts · ${formatCount(mesh.triangleCount)} tris · ${size} · ${extent}`,
     ),
   )
+  if (!mesh.available) {
+    thumb.textContent = 'source .bin not deployed'
+    body.appendChild(el('div', 'hint', 'manifest only — the binary is not part of this deployment'))
+  }
   const foot = el('div', 'foot')
   foot.appendChild(el('code', 'mono', `mesh/raw/${mesh.id}/`))
   body.appendChild(foot)

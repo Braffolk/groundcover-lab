@@ -457,6 +457,12 @@ code,
   border-color: var(--text);
 }
 
+/* Static deployment: the owner's rating is shown, but nothing can set it. */
+.pips.read-only .pip {
+  cursor: default;
+  opacity: 0.9;
+}
+
 .status {
   font-size: 10px;
   text-transform: uppercase;

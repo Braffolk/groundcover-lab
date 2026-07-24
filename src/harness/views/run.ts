@@ -1,4 +1,5 @@
 import { parsePose } from '../../scene/camera.ts'
+import { HAS_DEV_SINK } from '../../util/env.ts'
 import { buildHash, makeDebouncedQueryWriter, type HashState } from '../../url/state.ts'
 import { Overlay } from '../../ui/overlay.ts'
 import { Hud } from '../../ui/hud.ts'
@@ -14,6 +15,7 @@ import {
   copyToClipboard,
   currentBookmarkName,
   el,
+  fatalDetail,
   readSeed,
   readStand,
   resolveCam,
@@ -116,26 +118,34 @@ export async function runView(root: HTMLElement, state: HashState): Promise<View
       button('copy link', () => {
         void copyToClipboard(location.href).then(() => overlay.toast('link copied'))
       }),
-      button('thumbnail', () => {
-        void captureViewPng(app, 0, 640)
-          .then((blob) => uploadCapture(id, blob))
-          .then((saved) => overlay.toast(`saved ${saved} — shows on the browser card`))
-          .catch(() => {
-            overlay.toast('dev server sink unavailable — downloading instead', 'warn')
-            void captureViewPng(app, 0, 640).then((b) => downloadBlob(b, `${id}-thumbnail.png`))
-          })
-      }),
-      button('golden @cam', () => {
-        const name = currentBookmarkName(app)
-        if (!name) {
-          overlay.toast('goldens need a named cam — press 1-4 first', 'warn')
-          return
-        }
-        void captureViewPng(app)
-          .then((blob) => uploadCapture(id, blob, name))
-          .then((saved) => overlay.toast(`saved ${saved}`))
-          .catch((err: unknown) => overlay.toast(String(err), 'error'))
-      }),
+    )
+    // Capture buttons write into the repo through the dev-sink — a static
+    // deployment has nowhere to put them, so they simply do not exist there.
+    if (HAS_DEV_SINK) {
+      toolbar.append(
+        button('thumbnail', () => {
+          void captureViewPng(app, 0, 640)
+            .then((blob) => uploadCapture(id, blob))
+            .then((saved) => overlay.toast(`saved ${saved} — shows on the browser card`))
+            .catch(() => {
+              overlay.toast('dev server sink unavailable — downloading instead', 'warn')
+              void captureViewPng(app, 0, 640).then((b) => downloadBlob(b, `${id}-thumbnail.png`))
+            })
+        }),
+        button('golden @cam', () => {
+          const name = currentBookmarkName(app)
+          if (!name) {
+            overlay.toast('goldens need a named cam — press 1-4 first', 'warn')
+            return
+          }
+          void captureViewPng(app)
+            .then((blob) => uploadCapture(id, blob, name))
+            .then((saved) => overlay.toast(`saved ${saved}`))
+            .catch((err: unknown) => overlay.toast(String(err), 'error'))
+        }),
+      )
+    }
+    toolbar.append(
       button('bench', () => {
         location.hash = buildHash(['bench', id], { seed: String(seed), stand: stand.id })
       }),
@@ -144,6 +154,7 @@ export async function runView(root: HTMLElement, state: HashState): Promise<View
     if (!isReference) {
       const pips = pipsRow({
         value: await fetchRating(id),
+        readOnly: !HAS_DEV_SINK,
         onSet: (value) => {
           void saveRating(id, value)
             .then(() => overlay.toast(value === null ? 'rating cleared' : `rated ${value}/5`))
@@ -157,7 +168,7 @@ export async function runView(root: HTMLElement, state: HashState): Promise<View
     app.start()
     return { dispose }
   } catch (err) {
-    overlay.fatal(`Failed to start "${id}"`, err instanceof Error ? (err.stack ?? err.message) : String(err))
+    overlay.fatal(`Failed to start "${id}"`, fatalDetail(err))
     return { dispose }
   }
 }

@@ -10,6 +10,7 @@ import type { VramScope } from '../gpu/resources.ts'
 import type { ScopedTimer } from '../gpu/timing.ts'
 import type { ShaderRegistry } from '../gpu/shaders.ts'
 import type { MeshCatalog } from '../mesh/catalog.ts'
+import { assetUrl } from '../util/paths.ts'
 import type { ParamSchema, ParamValues } from './params.ts'
 
 /** Bump ONLY on breaking changes to the experiment contract. */
@@ -138,7 +139,7 @@ export async function discoverExperiments(): Promise<RegistryEntry[]> {
     if (id.startsWith('_')) continue
     // Conventional URL, not a glob import — the dev server serves it directly,
     // so fresh captures appear without rebundling (cards fall back on 404).
-    const entry: RegistryEntry = { id, manifest: null, thumbnailUrl: `/experiments/${id}/thumbnail.png` }
+    const entry: RegistryEntry = { id, manifest: null, thumbnailUrl: assetUrl(`/experiments/${id}/thumbnail.png`) }
     entries.push(entry)
     try {
       const mod = (await loader()) as { default?: ExperimentManifest }

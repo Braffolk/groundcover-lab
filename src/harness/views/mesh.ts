@@ -1,11 +1,11 @@
 import meshShader from './mesh-view.wgsl'
 import { createGpu, configureCanvas } from '../../gpu/context.ts'
 import { ShaderRegistry } from '../../gpu/shaders.ts'
-import { meshCatalog } from '../../mesh/catalog.ts'
+import { meshCatalog, MESH_NOT_DEPLOYED } from '../../mesh/catalog.ts'
 import { CameraController, poseMatrices } from '../../scene/camera.ts'
 import type { HashState } from '../../url/state.ts'
 import { Overlay } from '../../ui/overlay.ts'
-import { button, el, topbar, type View } from './shared.ts'
+import { button, el, fatalDetail, topbar, type View } from './shared.ts'
 
 /**
  * #/mesh/<id> — brute-force render of a raw GCMESH1 source mesh. Tooling
@@ -48,6 +48,23 @@ export async function meshView(root: HTMLElement, state: HashState): Promise<Vie
     viewer.appendChild(canvas)
     content.appendChild(viewer)
     page.appendChild(content)
+
+    // Static deployments ship the manifests but usually not the ~357MB of raw
+    // binaries: say so plainly instead of hanging on a fetch or feeding an
+    // SPA-fallback index.html to the GCMESH1 parser.
+    if (!info.available) {
+      canvas.remove()
+      const note = el('div', 'hud')
+      note.style.cssText = 'position:static;margin:24px;max-width:64ch;white-space:pre-wrap;line-height:1.5'
+      note.textContent =
+        `${MESH_NOT_DEPLOYED}.\n\n` +
+        `mesh/raw/${id}/ ships only manifest.json here — the ${(info.bytes / 1e6).toFixed(0)}MB GCMESH1 binary is ` +
+        `left out to keep the upload small.\n\n` +
+        `Rebuild with GC_DEPLOY_MESHES=1 (or run the lab locally with npm run dev) to inspect it. ` +
+        `Experiments still render: their baked artifacts are deployed.`
+      viewer.appendChild(note)
+      return { dispose }
+    }
 
     const loading = el('div', 'hud', `fetching ${(info.bytes / 1e6).toFixed(0)}MB…`)
     viewer.appendChild(loading)
@@ -219,7 +236,7 @@ export async function meshView(root: HTMLElement, state: HashState): Promise<Vie
       },
     }
   } catch (err) {
-    overlay.fatal(`Mesh inspector failed for "${id}"`, err instanceof Error ? (err.stack ?? err.message) : String(err))
+    overlay.fatal(`Mesh inspector failed for "${id}"`, fatalDetail(err))
     return { dispose }
   }
 }
