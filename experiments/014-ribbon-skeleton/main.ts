@@ -14,9 +14,11 @@ import {
   SCATTER_CELL_SIZE,
   SCATTER_MAX_DENSITY,
   speciesById,
+  standEntrySlots,
   type Experiment,
   type ExperimentContext,
   type FrameInfo,
+  type StandSpecies,
   type ViewTargets,
 } from '@harness'
 import type { PARAMS } from './manifest.ts'
@@ -46,35 +48,90 @@ import type { PARAMS } from './manifest.ts'
 const CELL = SCATTER_CELL_SIZE
 /** Keep equal to the manifest's regionRadius max. */
 const REGION_MAX = 128
-const FLOATS_PER_INSTANCE = 8
-/** ribbons drawn, samples drawn, atlas level, parent level (unused when equal). */
-const LOD_BUCKETS = [
-  { ribbons: 32, samples: 12, level: 0, parent: 1 },
-  { ribbons: 16, samples: 8, level: 1, parent: 2 },
-  { ribbons: 8, samples: 6, level: 2, parent: 3 },
-  { ribbons: 4, samples: 4, level: 3, parent: 3 },
-  { ribbons: 4, samples: 2, level: 3, parent: 3 },
-] as const
+const BUCKETS = 5
+
+interface LodBucket {
+  /** Ribbons drawn. */
+  ribbons: number
+  /** Samples drawn along each ribbon. */
+  samples: number
+  /** Atlas level supplying the rows. */
+  level: number
+  /** Level the ribbons morph into as the plant shrinks (`morph` only). */
+  parent: number
+  /** Whether this bucket morphs at all — false where `parent` == `level`. */
+  morph: boolean
+}
+
+/** Tufts: wedges halve with distance and each pair converges on its parent. */
+const UPRIGHT_BUCKETS: readonly LodBucket[] = [
+  { ribbons: 32, samples: 12, level: 0, parent: 1, morph: true },
+  { ribbons: 16, samples: 8, level: 1, parent: 2, morph: true },
+  { ribbons: 8, samples: 6, level: 2, parent: 3, morph: true },
+  { ribbons: 4, samples: 4, level: 3, parent: 3, morph: false },
+  { ribbons: 4, samples: 2, level: 3, parent: 3, morph: false },
+]
+/**
+ * Mats: a fan of N wedges covers the tile SQUARE, and the coarser the fan the
+ * more it has to overshoot into its neighbours to stay closed (a 4-wedge fan
+ * cannot tile a square at all). So a carpet keeps 16 wedges out to mid range and
+ * never drops below 8, spending its LOD on radial samples instead. Buckets that
+ * only drop samples keep the same level and do not morph.
+ */
+const MAT_BUCKETS: readonly LodBucket[] = [
+  { ribbons: 32, samples: 12, level: 0, parent: 1, morph: true },
+  { ribbons: 16, samples: 8, level: 1, parent: 1, morph: false },
+  { ribbons: 16, samples: 5, level: 1, parent: 2, morph: true },
+  { ribbons: 8, samples: 4, level: 2, parent: 2, morph: false },
+  { ribbons: 8, samples: 2, level: 2, parent: 2, morph: false },
+]
 /** Projected plant extent (px) at which each bucket takes over, before `detail`. */
 const PX_THRESHOLDS = [150, 70, 32, 20]
 /** Ribbons morph into their parent over [threshold, threshold*SPAN] px. */
 const MORPH_SPAN = 1.8
 /** Share of an entry's instance budget per bucket (near .. far). */
 const CAP_FRACTION = [0.03, 0.07, 0.16, 0.24, 0.5]
+/**
+ * A carpet's tiles are life size (0.18 m), so essentially all of them land in
+ * the farthest bucket: the tuft split would overflow it and drop tiles, which
+ * looks exactly like a placement bug. The near buckets still get several times
+ * their average-density share, because `entryPerM2` divides the grid by the
+ * entry's wetness share while the wetness field is 12 m noise — a camera sitting
+ * inside one zone sees the FULL grid density for a few metres around it.
+ */
+const MAT_CAP_FRACTION = [0.012, 0.03, 0.06, 0.1, 0.9]
 /** Fraction of the visible region disc assumed on screen at once. */
 const VISIBLE_FRACTION = 0.45
 const SHOW_MODES = ['off', 'lod', 'ribbon', 'variant', 'fluff']
+
+/** Plants per m² this entry can produce — a carpet's grid, not its density. */
+function entryPerM2(entry: StandSpecies): number {
+  if (entry.carpetDiv && entry.carpetDiv > 0) {
+    // Carpet entries partition the wetness axis, so an entry only claims about
+    // `wetWidth` of its grid nodes.
+    const share = entry.wetWidth && entry.wetWidth > 0 ? Math.min(1, entry.wetWidth) : 1
+    return (standEntrySlots(entry) / (CELL * CELL)) * share
+  }
+  return Math.min(entry.density, SCATTER_MAX_DENSITY)
+}
 
 interface SpeciesGpu {
   geomTex: GPUTexture
   shadeTex: GPUTexture
   radiusFrac: number
+  /** Radial-fan cushion atlas rather than a tuft of blades (see bake.ts). */
+  mat: boolean
 }
 
 interface EntryGpu {
   entryIndex: number
   speciesId: string
   gpu: SpeciesGpu
+  /** Scatter slots per cell for THIS entry — carpetDiv², not the 128 budget. */
+  slots: number
+  buckets: readonly LodBucket[]
+  /** Index into `patterns` per bucket. */
+  bucketPatterns: number[]
   /** vec4-unit base offset and instance capacity of each LOD bucket. */
   bases: number[]
   caps: number[]
@@ -97,31 +154,32 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
     speciesGpu.set(entry.species, uploadAtlas(ctx, entry.species, atlas))
   }
 
-  // --- shared index buffer: one strip pattern per LOD bucket ---------------
-  const bucketFirstIndex: number[] = []
-  const bucketIndexCount: number[] = []
-  let totalIndices = 0
-  for (const b of LOD_BUCKETS) {
-    bucketFirstIndex.push(totalIndices)
-    const count = b.ribbons * (b.samples - 1) * 6
-    bucketIndexCount.push(count)
-    totalIndices += count
+  // --- shared index buffer: one strip pattern per distinct (ribbons, samples)
+  // combination used by either bucket table -------------------------------
+  const patterns: { ribbons: number; samples: number; first: number; count: number }[] = []
+  const patternOf = (b: LodBucket): number => {
+    const found = patterns.findIndex((p) => p.ribbons === b.ribbons && p.samples === b.samples)
+    if (found >= 0) return found
+    const first = patterns.length === 0 ? 0 : patterns[patterns.length - 1]!.first + patterns[patterns.length - 1]!.count
+    patterns.push({ ribbons: b.ribbons, samples: b.samples, first, count: b.ribbons * (b.samples - 1) * 6 })
+    return patterns.length - 1
   }
+  const uprightPatterns = UPRIGHT_BUCKETS.map(patternOf)
+  const matPatterns = MAT_BUCKETS.map(patternOf)
+  const totalIndices = patterns[patterns.length - 1]!.first + patterns[patterns.length - 1]!.count
   const indexData = new Uint16Array(totalIndices)
-  {
-    let w = 0
-    for (const b of LOD_BUCKETS) {
-      const stride = 2 * b.samples
-      for (let r = 0; r < b.ribbons; r++) {
-        for (let q = 0; q < b.samples - 1; q++) {
-          const a = r * stride + q * 2
-          indexData[w++] = a
-          indexData[w++] = a + 1
-          indexData[w++] = a + 2
-          indexData[w++] = a + 1
-          indexData[w++] = a + 3
-          indexData[w++] = a + 2
-        }
+  for (const p of patterns) {
+    let w = p.first
+    const stride = 2 * p.samples
+    for (let r = 0; r < p.ribbons; r++) {
+      for (let q = 0; q < p.samples - 1; q++) {
+        const a = r * stride + q * 2
+        indexData[w++] = a
+        indexData[w++] = a + 1
+        indexData[w++] = a + 2
+        indexData[w++] = a + 1
+        indexData[w++] = a + 3
+        indexData[w++] = a + 2
       }
     }
   }
@@ -196,14 +254,20 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
   // --- per stand entry state ------------------------------------------------
   const entries: EntryGpu[] = ctx.stand.species.map((standEntry, entryIndex) => {
     const gpu = speciesGpu.get(standEntry.species)!
-    const density = Math.min(standEntry.density, SCATTER_MAX_DENSITY)
-    const budget = Math.ceil(Math.PI * REGION_MAX * REGION_MAX * density * VISIBLE_FRACTION)
+    // A carpet has carpetDiv² slots per cell (484 for the bog moss, over the
+    // 128 scatter budget), and the mat atlas wants the mat bucket table.
+    const slots = standEntrySlots(standEntry)
+    const isMat = gpu.mat
+    const buckets = isMat ? MAT_BUCKETS : UPRIGHT_BUCKETS
+    const bucketPatterns = isMat ? matPatterns : uprightPatterns
+    const fraction = isMat ? MAT_CAP_FRACTION : CAP_FRACTION
+    const budget = Math.ceil(Math.PI * REGION_MAX * REGION_MAX * entryPerM2(standEntry) * VISIBLE_FRACTION)
     const caps: number[] = []
     const bases: number[] = []
     let cursor = 0
-    for (let b = 0; b < LOD_BUCKETS.length; b++) {
+    for (let b = 0; b < BUCKETS; b++) {
       // Multiples of 8 instances keep every region's byte offset 256-aligned.
-      const cap = Math.max(8, Math.ceil((budget * CAP_FRACTION[b]!) / 8) * 8)
+      const cap = Math.max(8, Math.ceil((budget * fraction[b]!) / 8) * 8)
       caps.push(cap)
       bases.push(cursor)
       cursor += cap * 2
@@ -219,7 +283,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
     const drawArgs = ctx.res.createBuffer(
       {
         label: `${ctx.id}/draw-args-${entryIndex}`,
-        size: LOD_BUCKETS.length * 20,
+        size: BUCKETS * 20,
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.INDIRECT | GPUBufferUsage.COPY_DST,
       },
       { species: standEntry.species, tag: 'indirect-args' },
@@ -235,7 +299,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
     const lodInfo = ctx.res.createBuffer(
       {
         label: `${ctx.id}/lod-info-${entryIndex}`,
-        size: LOD_BUCKETS.length * 256,
+        size: BUCKETS * 256,
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       },
       { species: standEntry.species, tag: 'uniform' },
@@ -250,7 +314,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         { binding: 3, resource: { buffer: drawArgs } },
       ],
     })
-    const drawBinds = LOD_BUCKETS.map((_, b) =>
+    const drawBinds = buckets.map((_, b) =>
       device.createBindGroup({
         label: `${ctx.id}/draw-bg-${entryIndex}-${b}`,
         layout: drawBgl,
@@ -266,6 +330,9 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       entryIndex,
       speciesId: standEntry.species,
       gpu,
+      slots,
+      buckets,
+      bucketPatterns,
       bases,
       caps,
       instances,
@@ -324,42 +391,40 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
   )
   const cellData = new Float32Array(32)
   const expandData = new Float32Array(32)
-  const lodData = new Float32Array(LOD_BUCKETS.length * 64)
-  const argsReset = new Uint32Array(LOD_BUCKETS.length * 5)
-  LOD_BUCKETS.forEach((_, b) => {
-    argsReset[b * 5] = bucketIndexCount[b]!
-    argsReset[b * 5 + 1] = 0
-    argsReset[b * 5 + 2] = bucketFirstIndex[b]!
-    argsReset[b * 5 + 3] = 0
-    argsReset[b * 5 + 4] = 0
-  })
+  const lodData = new Float32Array(BUCKETS * 64)
+  /** Per entry: drawIndexedIndirect args with this entry's strip patterns. */
+  const argsReset = new Map<number, Uint32Array<ArrayBuffer>>()
+  for (const entry of entries) {
+    const args = new Uint32Array(BUCKETS * 5)
+    entry.bucketPatterns.forEach((p, b) => {
+      args[b * 5] = patterns[p]!.count
+      args[b * 5 + 2] = patterns[p]!.first
+    })
+    argsReset.set(entry.entryIndex, args)
+  }
   const cellArgsReset = new Uint32Array([0, 1, 1, 0])
   let cellCount = 0
   let lodDirty = true
 
   const writeLodInfo = (): void => {
     const showMode = Math.max(0, SHOW_MODES.indexOf(ctx.params.show))
-    LOD_BUCKETS.forEach((b, i) => {
-      const o = i * 64
-      lodData[o] = b.ribbons
-      lodData[o + 1] = b.samples
-      lodData[o + 2] = LEVEL_BASE[b.level]!
-      lodData[o + 3] = LEVEL_BASE[b.parent]!
-      lodData[o + 4] = ROWS_PER_VARIANT
-      lodData[o + 5] = SAMPLES
-      // cfg.z (capacity) is per entry — patched below.
-      lodData[o + 7] = ctx.params.widthScale
-      lodData[o + 8] = ctx.params.bladeCurl
-      lodData[o + 9] = ctx.params.flutter
-      lodData[o + 10] = showMode
-      // look.w (entry index) is per entry — patched below.
-      lodData[o + 12] = i
-      lodData[o + 13] = ctx.params.canopyLift
-    })
     for (const entry of entries) {
-      LOD_BUCKETS.forEach((_, i) => {
-        lodData[i * 64 + 6] = entry.caps[i]!
-        lodData[i * 64 + 11] = entry.entryIndex
+      entry.buckets.forEach((b, i) => {
+        const o = i * 64
+        lodData[o] = b.ribbons
+        lodData[o + 1] = b.samples
+        lodData[o + 2] = LEVEL_BASE[b.level]!
+        lodData[o + 3] = LEVEL_BASE[b.parent]!
+        lodData[o + 4] = ROWS_PER_VARIANT
+        lodData[o + 5] = SAMPLES
+        lodData[o + 6] = entry.caps[i]!
+        lodData[o + 7] = ctx.params.widthScale
+        lodData[o + 8] = ctx.params.bladeCurl
+        lodData[o + 9] = ctx.params.flutter
+        lodData[o + 10] = showMode
+        lodData[o + 11] = entry.entryIndex
+        lodData[o + 12] = i
+        lodData[o + 13] = ctx.params.canopyLift
       })
       device.queue.writeBuffer(entry.lodInfo, 0, lodData)
     }
@@ -412,8 +477,14 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         expandData[19] = VARIANTS
         for (let i = 0; i < 4; i++) expandData[20 + i] = entry.bases[i]!
         expandData[24] = entry.bases[4]!
+        // Slots to EVALUATE per cell (carpetDiv² for a carpet — every slot must
+        // be visited even though capacity only holds the expected survivors).
+        expandData[28] = entry.slots
+        // Morph gate: a bucket whose parent level equals its own must not morph
+        // (its "parent row" would be a sibling ribbon, not a coarser one).
+        for (let i = 0; i < 3; i++) expandData[29 + i] = entry.buckets[i]!.morph ? 1 : 0
         device.queue.writeBuffer(entry.expandInfo, 0, expandData)
-        device.queue.writeBuffer(entry.drawArgs, 0, argsReset)
+        device.queue.writeBuffer(entry.drawArgs, 0, argsReset.get(entry.entryIndex)!)
       }
 
       if (lodDirty) {
@@ -449,7 +520,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       pass.setBindGroup(0, ctx.frame.bindGroup)
       pass.setIndexBuffer(indexBuffer, 'uint16')
       for (const entry of entries) {
-        for (let b = 0; b < LOD_BUCKETS.length; b++) {
+        for (let b = 0; b < BUCKETS; b++) {
           pass.setBindGroup(1, entry.drawBinds[b]!)
           pass.drawIndexedIndirect(entry.drawArgs, b * 20)
         }
@@ -498,6 +569,7 @@ function uploadAtlas(
     geomTex: mk('geom', atlas.geom),
     shadeTex: mk('shade', atlas.shade),
     radiusFrac: atlas.radiusFrac,
+    mat: atlas.mat,
   }
 }
 

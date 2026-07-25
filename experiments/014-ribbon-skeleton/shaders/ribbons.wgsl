@@ -2,6 +2,7 @@
 #include "src/wgsl/wind.wgsl"
 #include "src/wgsl/lighting.wgsl"
 #include "src/wgsl/hash.wgsl"
+#include "src/wgsl/terrain.wgsl"
 #include "src/wgsl/debug.wgsl"
 
 // Ribbon unroll. Each instance is one plant; each ribbon is a triangle strip
@@ -14,6 +15,15 @@
 // Continuous LOD: a ribbon is morphed toward its parent ribbon at the next
 // coarser level; the morph reaches 1 exactly where the next bucket takes over
 // with half as many (now coincident) ribbons. Width, not alpha, is the fade.
+//
+// CARPET entries (stand_table[i].carpet_div > 0) take a second path through the
+// same unroll: their atlas rows are a radial fan of the tile square carrying the
+// cushion's surface relief, so the ribbon frame is a real surface frame (radial
+// slope x azimuthal slope from the neighbouring wedges) instead of a blade frame
+// with a curl, and every vertex is conformed to the terrain by a vertical shear.
+// A shear is the only rung of the fitting ladder that keeps a TILED species
+// seamless: the footprint stays exactly on its grid step, and neighbouring tiles
+// evaluate the same ground height at a shared edge, so nothing cracks.
 
 struct LodInfo {
   // x: ribbons drawn, y: samples drawn, z: atlas row base of this level,
@@ -85,6 +95,8 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
 
   let entry = stand_table[u32(lod_info.look.w)];
   let plant_h = entry.height_scale * d1.x;
+  // A tiled mat, not a tuft: surface frame, terrain shear, no fade, no jitter.
+  let is_carpet = entry.carpet_div > 0.0;
 
   let ribbon = vi / (2u * drawn);
   let rest = vi % (2u * drawn);
@@ -104,6 +116,9 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
   var sh = textureLoad(atlas_shade, vec2u(s_at, row_a), 0);
   var ao = clamp(sh.w - 2.0 * floor(sh.w * 0.5), 0.0, 1.0);
   var fluff = floor(sh.w * 0.5) / 7.0;
+  // Pre-morph height: the carpet's azimuthal slope is taken from this level's
+  // rows on both sides of an edge, so it stays continuous mid-morph.
+  let y_level = g.y;
   var albedo = sh.rgb;
 
   if (morph > 0.0) {
@@ -153,23 +168,53 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
   let d_xz = rot2(d_local.xz, cy, sy) * plant_h;
   // Wind is a function of height, so its contribution to the tangent is exact.
   var tangent = vec3f(d_xz.x, d_local.y * plant_h, d_xz.y) + sway * (2.0 * hf * d_local.y);
-  let t_len = length(tangent);
-  let tan_n = select(vec3f(0.0, 1.0, 0.0), tangent / t_len, t_len > 1.0e-7);
+  var nrm: vec3f;
+  if (is_carpet) {
+    // Real surface frame: the radial tangent above, crossed with the azimuthal
+    // tangent taken from the NEIGHBOUR THIS EDGE FACES. A centred difference
+    // would be constant across a wedge and shade the tile as a 32-spoke star;
+    // the one-sided difference is shared by the two wedges meeting at an edge,
+    // so the normal is continuous around the fan and interpolates across it.
+    // Clamping the azimuthal slope to 45 degrees keeps the fan apex (where the
+    // arc length goes to zero) from producing a horizontal normal.
+    let neighbour = select((ribbon + ribbons - 1u) % ribbons, (ribbon + 1u) % ribbons, side > 0.0);
+    let row_base = u32(variant) * rows_per_variant + u32(lod_info.counts.z);
+    let y_side = textureLoad(atlas_geom, vec2u(s_at, row_base + neighbour), 0).y;
+    let d_theta = 6.2831853 / max(f32(ribbons), 1.0);
+    let arc_len = max(d_theta * sqrt(max(r2, 0.0)) * plant_h, 1.0e-5);
+    let dy_theta = clamp((y_side - y_level) * side * plant_h, -arc_len, arc_len);
+    nrm = normalize(cross(lat3 * arc_len + vec3f(0.0, dy_theta, 0.0), tangent));
+  } else {
+    let t_len = length(tangent);
+    let tan_n = select(vec3f(0.0, 1.0, 0.0), tangent / t_len, t_len > 1.0e-7);
+    let flat_c = cross(tan_n, lat3);
+    let flat_len = length(flat_c);
+    let flat_n = select(vec3f(0.0, 1.0, 0.0), flat_c / flat_len, flat_len > 1.0e-5);
+    // Blades are channelled, not flat: rotate the normal across the width.
+    let curl = lod_info.look.x * (1.0 - 0.65 * fluff);
+    nrm = flat_n * cos(curl * side) + lat3 * sin(curl * side);
+    // Fluff (panicles) shade as a soft volume, not as a plastic strip.
+    nrm = normalize(mix(nrm, normalize(flat_n * 0.5 + vec3f(0.0, 1.0, 0.0)), fluff * 0.6));
+  }
 
-  let flat_c = cross(tan_n, lat3);
-  let flat_len = length(flat_c);
-  let flat_n = select(vec3f(0.0, 1.0, 0.0), flat_c / flat_len, flat_len > 1.0e-5);
-
-  // Blades are channelled, not flat: rotate the normal across the width.
-  let curl = lod_info.look.x * (1.0 - 0.65 * fluff);
-  var nrm = flat_n * cos(curl * side) + lat3 * sin(curl * side);
-  // Fluff (panicles) shade as a soft volume, not as a plastic strip.
-  nrm = normalize(mix(nrm, normalize(flat_n * 0.5 + vec3f(0.0, 1.0, 0.0)), fluff * 0.6));
+  // --- terrain conforming (carpets) ----------------------------------------
+  // The scatter only gives a position and a yaw, so a mat would otherwise sit
+  // bolt upright on its centre sample and bury one edge on any slope. One
+  // terrain_sample per vertex gives the height AND the (nx, nz) needed to shear
+  // the normal with it, for the price of a single bilinear fetch.
+  if (is_carpet) {
+    let ground = terrain_sample(world.xz);
+    world.y = ground.x + (world.y - base.y);
+    let ny = sqrt(max(1.0 - ground.y * ground.y - ground.z * ground.z, 1.0e-4));
+    nrm = normalize(vec3f(nrm.x + nrm.y * ground.y / ny, nrm.y, nrm.z + nrm.y * ground.z / ny));
+  }
 
   // --- per-plant colour variation ------------------------------------------
+  // A carpet gets only a whisper of it: at 0.18 m spacing, per-tile brightness
+  // jitter reads as a checkerboard rather than as natural mottling.
   let ph = hash3(bitcast<u32>(base.x * 91.7), bitcast<u32>(base.z * 91.7), u32(lod_info.look.w));
-  let jitter = 0.86 + 0.28 * hash_f32(ph);
-  albedo *= jitter;
+  let jitter_amp = select(0.28, 0.10, is_carpet);
+  albedo *= 1.0 - jitter_amp * 0.5 + jitter_amp * hash_f32(ph);
 
   let show = u32(lod_info.look.z + 0.5);
   if (show == 1u) {
@@ -193,8 +238,21 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
 @fragment
 fn fs_main(in: VOut, @builtin(front_facing) front: bool) -> @location(0) vec4f {
   // Ribbons are two-sided surfaces: shade whichever face the eye sees.
+  //
+  // For a CARPET the flip is against the VIEW VECTOR, not against
+  // @builtin(front_facing). The strip winding is fixed in parameter space, and
+  // for a fan whose centreline runs outward rather than upward the winding-based
+  // flip hands back the normal of the face you CANNOT see: every Sphagnum tile
+  // was lit from underneath and the whole mat rendered black. The view flip is
+  // winding-independent and cannot get this wrong.
+  //
+  // The tuft path deliberately keeps the winding flip: switching it there is a
+  // visible (and, against 000-ground-truth, better-looking) change to the
+  // default stand's grass, which is out of scope here — see NOTES.md.
+  let is_carpet = stand_table[u32(lod_info.look.w)].carpet_div > 0.0;
   var n = normalize(in.nrm);
-  if (!front) {
+  let away = select(!front, dot(n, frame.camera_pos - in.world) < 0.0, is_carpet);
+  if (away) {
     n = -n;
   }
   // Canopy lift: bias the visible face toward the canopy normal — the standard

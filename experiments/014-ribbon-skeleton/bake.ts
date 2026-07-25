@@ -79,6 +79,40 @@ const FLUFF_CAP = 0.62
 const FLUFF_LO = 12
 const FLUFF_HI = 45
 
+// --- mat mode (Sphagnum-like cushions) --------------------------------------
+/** Bumped independently of ATLAS_VERSION: only mat species re-bake. */
+const MAT_VERSION = 3
+/** Height/colour field resolution over the tile square (3.75 mm at 0.18 m). */
+const MAT_GRID = 48
+/** Blend of cell-mean toward cell-top height: what the eye sees is the top. */
+const MAT_TOP_MIX = 0.72
+/**
+ * How far the rim sample is pulled toward the tile-boundary mean height. The
+ * mesh's height field is periodic, so same-variant/same-yaw neighbours already
+ * agree at a seam — but 90-degree turns and different variants do not, and a
+ * 3 cm step repeating on a 0.18 m lattice reads as a grid. Tapering only the
+ * outer samples toward one shared height removes the step and keeps the
+ * interior relief.
+ */
+const MAT_RIM_TAPER = 0.5
+/** Darkest ambient occlusion in a cushion hollow. */
+const MAT_AO_FLOOR = 0.4
+/**
+ * Relief gain around the tile's mean surface height. The mesh's capitulum apexes
+ * span 33 mm, but a per-cell canopy envelope filtered to the fan's own sample
+ * spacing (~9 mm) only preserves ~9 mm of that — leaves fill the gaps between
+ * capitula, so the envelope is much smoother than the apex distribution. This
+ * puts some of it back rather than pretending a cushion is nearly flat.
+ */
+const MAT_RELIEF_GAIN = 1.8
+/**
+ * Angular offset of the fan per variant. Without it every tile's wedges point
+ * the same four ways (90-degree yaws only), and the field reads as a lattice of
+ * identical flowers; a per-variant twist decorrelates neighbours. Wedges may
+ * then straddle a tile corner, which only costs a little extra overlap.
+ */
+const MAT_VARIANT_TWIST = Math.PI / 2 / VARIANTS
+
 export interface RibbonAtlas {
   /** rgba per (row, sample): centreline xyz + half-width, in nominal heights. */
   geom: Float32Array
@@ -88,6 +122,13 @@ export interface RibbonAtlas {
   radiusFrac: number
   /** Nominal foliage height of the distilled tuft, metres (informational). */
   heightM: number
+  /**
+   * MAT mode: the ribbons are a radial fan of the periodic tile SQUARE carrying
+   * the cushion's surface relief, not a tuft of blades. Set for species whose
+   * tile is far wider than the plant is tall (Sphagnum); the renderer draws
+   * these with the terrain-conforming, surface-normal path.
+   */
+  mat: boolean
 }
 
 type BakeCtx = Pick<ExperimentContext<typeof PARAMS>, 'id' | 'meshes'>
@@ -96,7 +137,7 @@ type BakeCtx = Pick<ExperimentContext<typeof PARAMS>, 'id' | 'meshes'>
 // artifact io
 // ---------------------------------------------------------------------------
 
-export function unpackAtlas(buf: ArrayBuffer): RibbonAtlas | null {
+export function unpackAtlas(buf: ArrayBuffer, mat: boolean): RibbonAtlas | null {
   if (buf.byteLength < HEADER_BYTES) return null
   const u = new Uint32Array(buf, 0, 16)
   const f = new Float32Array(buf, 0, 16)
@@ -110,6 +151,7 @@ export function unpackAtlas(buf: ArrayBuffer): RibbonAtlas | null {
     shade: new Float32Array(buf, HEADER_BYTES + floats * 4, floats),
     radiusFrac: f[6]!,
     heightM: f[7]!,
+    mat,
   }
 }
 
@@ -141,23 +183,37 @@ function packAtlas(a: RibbonAtlas): ArrayBuffer {
  * server answers a missing /mesh/baked file with index.html at status 200,
  * which would otherwise poison the caches.
  */
+/**
+ * A MAT species: a periodic community tile far wider than the plant is tall
+ * (Sphagnum palustre: 0.18 m tile, 0.07-0.09 m tall). Such a species is not a
+ * tuft of blades radiating from a centre — it is a closed cushion surface, and
+ * gets the radial-fan distiller instead. Decided from the catalog so the bake
+ * key is known before the (479 MB) mesh is fetched.
+ */
+export function isMatSpecies(speciesId: string): boolean {
+  const sp = speciesById(speciesId)
+  return sp.tileM !== undefined && sp.heightScale < 0.8 * sp.tileM
+}
+
 export async function loadRibbonAtlas(ctx: BakeCtx, speciesId: string): Promise<RibbonAtlas> {
-  const key = `ribbons-v${ATLAS_VERSION}-s${SECTORS}-k${SAMPLES}-va${VARIANTS}-${speciesId}`
+  const mat = isMatSpecies(speciesId)
+  const kind = mat ? `mat${MAT_VERSION}` : `v${ATLAS_VERSION}`
+  const key = `ribbons-${kind}-s${SECTORS}-k${SAMPLES}-va${VARIANTS}-${speciesId}`
   let freshlyBaked = false
   const runBake = async (): Promise<ArrayBuffer> => {
     freshlyBaked = true
     const mesh = await ctx.meshes.load(speciesById(speciesId).meshId)
     const t0 = performance.now()
-    const atlas = distill(mesh)
+    const atlas = mat ? distillMat(mesh, speciesById(speciesId).heightScale) : distill(mesh)
     console.info(`[${ctx.id}] distilled ${speciesId} in ${Math.round(performance.now() - t0)}ms`)
     return packAtlas(atlas)
   }
 
   let buf = await bakedArtifact({ expId: ctx.id, key }, runBake)
-  let atlas = unpackAtlas(buf)
+  let atlas = unpackAtlas(buf, mat)
   if (!atlas) {
     buf = await runBake()
-    atlas = unpackAtlas(buf)
+    atlas = unpackAtlas(buf, mat)
     if (!atlas) throw new Error(`[${ctx.id}] ${speciesId}: distiller produced an invalid artifact`)
   }
   if (freshlyBaked) {
@@ -511,7 +567,325 @@ export function distill(mesh: GcMesh): RibbonAtlas {
     }
   }
 
-  return { geom, shade, radiusFrac: Math.max(radiusFrac, 0.05), heightM }
+  return { geom, shade, radiusFrac: Math.max(radiusFrac, 0.05), heightM, mat: false }
+}
+
+// ---------------------------------------------------------------------------
+// mat distillation — a periodic cushion tile, not a tuft
+// ---------------------------------------------------------------------------
+
+/** Accumulator fields per grid cell of the mat's height/colour field. */
+const MF = 7
+const M_AREA = 0
+const M_AY = 1 // area * height
+const M_TOP = 2 // max triangle-top height in the cell
+const M_CW = 3 // colour weight (area * height^2)
+const M_CR = 4
+const M_CG = 5
+const M_CB = 6
+
+/**
+ * Distil a Sphagnum-like community tile into a RADIAL FAN OF THE TILE SQUARE.
+ *
+ * A cushion is not a tuft: its foliage is spread over the whole tile at roughly
+ * uniform density, so the tuft distiller's per-wedge centroid curve collapses to
+ * a ring of near-vertical pickets at ~0.68 of the gather radius — a ring fence,
+ * covering a thin annulus and shading with horizontal normals. Here each ribbon
+ * is instead a strip running OUTWARD from the tile centre to the tile boundary,
+ * carrying the cushion's surface height and top-weighted colour along it:
+ *
+ * - the mesh is swept into a periodic MAT_GRID x MAT_GRID height/colour field
+ *   over the tile square (the fold is the tile's own periodicity, so this is the
+ *   real field, not an approximation);
+ * - ribbon `i` of a level runs along the wedge mid-angle `(i+0.5)*arc`, with
+ *   half-width `r*tan(arc/2)`, so the wedges of one tile exactly abut along
+ *   their shared rays and the fan covers the disc-free SQUARE;
+ * - its outer radius reaches the tile boundary far enough that the whole square
+ *   is covered (`half*cos(arc/2)/cos(|off|+arc/2)`, `off` = angle from the
+ *   nearest tile side normal), so the mat is closed with no lattice of holes.
+ *   Levels 0-2 have their corners on wedge boundaries, so the overshoot into the
+ *   neighbour tile stays small; the 4-wedge level cannot tile a square at all
+ *   and simply reaches the corner.
+ * - sample height = per-cell mean blended toward the per-cell top over a
+ *   footprint-sized window, which is a natural mip: coarse levels read a wider
+ *   window and come out smoother instead of aliasing.
+ *
+ * Nothing is randomised and nothing is view-dependent; XZ is normalised by the
+ * species' nominal height so that `local * height_scale * carpet_scale` puts the
+ * tile exactly on its grid step.
+ */
+export function distillMat(mesh: GcMesh, heightScale: number): RibbonAtlas {
+  const h = mesh.header
+  const verts = mesh.vertices
+  const tris = mesh.triangles
+  const bx = h.boundsMin[0]
+  const by = h.boundsMin[1]
+  const bz = h.boundsMin[2]
+  const sx = (h.boundsMax[0] - bx) / 65535
+  const sy = (h.boundsMax[1] - by) / 65535
+  const sz = (h.boundsMax[2] - bz) / 65535
+  const tileX = h.tileSize[0]
+  const tileZ = h.tileSize[1]
+  if (!(tileX > 1e-4 && tileZ > 1e-4)) {
+    throw new Error('mat distillation needs a periodic tile (tileSize)')
+  }
+  const halfX = tileX * 0.5
+  const halfZ = tileZ * 0.5
+  const cell = tileX / MAT_GRID
+
+  // Variant frames: six different pieces of the periodic tile. NO rotation —
+  // the fan must stay aligned with the tile square or tiles stop abutting.
+  const cX = new Float64Array(VARIANTS)
+  const cZ = new Float64Array(VARIANTS)
+  for (let v = 0; v < VARIANTS; v++) {
+    cX[v] = h.tileOrigin[0] + (((v + 1) * R2A) % 1) * tileX
+    cZ[v] = h.tileOrigin[1] + (((v + 1) * R2B) % 1) * tileZ
+  }
+
+  // --- sweep the mesh into a periodic height/colour field per variant -------
+  const grid = new Float64Array(VARIANTS * MAT_GRID * MAT_GRID * MF)
+  const stride = pickStride(h.triangleCount)
+  for (let t = 0; t < h.triangleCount; t += stride) {
+    const o = t * 4
+    const a0 = tris[o]! * 8
+    const a1 = tris[o + 1]! * 8
+    const a2 = tris[o + 2]! * 8
+    const x0 = bx + verts[a0]! * sx
+    const y0 = by + verts[a0 + 1]! * sy
+    const z0 = bz + verts[a0 + 2]! * sz
+    const x1 = bx + verts[a1]! * sx
+    const y1 = by + verts[a1 + 1]! * sy
+    const z1 = bz + verts[a1 + 2]! * sz
+    const x2 = bx + verts[a2]! * sx
+    const y2 = by + verts[a2 + 1]! * sy
+    const z2 = bz + verts[a2 + 2]! * sz
+    const ex1 = x1 - x0
+    const ey1 = y1 - y0
+    const ez1 = z1 - z0
+    const ex2 = x2 - x0
+    const ey2 = y2 - y0
+    const ez2 = z2 - z0
+    const nx = ey1 * ez2 - ez1 * ey2
+    const ny = ez1 * ex2 - ex1 * ez2
+    const nz = ex1 * ey2 - ey1 * ex2
+    const nl = Math.sqrt(nx * nx + ny * ny + nz * nz)
+    if (nl < 1e-12) continue
+    const area = 0.5 * nl * stride
+    const px = (x0 + x1 + x2) / 3
+    const py = Math.max(0, (y0 + y1 + y2) / 3)
+    const pz = (z0 + z1 + z2) / 3
+    const top = Math.max(y0, Math.max(y1, y2))
+    const cr = (verts[a0 + 3]! + verts[a1 + 3]! + verts[a2 + 3]!) / 196605
+    const cg = (verts[a0 + 4]! + verts[a1 + 4]! + verts[a2 + 4]!) / 196605
+    const cb = (verts[a0 + 5]! + verts[a1 + 5]! + verts[a2 + 5]!) / 196605
+    // Colour weighted by height^2: what you see of a cushion is its top layer,
+    // and the interior of this mesh is authored much darker than the capitula.
+    const cw = area * py * py
+
+    for (let v = 0; v < VARIANTS; v++) {
+      let dx = px - cX[v]!
+      let dz = pz - cZ[v]!
+      dx -= Math.round(dx / tileX) * tileX
+      dz -= Math.round(dz / tileZ) * tileZ
+      let ix = Math.floor(((dx + halfX) / tileX) * MAT_GRID)
+      let iz = Math.floor(((dz + halfZ) / tileZ) * MAT_GRID)
+      ix = ix < 0 ? 0 : ix >= MAT_GRID ? MAT_GRID - 1 : ix
+      iz = iz < 0 ? 0 : iz >= MAT_GRID ? MAT_GRID - 1 : iz
+      const base = ((v * MAT_GRID + iz) * MAT_GRID + ix) * MF
+      grid[base + M_AREA]! += area
+      grid[base + M_AY]! += area * py
+      if (top > grid[base + M_TOP]!) grid[base + M_TOP] = top
+      grid[base + M_CW]! += cw
+      grid[base + M_CR]! += cw * cr
+      grid[base + M_CG]! += cw * cg
+      grid[base + M_CB]! += cw * cb
+    }
+  }
+
+  // --- global fallbacks (a cell with no foliage at all should not exist) ----
+  let gArea = 0
+  let gAY = 0
+  let gCW = 0
+  const gCol = [0, 0, 0]
+  let gTop = 0
+  for (let i = 0; i < VARIANTS * MAT_GRID * MAT_GRID; i++) {
+    const b = i * MF
+    gArea += grid[b + M_AREA]!
+    gAY += grid[b + M_AY]!
+    gCW += grid[b + M_CW]!
+    gCol[0]! += grid[b + M_CR]!
+    gCol[1]! += grid[b + M_CG]!
+    gCol[2]! += grid[b + M_CB]!
+    gTop = Math.max(gTop, grid[b + M_TOP]!)
+  }
+  if (gArea <= 0) throw new Error('mat distillation found no foliage')
+  const meanY = gAY / gArea
+  const meanCol = gCW > 0 ? [gCol[0]! / gCW, gCol[1]! / gCW, gCol[2]! / gCW] : [0.2, 0.35, 0.12]
+
+  /** Periodic box filter of the field over a window of half-width `hw` metres. */
+  const sampleField = (
+    v: number,
+    x: number,
+    z: number,
+    hw: number,
+  ): { y: number; top: number; col: [number, number, number] } => {
+    const i0 = Math.floor(((x - hw + halfX) / tileX) * MAT_GRID)
+    const i1 = Math.floor(((x + hw + halfX) / tileX) * MAT_GRID)
+    const j0 = Math.floor(((z - hw + halfZ) / tileZ) * MAT_GRID)
+    const j1 = Math.floor(((z + hw + halfZ) / tileZ) * MAT_GRID)
+    let area = 0
+    let ay = 0
+    let topSum = 0
+    let topCount = 0
+    let cw = 0
+    let cr = 0
+    let cg = 0
+    let cb = 0
+    for (let j = j0; j <= j1; j++) {
+      const iz = ((j % MAT_GRID) + MAT_GRID) % MAT_GRID
+      for (let i = i0; i <= i1; i++) {
+        const ix = ((i % MAT_GRID) + MAT_GRID) % MAT_GRID
+        const b = ((v * MAT_GRID + iz) * MAT_GRID + ix) * MF
+        const a = grid[b + M_AREA]!
+        area += a
+        ay += grid[b + M_AY]!
+        // Mean of local maxima, not the window max (stable as the window grows)
+        // and UNWEIGHTED by area: weighting by area lets the dense capitulum
+        // tops outvote the sparse hollows between them and flattens the relief.
+        if (a > 0) {
+          topSum += grid[b + M_TOP]!
+          topCount++
+        }
+        cw += grid[b + M_CW]!
+        cr += grid[b + M_CR]!
+        cg += grid[b + M_CG]!
+        cb += grid[b + M_CB]!
+      }
+    }
+    if (area <= 0 || topCount === 0) {
+      return { y: meanY, top: meanY, col: [meanCol[0]!, meanCol[1]!, meanCol[2]!] }
+    }
+    return {
+      y: ay / area,
+      top: topSum / topCount,
+      col: cw > 0 ? [cr / cw, cg / cw, cb / cw] : [meanCol[0]!, meanCol[1]!, meanCol[2]!],
+    }
+  }
+
+  // --- fit the fans ---------------------------------------------------------
+  const geom = new Float32Array(ATLAS_ROWS * SAMPLES * 4)
+  const shade = new Float32Array(ATLAS_ROWS * SAMPLES * 4)
+  const halfDiag = Math.hypot(halfX, halfZ)
+  const invH = 1 / Math.max(heightScale, 1e-4)
+  let radiusFrac = 0
+  let rimSum = 0
+  let rimCount = 0
+
+  for (let v = 0; v < VARIANTS; v++) {
+    for (let level = 0; level < LEVEL_RIBBONS.length; level++) {
+      const n = LEVEL_RIBBONS[level]!
+      const arc = TWO_PI / n
+      const halfArc = arc * 0.5
+      const tanHalf = Math.tan(halfArc)
+      for (let ribbon = 0; ribbon < n; ribbon++) {
+        const theta = (ribbon + 0.5) * arc + v * MAT_VARIANT_TWIST
+        const dirX = Math.cos(theta)
+        const dirZ = Math.sin(theta)
+        // Angle from the nearest tile side normal.
+        const off = Math.abs(theta - Math.round(theta / (Math.PI * 0.5)) * (Math.PI * 0.5))
+        // Reach the far corner of this wedge's slice of the tile square. The
+        // 4-wedge level straddles a corner and cannot tile a square at all;
+        // it just reaches the corner and overlaps its neighbours.
+        const rMax =
+          off + halfArc >= Math.PI * 0.5 - 1e-3
+            ? halfDiag * 1.02
+            : Math.min(halfDiag * 1.02, (halfX * Math.cos(halfArc)) / Math.cos(off + halfArc))
+        const dr = rMax / (SAMPLES - 1)
+        const row = v * ROWS_PER_VARIANT + LEVEL_BASE[level]! + ribbon
+        for (let j = 0; j < SAMPLES; j++) {
+          const r = dr * j
+          const w = r * tanHalf
+          const hw = Math.max(0.5 * Math.max(dr, w), 0.6 * cell)
+          const s = sampleField(v, r * dirX, r * dirZ, hw)
+          const o = (row * SAMPLES + j) * 4
+          geom[o] = r * dirX * invH
+          geom[o + 1] = (s.y + (s.top - s.y) * MAT_TOP_MIX) * invH
+          geom[o + 2] = r * dirZ * invH
+          geom[o + 3] = w * invH
+          shade[o] = s.col[0]!
+          shade[o + 1] = s.col[1]!
+          shade[o + 2] = s.col[2]!
+          radiusFrac = Math.max(radiusFrac, r * invH)
+        }
+      }
+    }
+  }
+
+  // --- relief gain about each variant's own mean surface height -------------
+  const rowsOf = (v: number): number[] => {
+    const rows: number[] = []
+    for (let level = 0; level < LEVEL_RIBBONS.length; level++) {
+      for (let ribbon = 0; ribbon < LEVEL_RIBBONS[level]!; ribbon++) {
+        rows.push(v * ROWS_PER_VARIANT + LEVEL_BASE[level]! + ribbon)
+      }
+    }
+    return rows
+  }
+  for (let v = 0; v < VARIANTS; v++) {
+    let sum = 0
+    let count = 0
+    for (let ribbon = 0; ribbon < LEVEL_RIBBONS[0]!; ribbon++) {
+      const row = v * ROWS_PER_VARIANT + ribbon
+      for (let j = 0; j < SAMPLES; j++) {
+        sum += geom[(row * SAMPLES + j) * 4 + 1]!
+        count++
+      }
+    }
+    const mean = sum / Math.max(count, 1)
+    for (const row of rowsOf(v)) {
+      for (let j = 0; j < SAMPLES; j++) {
+        const o = (row * SAMPLES + j) * 4
+        geom[o + 1] = mean + (geom[o + 1]! - mean) * MAT_RELIEF_GAIN
+        if (j === SAMPLES - 1 && row < v * ROWS_PER_VARIANT + LEVEL_RIBBONS[0]!) {
+          rimSum += geom[o + 1]!
+          rimCount++
+        }
+      }
+    }
+  }
+
+  // --- rim taper (seam continuity) + relief-driven ambient occlusion --------
+  const rimMean = rimCount > 0 ? rimSum / rimCount : meanY * invH
+  for (let v = 0; v < VARIANTS; v++) {
+    let lo = Infinity
+    let hi = -Infinity
+    for (let ribbon = 0; ribbon < LEVEL_RIBBONS[0]!; ribbon++) {
+      const row = v * ROWS_PER_VARIANT + ribbon
+      for (let j = 0; j < SAMPLES; j++) {
+        const y = geom[(row * SAMPLES + j) * 4 + 1]!
+        lo = Math.min(lo, y)
+        hi = Math.max(hi, y)
+      }
+    }
+    const span = Math.max(hi - lo, 1e-4)
+    for (const row of rowsOf(v)) {
+      for (let j = 0; j < SAMPLES; j++) {
+        const o = (row * SAMPLES + j) * 4
+        const taper = MAT_RIM_TAPER * smoothstep(0.72, 1.0, j / (SAMPLES - 1))
+        const y = geom[o + 1]! + (rimMean - geom[o + 1]!) * taper
+        geom[o + 1] = y
+        // Hollows between capitula sit in their own shadow; tops do not. The
+        // smoothstep spends the contrast where the samples actually are.
+        const ao = Math.min(
+          0.99,
+          Math.max(0.3, MAT_AO_FLOOR + (1 - MAT_AO_FLOOR) * smoothstep(0.05, 0.95, (y - lo) / span)),
+        )
+        shade[o + 3] = ao // fluffLevel 0: a cushion surface is a surface
+      }
+    }
+  }
+
+  return { geom, shade, radiusFrac: Math.max(radiusFrac, 0.05), heightM: gTop, mat: true }
 }
 
 /** Deterministic [0,1) jitter per (atlas row, sample) — no Math.random anywhere. */

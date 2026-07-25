@@ -25,6 +25,28 @@ const MAGIC = 0x31464456 // 'VDF1'
 const POINT_TARGET = 320_000
 const FLOATS_PER_STATION = 12
 
+/**
+ * Second artifact format, for CARPET species ("VDG1").
+ *
+ * A tiled mat is not a bundle of upward strands — it is a low, wide, intricate
+ * SURFACE, so for those species the same three field textures hold a regular
+ * (GRID_LINES x GRID_LINES) vector-displacement grid of the cushion's top
+ * shell instead: node xz on a square lattice, the cushion's surface height,
+ * its real per-node colour, its normal and a relief-derived occlusion. The
+ * runtime draws it as a displaced grid mesh whose LOD is an integer texel
+ * stride, which keeps the sheet watertight at every level.
+ */
+export const GRID_BAKE_VERSION = 2
+const GRID_MAGIC = 0x31474456 // 'VDG1'
+/** Quads per axis at full detail; GRID_N must be a power of two (stride LOD). */
+export const GRID_N = 64
+export const GRID_LINES = GRID_N + 1
+/** Sheet extent as a multiple of the periodic tile: >1 so neighbours overlap. */
+export const GRID_EXT_FACTOR = 1.15
+const GRID_POINT_TARGET = 900_000
+/** Points within this depth of the local maximum count as "the top shell". */
+const GRID_SHELL_DEPTH = 0.004
+
 export interface StrandField {
   strands: number
   stations: number
@@ -77,7 +99,7 @@ function makeRng(seed: number): () => number {
   }
 }
 
-function samplePoints(mesh: GcMesh, cx: number, cz: number): PointCloud {
+function samplePoints(mesh: GcMesh, cx: number, cz: number, target = POINT_TARGET): PointCloud {
   const h = mesh.header
   const verts = mesh.vertices
   const tris = mesh.triangles
@@ -109,7 +131,7 @@ function samplePoints(mesh: GcMesh, cx: number, cz: number): PointCloud {
     totalArea += 0.5 * Math.sqrt(cxx * cxx + cyy * cyy + czz * czz)
   }
 
-  const cap = POINT_TARGET + 4096
+  const cap = target + 4096
   const out: PointCloud = {
     n: 0,
     px: new Float32Array(cap),
@@ -122,7 +144,7 @@ function samplePoints(mesh: GcMesh, cx: number, cz: number): PointCloud {
     ny: new Float32Array(cap),
     nz: new Float32Array(cap),
   }
-  const perArea = POINT_TARGET / Math.max(totalArea, 1e-9)
+  const perArea = target / Math.max(totalArea, 1e-9)
   const rng = makeRng(0x9e3779b9)
   const nrm: [number, number, number] = [0, 0, 0]
   let acc = 0
@@ -527,6 +549,321 @@ export function bakeStrandField(mesh: GcMesh, tileSize: [number, number] | null)
     topH,
     canopy: wsum > 0 ? [wr * inv, wg * inv, wb * inv] : [0.2, 0.26, 0.11],
     data,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Carpet grid bake (top-shell vector-displacement surface of a periodic tile)
+// ---------------------------------------------------------------------------
+
+export interface GridField {
+  lines: number
+  /** Side of the square sheet in mesh metres (> the tile period: overlap). */
+  ext: number
+  /** Mean surface height of the mat (what the far shell should sit at). */
+  topH: number
+  canopy: [number, number, number]
+  /** LINES²×12 floats: [x,y,z,1, nx,ny,nz,ao, r,g,b,1] in tile-centred frame. */
+  data: Float32Array
+}
+
+/**
+ * Sample the cushion's TOP SHELL on a regular lattice. For every grid node we
+ * find the local maximum height in a small xz neighbourhood and average only
+ * the points within GRID_SHELL_DEPTH of it — that is the surface you actually
+ * see, with its own colour (pale young apices, dark crevices) instead of the
+ * whole-cushion mean that a 3 cm gather radius collapses everything into.
+ */
+export function bakeCarpetGrid(mesh: GcMesh, tileSize: [number, number]): GridField {
+  const h = mesh.header
+  const cx = h.tileOrigin[0] + tileSize[0] / 2
+  const cz = h.tileOrigin[1] + tileSize[1] / 2
+  const ext = Math.max(tileSize[0], tileSize[1]) * GRID_EXT_FACTOR
+  const step = ext / GRID_N
+  const pts = samplePoints(mesh, cx, cz, GRID_POINT_TARGET)
+
+  // The sheet is WIDER than the tile period, so neighbouring sheets overlap
+  // instead of abutting — a height step at a shared edge would be a hole, an
+  // overlap is only a crease. That means the rim must be sampled from the
+  // PERIODIC continuation of the tile: every point is bucketed nine times, once
+  // per +-period offset, and the copies inside the sheet box are kept. Without
+  // it the rim finds only the mesh's own overflow, reads far too low, and every
+  // tile bakes as a dome with a groove around it.
+  const L = GRID_LINES
+  const nCells = L * L
+  const half = ext / 2
+  const ox9 = (k: number): number => ((k % 3) - 1) * tileSize[0]
+  const oz9 = (k: number): number => (Math.floor(k / 3) - 1) * tileSize[1]
+  const cellOfXZ = (x: number, z: number): number => {
+    const gx = Math.min(L - 1, Math.max(0, Math.round((x + half) / step)))
+    const gz = Math.min(L - 1, Math.max(0, Math.round((z + half) / step)))
+    return gx + L * gz
+  }
+  const counts = new Uint32Array(nCells + 1)
+  for (let i = 0; i < pts.n; i++) {
+    for (let k = 0; k < 9; k++) {
+      const x = pts.px[i]! + ox9(k)
+      const z = pts.pz[i]! + oz9(k)
+      if (Math.abs(x) <= half + step && Math.abs(z) <= half + step) counts[cellOfXZ(x, z) + 1]!++
+    }
+  }
+  for (let c = 0; c < nCells; c++) counts[c + 1]! += counts[c]!
+  const items = new Uint32Array(counts[nCells]!)
+  const cursor = counts.slice(0, nCells)
+  for (let i = 0; i < pts.n; i++) {
+    for (let k = 0; k < 9; k++) {
+      const x = pts.px[i]! + ox9(k)
+      const z = pts.pz[i]! + oz9(k)
+      if (Math.abs(x) <= half + step && Math.abs(z) <= half + step) items[cursor[cellOfXZ(x, z)]!++] = i * 9 + k
+    }
+  }
+
+  const height = new Float32Array(nCells)
+  const filled = new Uint8Array(nCells)
+  const col = new Float32Array(nCells * 3)
+  const leafN = new Float32Array(nCells * 3)
+  let hSum = 0
+  let hCount = 0
+
+  for (let gz = 0; gz < L; gz++) {
+    for (let gx = 0; gx < L; gx++) {
+      const c = gx + L * gz
+      // Pass A: local max height over the 3x3 cell ring (robust against the
+      // odd single high leaf tip landing in one cell).
+      let maxY = -Infinity
+      for (let dz = -1; dz <= 1; dz++) {
+        const zz = gz + dz
+        if (zz < 0 || zz >= L) continue
+        for (let dx = -1; dx <= 1; dx++) {
+          const xx = gx + dx
+          if (xx < 0 || xx >= L) continue
+          const cc = xx + L * zz
+          for (let k = counts[cc]!; k < counts[cc + 1]!; k++) {
+            const y = pts.py[items[k]! / 9 | 0]!
+            if (y > maxY) maxY = y
+          }
+        }
+      }
+      if (maxY === -Infinity) continue
+      // Pass B: mean of the top shell in the NODE's own cell — widening this
+      // blurs the capitulum-scale relief away, which is the whole subject.
+      const cut = maxY - GRID_SHELL_DEPTH
+      let n = 0
+      let sy = 0
+      let sr = 0
+      let sg = 0
+      let sb = 0
+      let nx = 0
+      let ny = 0
+      let nz = 0
+      for (let k = counts[c]!; k < counts[c + 1]!; k++) {
+        const i = (items[k]! / 9) | 0
+        if (pts.py[i]! < cut) continue
+        n++
+        sy += pts.py[i]!
+        sr += pts.cr[i]!
+        sg += pts.cg[i]!
+        sb += pts.cb[i]!
+        nx += pts.nx[i]!
+        ny += pts.ny[i]!
+        nz += pts.nz[i]!
+      }
+      if (n < 3) {
+        // Sparse cell: fall back to the 3x3 ring rather than punching a hole.
+        n = 0
+        sy = 0
+        sr = 0
+        sg = 0
+        sb = 0
+        nx = 0
+        ny = 0
+        nz = 0
+        for (let dz = -1; dz <= 1; dz++) {
+          const zz = gz + dz
+          if (zz < 0 || zz >= L) continue
+          for (let dx = -1; dx <= 1; dx++) {
+            const xx = gx + dx
+            if (xx < 0 || xx >= L) continue
+            const cc = xx + L * zz
+            for (let k = counts[cc]!; k < counts[cc + 1]!; k++) {
+              const i = (items[k]! / 9) | 0
+              if (pts.py[i]! < cut) continue
+              n++
+              sy += pts.py[i]!
+              sr += pts.cr[i]!
+              sg += pts.cg[i]!
+              sb += pts.cb[i]!
+              nx += pts.nx[i]!
+              ny += pts.ny[i]!
+              nz += pts.nz[i]!
+            }
+          }
+        }
+      }
+      if (n === 0) continue
+      const inv = 1 / n
+      // Bias toward the local maximum: the mean of the shell sits half a shell
+      // depth below the visible tips.
+      height[c] = sy * inv + GRID_SHELL_DEPTH * 0.35
+      filled[c] = 1
+      col[c * 3] = sr * inv
+      col[c * 3 + 1] = sg * inv
+      col[c * 3 + 2] = sb * inv
+      const ln = Math.hypot(nx, ny, nz) || 1
+      leafN[c * 3] = nx / ln
+      leafN[c * 3 + 1] = ny / ln
+      leafN[c * 3 + 2] = nz / ln
+      hSum += height[c]!
+      hCount++
+    }
+  }
+
+  const meanH = hCount > 0 ? hSum / hCount : 0.05
+  // Safety only: with periodic bucketing every node has points, so this should
+  // never fire. If it ever does, sink the node to the ground rather than leaving
+  // an undefined height — the neighbouring sheet's interior covers it.
+  const darkest: [number, number, number] = [0.12, 0.16, 0.06]
+  for (let c = 0; c < nCells; c++) {
+    if (!filled[c]) {
+      height[c] = 0
+      col[c * 3] = darkest[0]
+      col[c * 3 + 1] = darkest[1]
+      col[c * 3 + 2] = darkest[2]
+      leafN[c * 3 + 1] = 1
+    }
+  }
+
+  // Mild 3x3 smoothing: the top-shell estimate is noisy at 3 mm sampling and
+  // the normals are finite differences of it, but a heavy kernel would erase the
+  // capitulum relief the sheet exists to show.
+  const smooth = new Float32Array(nCells)
+  const wk = [1, 6, 1]
+  for (let gz = 0; gz < L; gz++) {
+    for (let gx = 0; gx < L; gx++) {
+      let acc = 0
+      let wsum = 0
+      for (let dz = -1; dz <= 1; dz++) {
+        const zz = Math.min(L - 1, Math.max(0, gz + dz))
+        for (let dx = -1; dx <= 1; dx++) {
+          const xx = Math.min(L - 1, Math.max(0, gx + dx))
+          const w = wk[dz + 1]! * wk[dx + 1]!
+          acc += height[xx + L * zz]! * w
+          wsum += w
+        }
+      }
+      smooth[gx + L * gz] = acc / wsum
+    }
+  }
+  // Wide blur for the relief-based occlusion (crevices darker than knolls).
+  const wide = new Float32Array(nCells)
+  const R = 4
+  for (let gz = 0; gz < L; gz++) {
+    for (let gx = 0; gx < L; gx++) {
+      let acc = 0
+      let n = 0
+      for (let dz = -R; dz <= R; dz += 2) {
+        const zz = Math.min(L - 1, Math.max(0, gz + dz))
+        for (let dx = -R; dx <= R; dx += 2) {
+          const xx = Math.min(L - 1, Math.max(0, gx + dx))
+          acc += smooth[xx + L * zz]!
+          n++
+        }
+      }
+      wide[gx + L * gz] = acc / n
+    }
+  }
+  let sd = 0
+  for (let c = 0; c < nCells; c++) sd += (smooth[c]! - meanH) ** 2
+  const relief = Math.max(Math.sqrt(sd / nCells) * 2.2, 0.004)
+
+  const data = new Float32Array(nCells * FLOATS_PER_STATION)
+  let wr = 0
+  let wg = 0
+  let wb = 0
+  for (let gz = 0; gz < L; gz++) {
+    for (let gx = 0; gx < L; gx++) {
+      const c = gx + L * gz
+      const b = c * FLOATS_PER_STATION
+      const x = -ext / 2 + gx * step
+      const z = -ext / 2 + gz * step
+      const y = smooth[c]!
+      // Height-field normal from central differences, nudged by the mean leaf
+      // normal so flat facets still carry some foliage-scale variation.
+      const xm = smooth[Math.max(gx - 1, 0) + L * gz]!
+      const xp = smooth[Math.min(gx + 1, L - 1) + L * gz]!
+      const zm = smooth[gx + L * Math.max(gz - 1, 0)]!
+      const zp = smooth[gx + L * Math.min(gz + 1, L - 1)]!
+      const sx = (gx === 0 || gx === L - 1 ? 1 : 2) * step
+      const sz = (gz === 0 || gz === L - 1 ? 1 : 2) * step
+      let nx = -(xp - xm) / sx + leafN[c * 3]! * 0.45
+      let ny = 1 + leafN[c * 3 + 1]! * 0.45
+      let nz = -(zp - zm) / sz + leafN[c * 3 + 2]! * 0.45
+      const nl = Math.hypot(nx, ny, nz) || 1
+      nx /= nl
+      ny /= nl
+      nz /= nl
+      const ao = Math.min(1, Math.max(0.22, 0.62 + (0.9 * (y - wide[c]!)) / relief))
+      data[b] = x
+      data[b + 1] = y
+      data[b + 2] = z
+      data[b + 3] = 1
+      data[b + 4] = nx
+      data[b + 5] = ny
+      data[b + 6] = nz
+      data[b + 7] = ao
+      data[b + 8] = col[c * 3]!
+      data[b + 9] = col[c * 3 + 1]!
+      data[b + 10] = col[c * 3 + 2]!
+      data[b + 11] = 1
+      wr += col[c * 3]!
+      wg += col[c * 3 + 1]!
+      wb += col[c * 3 + 2]!
+    }
+  }
+  const inv = 1 / nCells
+  return {
+    lines: L,
+    ext,
+    topH: meanH,
+    canopy: [wr * inv, wg * inv, wb * inv],
+    data,
+  }
+}
+
+export function serializeGrid(f: GridField): ArrayBuffer {
+  const buf = new ArrayBuffer(64 + f.data.byteLength)
+  const u32 = new Uint32Array(buf, 0, 16)
+  const f32 = new Float32Array(buf, 0, 16)
+  u32[0] = GRID_MAGIC
+  u32[1] = GRID_BAKE_VERSION
+  u32[2] = f.lines
+  u32[3] = f.lines
+  f32[4] = f.topH
+  f32[5] = f.canopy[0]
+  f32[6] = f.canopy[1]
+  f32[7] = f.canopy[2]
+  f32[8] = f.ext
+  new Float32Array(buf, 64).set(f.data)
+  return buf
+}
+
+export function isGrid(buf: ArrayBuffer | null): buf is ArrayBuffer {
+  if (!buf || buf.byteLength < 64) return false
+  const u32 = new Uint32Array(buf, 0, 16)
+  if (u32[0] !== GRID_MAGIC || u32[1] !== GRID_BAKE_VERSION) return false
+  if (u32[2] !== GRID_LINES || u32[3] !== GRID_LINES) return false
+  return buf.byteLength === 64 + GRID_LINES * GRID_LINES * FLOATS_PER_STATION * 4
+}
+
+export function parseGrid(buf: ArrayBuffer): GridField {
+  if (!isGrid(buf)) throw new Error('VDG1: bad artifact')
+  const f32 = new Float32Array(buf, 0, 16)
+  return {
+    lines: GRID_LINES,
+    ext: f32[8]!,
+    topH: f32[4]!,
+    canopy: [f32[5]!, f32[6]!, f32[7]!],
+    data: new Float32Array(buf, 64),
   }
 }
 
