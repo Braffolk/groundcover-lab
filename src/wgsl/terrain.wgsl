@@ -40,3 +40,24 @@ fn terrain_normal(xz: vec2f) -> vec3f {
   let ny = sqrt(max(1.0 - s.y * s.y - s.z * s.z, 0.0));
   return vec3f(s.y, ny, s.z);
 }
+
+/**
+ * Orthonormal basis for placing a plant on sloped ground. Columns are
+ * (tangent, up, bitangent): multiply a plant-local offset by it, so local +Y
+ * is the plant's own up axis and local XZ is its footprint.
+ *
+ * `align` blends up from world-vertical toward the terrain normal — pass the
+ * species' stand_table[].slope_align. A flat mat MUST use 1.0 or it buries one
+ * edge and floats the other on any slope; tall plants want only a little,
+ * because grass grows upright no matter what it grows on.
+ */
+fn plant_basis(xz: vec2f, yaw: f32, align: f32) -> mat3x3f {
+  let up = normalize(mix(vec3f(0.0, 1.0, 0.0), terrain_normal(xz), clamp(align, 0.0, 1.0)));
+  // Yawed tangent, projected into the plane so the basis stays orthonormal.
+  var t = vec3f(cos(yaw), 0.0, -sin(yaw));
+  let proj = t - up * dot(up, t);
+  // Degenerate only where the ground is a vertical wall; fall back to any
+  // in-plane direction rather than emitting NaNs.
+  t = select(normalize(vec3f(up.y, -up.x, 0.0)), normalize(proj), dot(proj, proj) > 1.0e-6);
+  return mat3x3f(t, up, cross(t, up));
+}

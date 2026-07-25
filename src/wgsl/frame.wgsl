@@ -61,8 +61,15 @@ struct StandEntry {
    * what should be a closed mat. Use this, or the extents you baked yourself.
    */
   footprint_m: f32,
+  /**
+   * How much this species lies into the terrain plane instead of standing
+   * upright: 1 = fully aligned to the terrain normal (correct for mats and
+   * carpets, which must follow the ground or they bury one edge and float the
+   * other), ~0.2-0.4 for tall plants (real grass grows upright regardless of
+   * slope), 0 = always vertical. Apply it with plant_basis() in terrain.wgsl.
+   */
+  slope_align: f32,
   _pad0: f32,
-  _pad1: f32,
 }
 
 @group(0) @binding(0) var<uniform> frame: Frame;

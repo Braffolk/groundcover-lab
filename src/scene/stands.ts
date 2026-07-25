@@ -49,6 +49,13 @@ export interface StandSpecies {
    * carpetDiv² must not exceed SCATTER_MAX_PER_CELL (128), so div ≤ 11.
    */
   carpetDiv?: number
+  /**
+   * How much this species lies into the terrain plane rather than standing
+   * upright (0..1). Defaults to 1 for carpet entries — a flat mat must follow
+   * the ground — and 0 otherwise. Tall plants look right at ~0.2-0.4: real
+   * grass grows upright regardless of the slope it grows on.
+   */
+  slopeAlign?: number
 }
 
 export interface Stand {
@@ -151,7 +158,7 @@ export const STANDS: readonly Stand[] = [
       { ...DRY_MOSS, density: 8, carpetDiv: 11, wetCenter: 1 / 6, wetWidth: 1 / 3 },
       // Calamagrostis canescens is genuinely a fen / wet-meadow grass, so it
       // belongs in the hollows — sparse, emergent above the carpet.
-      { ...CALAMAGROSTIS, density: 1.4, wetCenter: 0.78, wetWidth: 0.26 },
+      { ...CALAMAGROSTIS, density: 1.4, wetCenter: 0.78, wetWidth: 0.26, slopeAlign: 0.3 },
       // Poa is a meadow grass, not a bog plant: a trace on the driest crests
       // only, reading as encroachment from the drier margin.
       { ...POA, density: 0.5, wetCenter: 0.04, wetWidth: 0.2 },
@@ -236,7 +243,7 @@ export function createStandBuffer(scope: VramScope, queue: GPUQueue, stand: Stan
         entry.wetWidth ?? 0,
         entry.carpetDiv ?? 0,
         species.tileM ?? 0,
-        0,
+        entry.slopeAlign ?? (entry.carpetDiv ? 1 : 0),
         0,
       ],
       i * 12,
