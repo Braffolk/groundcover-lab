@@ -18,12 +18,27 @@ export const HARNESS_API = 1
 
 export type ExperimentStatus = 'idea' | 'wip' | 'working' | 'best' | 'abandoned' | 'reference'
 
+/**
+ * What sort of experiment this is. The kind selects the Stage (what scene the
+ * harness builds around it) and which rules in CLAUDE.md bind the author.
+ * Additive: an absent `kind` means 'renderer', so every pre-existing manifest
+ * keeps working untouched.
+ */
+export type ExperimentKind = 'renderer' | 'material'
+
 export interface ExperimentManifest<S extends ParamSchema = ParamSchema> {
-  /** Must equal the directory name under experiments/. */
+  /**
+   * Unique id. For a top-level experiment this is the directory name; for a
+   * nested one (materials/mosses/sphagnum/003-nd-fuzz) it is the LAST path
+   * segment. The id — not the path — is what ratings, bench results and
+   * goldens are keyed by, so a taxonomy reshuffle never orphans them.
+   */
   id: string
   title: string
   description: string
   status: ExperimentStatus
+  /** Defaults to 'renderer'. */
+  kind?: ExperimentKind
   harnessApi: number
   /** Species ids rendered — each gets a 25MB VRAM budget row. */
   species: string[]
@@ -127,26 +142,53 @@ export function defineExperiment<S extends ParamSchema>(manifest: ExperimentMani
 
 export interface RegistryEntry {
   id: string
+  /**
+   * Repo-relative directory, e.g. `experiments/001-billboard-smoke` or
+   * `experiments/materials/mosses/sphagnum/003-nd-fuzz`. Every per-experiment
+   * asset URL derives from THIS, not from the id — the two stopped being the
+   * same thing when experiments gained a hierarchy.
+   */
+  dir: string
+  /**
+   * Path segments between `experiments/` and the experiment's own directory,
+   * e.g. `['materials', 'mosses', 'sphagnum']`. Empty for a top-level
+   * experiment. This is the grouping the browser will render as a tree.
+   */
+  taxonomy: readonly string[]
+  kind: ExperimentKind
   manifest: ExperimentManifest | null
   /** Present when the manifest failed to load or is incompatible. */
   error?: string
   thumbnailUrl?: string
 }
 
-const manifestLoaders = import.meta.glob('/experiments/*/manifest.ts')
+// Nested so a hierarchy (materials/<class>/<subject>/<attempt>) is discoverable.
+// Directories starting with `_` are skipped at ANY depth, which is what keeps
+// `_template` out.
+const manifestLoaders = import.meta.glob('/experiments/**/manifest.ts')
 
-function dirOf(path: string): string {
-  return path.split('/')[2]!
+/** Path segments between `experiments/` and `manifest.ts`. */
+function segmentsOf(path: string): string[] {
+  return path.split('/').slice(2, -1)
 }
 
 export async function discoverExperiments(): Promise<RegistryEntry[]> {
   const entries: RegistryEntry[] = []
   for (const [path, loader] of Object.entries(manifestLoaders)) {
-    const id = dirOf(path)
-    if (id.startsWith('_')) continue
-    // Conventional URL, not a glob import — the dev server serves it directly,
-    // so fresh captures appear without rebundling (cards fall back on 404).
-    const entry: RegistryEntry = { id, manifest: null, thumbnailUrl: assetUrl(`/experiments/${id}/thumbnail.png`) }
+    const segments = segmentsOf(path)
+    if (segments.length === 0 || segments.some((s) => s.startsWith('_'))) continue
+    const id = segments[segments.length - 1]!
+    const dir = `experiments/${segments.join('/')}`
+    const entry: RegistryEntry = {
+      id,
+      dir,
+      taxonomy: segments.slice(0, -1),
+      kind: 'renderer',
+      manifest: null,
+      // Conventional URL, not a glob import — the dev server serves it directly,
+      // so fresh captures appear without rebundling (cards fall back on 404).
+      thumbnailUrl: assetUrl(`/${dir}/thumbnail.png`),
+    }
     entries.push(entry)
     try {
       const mod = (await loader()) as { default?: ExperimentManifest }
@@ -157,8 +199,20 @@ export async function discoverExperiments(): Promise<RegistryEntry[]> {
         throw new Error(`built for harness API ${manifest.harnessApi}, current is ${HARNESS_API}`)
       }
       entry.manifest = manifest
+      entry.kind = manifest.kind ?? 'renderer'
     } catch (err) {
       entry.error = err instanceof Error ? err.message : String(err)
+    }
+  }
+  const duplicates = new Map<string, string[]>()
+  for (const e of entries) duplicates.set(e.id, [...(duplicates.get(e.id) ?? []), e.dir])
+  for (const [id, dirs] of duplicates) {
+    if (dirs.length < 2) continue
+    // Ids key ratings, bench results and goldens, so a collision silently mixes
+    // two experiments' history. Surface it as a broken entry rather than a merge.
+    for (const e of entries.filter((x) => x.id === id)) {
+      e.manifest = null
+      e.error = `duplicate experiment id "${id}" in ${dirs.join(' and ')} — ids must be unique across the whole tree`
     }
   }
   return entries.sort((a, b) => a.id.localeCompare(b.id, undefined, { numeric: true }))

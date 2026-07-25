@@ -9,11 +9,11 @@ import type { Plugin } from 'vite'
  *
  *   POST /__bench                        JSON BenchResult -> results/<derived-name>.json
  *   GET  /__bench/list                   JSON string[] of results/ filenames
- *   POST /__thumb?exp=<id>               PNG body -> experiments/<id>/thumbnail.png
- *   POST /__thumb?exp=<id>&cam=<name>    PNG body -> goldens/<id>/<name>.png
+ *   POST /__thumb?exp=<dir>              PNG body -> <dir>/thumbnail.png
+ *   POST /__thumb?exp=<dir>&cam=<name>   PNG body -> goldens/<id>/<name>.png (id = last segment)
  *   POST /__bake?exp=<id>&key=<key>[&ext=bin|png|json]
  *                                        binary body -> mesh/baked/<id>/<key>.<ext> (ext defaults to bin)
- *   POST /__rating?exp=<id>              {"visual":1..5|null} -> experiments/<id>/rating.json (null deletes)
+ *   POST /__rating?exp=<dir>             {"visual":1..5|null} -> <dir>/rating.json (null deletes)
  */
 const BAKE_EXTS = ['bin', 'png', 'json']
 
@@ -25,6 +25,23 @@ export function devSink(): Plugin {
       throw new Error(`invalid ${label}: ${JSON.stringify(value)}`)
     }
     return value
+  }
+
+  /**
+   * A repo-relative experiment directory, e.g. `experiments/001-billboard-smoke`
+   * or `experiments/materials/mosses/sphagnum/003-nd-fuzz`. Experiments gained a
+   * hierarchy, so this has to admit `/` — which means it must be validated
+   * segment by segment, and pinned under `experiments/`, or it becomes a
+   * write-anywhere primitive on the owner's disk.
+   */
+  const experimentDir = (value: string | null, label: string): string => {
+    if (!value) throw new Error(`invalid ${label}: ${JSON.stringify(value)}`)
+    const parts = value.split('/')
+    if (parts[0] !== 'experiments' || parts.length < 2) {
+      throw new Error(`invalid ${label}: must be a path under experiments/, got ${JSON.stringify(value)}`)
+    }
+    for (const part of parts) segment(part, label)
+    return parts.join('/')
   }
 
   const readBody = (req: IncomingMessage): Promise<Buffer> =>
@@ -86,19 +103,22 @@ export function devSink(): Plugin {
             return
           }
           if (route === '/__thumb' && req.method === 'POST') {
-            const exp = segment(url.searchParams.get('exp'), 'exp')
+            const dir = experimentDir(url.searchParams.get('exp'), 'exp')
             const cam = url.searchParams.get('cam')
             const body = await readBody(req)
+            // Goldens stay keyed by ID (the directory's last segment), not by
+            // path, so a taxonomy reshuffle never orphans a golden.
+            const id = dir.slice(dir.lastIndexOf('/') + 1)
             const saved = cam
-              ? write(path.join('goldens', exp), `${segment(cam, 'cam')}.png`, body)
-              : write(path.join('experiments', exp), 'thumbnail.png', body)
+              ? write(path.join('goldens', id), `${segment(cam, 'cam')}.png`, body)
+              : write(dir, 'thumbnail.png', body)
             json(res, 200, { saved })
             return
           }
           if (route === '/__rating' && req.method === 'POST') {
-            const exp = segment(url.searchParams.get('exp'), 'exp')
+            const dir = experimentDir(url.searchParams.get('exp'), 'exp')
             const { visual } = JSON.parse((await readBody(req)).toString('utf8')) as { visual: number | null }
-            const file = path.join(root, 'experiments', exp, 'rating.json')
+            const file = path.join(root, dir, 'rating.json')
             if (visual === null) {
               rmSync(file, { force: true })
               json(res, 200, { cleared: true })

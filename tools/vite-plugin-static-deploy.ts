@@ -95,10 +95,21 @@ export function staticDeploy(options: StaticDeployOptions = {}): Plugin {
       const stats: CopyStat[] = []
 
       // --- experiment thumbnails + owner ratings ---------------------------
+      // Experiments are a tree (materials/<class>/<subject>/<attempt>), so this
+      // walks for manifest.ts at any depth rather than reading one level.
+      const experimentDirs = (rel: string): string[] => {
+        const out: string[] = []
+        for (const name of dirs(rel)) {
+          const child = path.join(rel, name)
+          if (existsSync(path.join(root, child, 'manifest.ts'))) out.push(child)
+          else out.push(...experimentDirs(child))
+        }
+        return out
+      }
       const experiments: CopyStat = { label: 'experiments (thumbnails + ratings)', files: 0, bytes: 0 }
-      for (const id of dirs('experiments')) {
-        copy(path.join('experiments', id, 'thumbnail.png'), experiments)
-        copy(path.join('experiments', id, 'rating.json'), experiments)
+      for (const dir of experimentDirs('experiments')) {
+        copy(path.join(dir, 'thumbnail.png'), experiments)
+        copy(path.join(dir, 'rating.json'), experiments)
       }
       stats.push(experiments)
 

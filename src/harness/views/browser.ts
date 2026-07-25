@@ -32,7 +32,7 @@ export async function browserView(root: HTMLElement): Promise<View> {
   const renderers = entries.filter((e) => e.manifest?.status !== 'reference')
   const references = entries.filter((e) => e.manifest?.status === 'reference')
   const [ratings, perf] = await Promise.all([
-    fetchAllRatings(renderers.map((e) => e.id)),
+    fetchAllRatings(renderers),
     loadPerfIndex(),
   ])
 
@@ -143,7 +143,7 @@ export async function browserView(root: HTMLElement): Promise<View> {
     const ref = experimentCard(entry, toggleSelect, entry.manifest ? {
       rating: ratings.get(entry.id) ?? null,
       onRate: (value) => {
-        void saveRating(entry.id, value)
+        void saveRating(entry.dir, value)
           .then(() => {
             if (value === null) ratings.delete(entry.id)
             else ratings.set(entry.id, value)

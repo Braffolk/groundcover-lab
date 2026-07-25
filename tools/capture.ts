@@ -10,7 +10,7 @@
  * Requires the dev server to be running (npm run dev) — results/thumbnails
  * land in the repo via its sink endpoints.
  */
-import { readdirSync } from 'node:fs'
+import { existsSync, readdirSync } from 'node:fs'
 import path from 'node:path'
 import { chromium } from 'playwright'
 
@@ -24,10 +24,24 @@ if (mode !== 'thumbs' && mode !== 'goldens' && mode !== 'bench') {
 }
 
 const root = path.resolve(import.meta.dirname, '..')
-const experiments = readdirSync(path.join(root, 'experiments'), { withFileTypes: true })
-  .filter((e) => e.isDirectory() && !e.name.startsWith('_'))
-  .map((e) => e.name)
-  .sort()
+
+/**
+ * Experiment ids, found by walking for `manifest.ts` at any depth — experiments
+ * are a tree now (materials/<class>/<subject>/<attempt>), and an id is the last
+ * path segment rather than a child of experiments/.
+ */
+function findExperimentIds(dir: string): string[] {
+  const out: string[] = []
+  for (const e of readdirSync(dir, { withFileTypes: true })) {
+    if (!e.isDirectory() || e.name.startsWith('_') || e.name.startsWith('.')) continue
+    const child = path.join(dir, e.name)
+    if (existsSync(path.join(child, 'manifest.ts'))) out.push(e.name)
+    else out.push(...findExperimentIds(child))
+  }
+  return out
+}
+
+const experiments = findExperimentIds(path.join(root, 'experiments')).sort()
 
 if (experiments.length === 0) {
   console.error('no experiments found')

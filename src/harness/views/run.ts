@@ -136,7 +136,7 @@ export async function runView(root: HTMLElement, state: HashState): Promise<View
       toolbar.append(
         button('thumbnail', () => {
           void captureViewPng(app, 0, 640)
-            .then((blob) => uploadCapture(id, blob))
+            .then((blob) => uploadCapture(entry.dir, blob))
             .then((saved) => overlay.toast(`saved ${saved} — shows on the browser card`))
             .catch(() => {
               overlay.toast('dev server sink unavailable — downloading instead', 'warn')
@@ -150,7 +150,7 @@ export async function runView(root: HTMLElement, state: HashState): Promise<View
             return
           }
           void captureViewPng(app)
-            .then((blob) => uploadCapture(id, blob, name))
+            .then((blob) => uploadCapture(entry.dir, blob, name))
             .then((saved) => overlay.toast(`saved ${saved}`))
             .catch((err: unknown) => overlay.toast(String(err), 'error'))
         }),
@@ -165,10 +165,10 @@ export async function runView(root: HTMLElement, state: HashState): Promise<View
     )
     if (!isReference) {
       const pips = pipsRow({
-        value: await fetchRating(id),
+        value: await fetchRating(entry.dir),
         readOnly: !HAS_DEV_SINK,
         onSet: (value) => {
-          void saveRating(id, value)
+          void saveRating(entry.dir, value)
             .then(() => overlay.toast(value === null ? 'rating cleared' : `rated ${value}/5`))
             .catch(() => overlay.toast('rating needs the dev server', 'warn'))
         },
