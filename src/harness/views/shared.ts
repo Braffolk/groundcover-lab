@@ -148,7 +148,7 @@ export function setupCameraSync(app: LabApp, initialCam: string | null, overlay:
 
   const interval = setInterval(() => {
     const s = serializePose(app.camera.pose)
-    const onBookmark = app.scene.bookmarks[lastCam]
+    const onBookmark = app.bookmarks[lastCam]
     if (onBookmark ? s !== serializePose(onBookmark) : s !== lastCam) {
       lastCam = s
       writeQuery({ cam: s })
@@ -162,12 +162,12 @@ export function setupCameraSync(app: LabApp, initialCam: string | null, overlay:
     if (ev.shiftKey) {
       const name = `u${digit}`
       saveUserBookmark(name, app.camera.pose)
-      app.scene.bookmarks[name] = { ...app.camera.pose }
+      app.bookmarks[name] = { ...app.camera.pose }
       overlay.toast(`saved bookmark ${name} (Shift+${digit} to overwrite, ${digit} to recall)`)
     } else {
-      const names = [...STANDARD_CAM_KEYS, ...Object.keys(app.scene.bookmarks).filter((k) => k.startsWith('u')).sort()]
+      const names = [...STANDARD_CAM_KEYS, ...Object.keys(app.bookmarks).filter((k) => k.startsWith('u')).sort()]
       const name = names[digit - 1]
-      const pose = name !== undefined ? app.scene.bookmarks[name] : undefined
+      const pose = name !== undefined ? app.bookmarks[name] : undefined
       if (pose && name) {
         app.camera.setPose(pose)
         lastCam = name
@@ -210,7 +210,7 @@ export function debugPicker(app: LabApp, initial: string | null): HTMLElement {
 /** Current cam name if the pose sits on a named bookmark. */
 export function currentBookmarkName(app: LabApp): string | null {
   const s = serializePose(app.camera.pose)
-  for (const [name, pose] of Object.entries(app.scene.bookmarks)) {
+  for (const [name, pose] of Object.entries(app.bookmarks)) {
     if (serializePose(pose) === s) return name
   }
   return null

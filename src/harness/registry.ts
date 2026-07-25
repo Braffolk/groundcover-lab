@@ -95,6 +95,13 @@ export interface ExperimentContext<S extends ParamSchema = ParamSchema> {
   stand: Stand
   meshes: MeshCatalog
   size(): { width: number; height: number }
+  /**
+   * Report long setup work (fraction 0..1, plus a short note) while `create()`
+   * is still running — the runner shows it as a status line. A multi-minute
+   * bake otherwise blocks the page with nothing on screen. Pass it straight
+   * through as `BakeContext.onProgress`. A no-op where the host provides none.
+   */
+  progress(fraction: number, note?: string): void
 }
 
 export interface Experiment {

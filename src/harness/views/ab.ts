@@ -4,6 +4,7 @@ import { Hud } from '../../ui/hud.ts'
 import { buildParamsPanel } from '../../ui/panel.ts'
 import { CompareCompositor, type CompareMode } from '../compare.ts'
 import { LabApp, type ViewSlot } from '../loop.ts'
+import { standStage } from '../stage.ts'
 import { paramsToQuery } from '../params.ts'
 import { findExperiment } from '../registry.ts'
 import {
@@ -67,14 +68,22 @@ export async function abView(root: HTMLElement, state: HashState): Promise<View>
     content.appendChild(viewer)
     page.appendChild(content)
 
+    // Plain status line while the page starts (two experiments, possibly two
+    // bakes). Removed as soon as the app exists.
+    const status = el('div', 'hud', 'starting…')
+    viewer.appendChild(status)
+
     const app = await LabApp.create({
       canvas,
       seed,
-      stand,
+      stage: standStage(stand, seed),
       experiments: [
         { entry: entryA, ns: 'a', query: state.q },
         { entry: entryB, ns: 'b', query: state.q },
       ],
+      onProgress: (fraction, note) => {
+        status.textContent = `${Math.round(fraction * 100)}% · ${note ?? ''}`
+      },
       onError: (m) => overlay.toast(m, 'error'),
       onShaderMessage: (m) =>
         overlay.toast(m.text, m.kind === 'error' ? 'error' : 'info', m.kind === 'error' ? 10000 : 2500),
@@ -84,13 +93,14 @@ export async function abView(root: HTMLElement, state: HashState): Promise<View>
       },
     })
     cleanups.push(() => app.dispose())
+    status.remove()
 
     const compositor = app.tracker.exempt(() => new CompareCompositor(app.gpu.device, app.shaders, app.gpu.format))
     app.setCompositor(compositor)
     const initialMode = state.q.get('mode')
     if (initialMode === 'flicker' || initialMode === 'diff') compositor.mode = initialMode
 
-    const { pose } = resolveCam(state.q, app.scene.bookmarks)
+    const { pose } = resolveCam(state.q, app.bookmarks)
     if (pose) app.camera.setPose(pose)
     cleanups.push(setupCameraSync(app, state.q.get('cam'), overlay))
 

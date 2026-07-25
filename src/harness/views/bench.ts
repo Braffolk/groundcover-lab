@@ -5,6 +5,7 @@ import { buildHash, type HashState } from '../../url/state.ts'
 import { HAS_DEV_SINK } from '../../util/env.ts'
 import { Overlay } from '../../ui/overlay.ts'
 import { LabApp } from '../loop.ts'
+import { standStage } from '../stage.ts'
 import { paramsHash } from '../params.ts'
 import { findExperiment, HARNESS_API } from '../registry.ts'
 import { button, el, fatalDetail, link, readSeed, readStand, topbar, type View } from './shared.ts'
@@ -61,8 +62,11 @@ export async function benchView(root: HTMLElement, state: HashState): Promise<Vi
     const app = await LabApp.create({
       canvas,
       seed,
-      stand,
+      stage: standStage(stand, seed),
       experiments: [{ entry, ns: 'p', query: state.q }],
+      onProgress: (fraction, note) => {
+        status.textContent = `${Math.round(fraction * 100)}% · ${note ?? ''}`
+      },
       onError: (m) => overlay.toast(m, 'error'),
       onShaderMessage: (m) => overlay.toast(m.text, m.kind === 'error' ? 'error' : 'info'),
       onDeviceLost: (r) => overlay.toast(`device lost: ${r}`, 'error'),
@@ -73,9 +77,9 @@ export async function benchView(root: HTMLElement, state: HashState): Promise<Vi
     cleanups.push(() => app.dispose())
     app.camera.inputEnabled = false
 
-    const spline = app.scene.splines[splineName]
+    const spline = app.splines[splineName]
     if (!spline) {
-      throw new Error(`unknown spline "${splineName}" — known: ${Object.keys(app.scene.splines).join(', ')}`)
+      throw new Error(`unknown spline "${splineName}" — known: ${Object.keys(app.splines).join(', ')}`)
     }
     const total = warmup + frames
     const duration = total / 60

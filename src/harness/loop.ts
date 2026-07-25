@@ -5,24 +5,12 @@ import { ShaderRegistry, type ShaderMessage } from '../gpu/shaders.ts'
 import { PassTimer, RollingStats, ScopedTimer, type FrameTiming } from '../gpu/timing.ts'
 import { VramTracker, type VramReport, type VramScope } from '../gpu/resources.ts'
 import { meshCatalog } from '../mesh/catalog.ts'
-import { standardBookmarks, loadUserBookmarks } from '../scene/bookmarks.ts'
 import { CameraController, poseMatrices, type CameraPose } from '../scene/camera.ts'
-import { BasePass } from '../scene/basePass.ts'
-import { FrameGroup } from '../scene/frameUbo.ts'
-import { Scatter } from '../scene/scatter.ts'
-import { SPECIES } from '../scene/species.ts'
-import { createStandBuffer, type Stand } from '../scene/stands.ts'
-import { builtinSplines } from '../scene/spline.ts'
-import { Terrain } from '../scene/terrain.ts'
+import { createFrameLayout, FrameGroup } from '../scene/frameUbo.ts'
+import type { CameraSpline } from '../scene/spline.ts'
 import { WIND_DEFAULTS } from '../scene/wind.ts'
-import type {
-  Experiment,
-  ExperimentContext,
-  FrameInfo,
-  RegistryEntry,
-  SceneServices,
-  ViewTargets,
-} from './registry.ts'
+import type { Stage, StageFactory } from './stage.ts'
+import type { Experiment, ExperimentContext, FrameInfo, RegistryEntry, ViewTargets } from './registry.ts'
 import { paramDefaults, paramsFromQuery, type ParamSchema, type ParamValues } from './params.ts'
 
 export const DEPTH_FORMAT: GPUTextureFormat = 'depth32float'
@@ -54,12 +42,22 @@ export interface Compositor {
 export interface LabAppOptions {
   canvas: HTMLCanvasElement
   seed: number
-  /** The placement setup every view on this page renders. */
-  stand: Stand
+  /**
+   * WHAT every view on this page draws around the experiments — the world of
+   * the shared @group(0), the base pass and the camera setup. `standStage(...)`
+   * is the groundcover scene; see src/harness/stage.ts.
+   */
+  stage: StageFactory
   experiments: { entry: RegistryEntry; ns: 'p' | 'a' | 'b'; query: URLSearchParams }[]
   onError: (message: string) => void
   onShaderMessage: (msg: ShaderMessage) => void
   onDeviceLost: (reason: string) => void
+  /**
+   * Long setup progress (0..1) — stage build, then one step per experiment,
+   * plus whatever an experiment reports through `ctx.progress`. A page-blocking
+   * bake otherwise shows nothing at all until it finishes.
+   */
+  onProgress?: (fraction: number, note?: string) => void
   /** Fixed timestep (s) — bench/diff/capture determinism. */
   fixedDt?: number
   /** Fixed canvas size (device px) — bench reproducibility. */
@@ -95,15 +93,24 @@ export class LabApp {
     readonly tracker: VramTracker,
     readonly shaders: ShaderRegistry,
     readonly timer: PassTimer,
-    readonly scene: SceneServices,
+    readonly stage: Stage,
     private frameGroup: FrameGroup,
-    private basePass: BasePass,
     private sceneScope: VramScope,
     readonly camera: CameraController,
     readonly views: ViewSlot[],
     private compositor: Compositor,
     private opts: LabAppOptions,
   ) {}
+
+  /** Named poses of the active stage, plus user bookmarks. Live-mutable. */
+  get bookmarks(): Record<string, CameraPose> {
+    return this.stage.bookmarks()
+  }
+
+  /** Named bench camera paths of the active stage. */
+  get splines(): Record<string, CameraSpline> {
+    return this.stage.splines()
+  }
 
   static async create(opts: LabAppOptions): Promise<LabApp> {
     const gpu = await createGpu({ onError: opts.onError, onDeviceLost: opts.onDeviceLost })
@@ -113,36 +120,44 @@ export class LabApp {
     const timer = tracker.exempt(() => new PassTimer(device, gpu.hasTimestamps, opts.timerRingSize ?? 4))
 
     const sceneScope = tracker.scope('scene')
-    const terrain = Terrain.generate(sceneScope, device.queue)
-    const standBuffer = createStandBuffer(sceneScope, device.queue, opts.stand)
-    const frameGroup = new FrameGroup(device, sceneScope, terrain, standBuffer)
-    const basePass = new BasePass(device, shaders, frameGroup.layout, gpu.format, DEPTH_FORMAT)
-    const scatter = new Scatter(terrain, opts.seed, opts.stand)
-    const scene: SceneServices = {
-      terrain,
-      scatter,
-      wind: WIND_DEFAULTS,
-      species: SPECIES,
-      bookmarks: { ...standardBookmarks(terrain), ...loadUserBookmarks() },
-      splines: builtinSplines(terrain),
-    }
+    // ONE layout object, shared by the stage's base pass, the FrameGroup and
+    // every experiment's pipelines — see FRAME_LAYOUT_ENTRIES (frozen).
+    const frameLayout = createFrameLayout(device)
+    opts.onProgress?.(0, 'building stage')
+    const stage = opts.stage({
+      device,
+      queue: device.queue,
+      scope: sceneScope,
+      shaders,
+      frameLayout,
+      colorFormat: gpu.format,
+      depthFormat: DEPTH_FORMAT,
+      ...(opts.onProgress && { onProgress: opts.onProgress }),
+    })
+    const frameGroup = new FrameGroup(
+      device, sceneScope, frameLayout, stage.heightmapView, stage.standBuffer, stage.terrainDims,
+    )
 
-    const camera = new CameraController(opts.initialPose ?? scene.bookmarks['grazing']!)
+    const camera = new CameraController(opts.initialPose ?? stage.defaultPose)
+    camera.mode = stage.cameraMode
     camera.attach(opts.canvas)
     const canvasCtx = configureCanvas(gpu, opts.canvas)
 
     const app = new LabApp(
-      gpu, opts.canvas, canvasCtx, tracker, shaders, timer, scene, frameGroup, basePass,
+      gpu, opts.canvas, canvasCtx, tracker, shaders, timer, stage, frameGroup,
       sceneScope, camera, [], null as unknown as Compositor, opts,
     )
 
     app.updateSize()
-    for (const req of opts.experiments) {
+    const count = opts.experiments.length
+    for (const [i, req] of opts.experiments.entries()) {
+      opts.onProgress?.((i + 1) / (count + 1), `loading ${req.entry.id}`)
       app.views.push(await app.createView(req.entry, req.ns, req.query))
     }
+    opts.onProgress?.(1, 'ready')
     app.setCompositor(new BlitCompositor(device, shaders, gpu.format))
     shaders.onReload(() => {
-      basePass.rebuild()
+      stage.rebuild()
       app.compositor.rebuild?.()
     })
     return app
@@ -161,16 +176,16 @@ export class LabApp {
       device: this.gpu.device,
       colorFormat: this.gpu.format,
       depthFormat: DEPTH_FORMAT,
-      scene: this.scene,
+      ...this.stage.contextFor(name),
       frame: { layout: this.frameGroup.layout, bindGroup: this.frameGroup.bindGroup },
       res: scope,
       shaders: this.shaders,
       timing: new ScopedTimer(this.timer, name === 'solo' ? '' : `${name}/`),
       params,
       seed: this.opts.seed,
-      stand: this.opts.stand,
       meshes: meshCatalog,
       size: () => ({ width: app.width, height: app.height }),
+      progress: (fraction, note) => this.opts.onProgress?.(fraction, note),
     }
     const module = await manifest.load()
     const experiment = await module.create(ctx)
@@ -264,7 +279,7 @@ export class LabApp {
       time: this.time,
       dt,
       frameIndex: this.frameIndex,
-      wind: this.scene.wind,
+      wind: WIND_DEFAULTS,
       viewport: [this.width, this.height],
       debugMode: this.debugMode,
     })
@@ -274,7 +289,7 @@ export class LabApp {
       dt,
       deterministic: this.opts.fixedDt !== undefined,
       camera: { pose, ...matrices },
-      wind: this.scene.wind,
+      wind: WIND_DEFAULTS,
     }
 
     for (const view of this.views) view.experiment.update?.(frame)
@@ -284,10 +299,12 @@ export class LabApp {
 
     const first = this.views[0]
     if (first) {
-      this.basePass.encode(enc, this.timer, this.frameGroup.bindGroup, first.colorView, first.depthView)
+      this.stage.encodeBase(enc, this.timer, this.frameGroup.bindGroup, first.colorView, first.depthView)
       const second = this.views[1]
       if (second) {
-        // Bit-identical base inputs for B — the fairness invariant.
+        // Bit-identical base inputs for B — the fairness invariant. It lives
+        // HERE, never in a Stage: the stage encodes the base pass once, and the
+        // harness guarantees both sides start from the same pixels.
         enc.copyTextureToTexture({ texture: first.color }, { texture: second.color }, [this.width, this.height])
         enc.copyTextureToTexture({ texture: first.depth }, { texture: second.depth }, [this.width, this.height])
       }
@@ -351,6 +368,7 @@ export class LabApp {
       view.scope.dispose()
     }
     this.compositor?.dispose?.()
+    this.stage.dispose()
     this.sceneScope.dispose()
     this.timer.dispose()
     this.gpu.device.destroy()

@@ -8,6 +8,7 @@ import { captureViewPng, downloadBlob, uploadCapture } from '../capture.ts'
 import { fetchRating, saveRating } from '../ratings.ts'
 import { pipsRow } from '../../ui/pips.ts'
 import { LabApp } from '../loop.ts'
+import { standStage } from '../stage.ts'
 import { paramsToQuery } from '../params.ts'
 import { findExperiment } from '../registry.ts'
 import {
@@ -58,13 +59,21 @@ export async function runView(root: HTMLElement, state: HashState): Promise<View
     content.appendChild(viewer)
     page.appendChild(content)
 
+    // Plain status line while the page starts — a multi-minute bake otherwise
+    // shows nothing at all. Removed as soon as the app exists.
+    const status = el('div', 'hud', 'starting…')
+    viewer.appendChild(status)
+
     const det = state.q.get('det') === '1'
     const t = Number(state.q.get('t'))
     const app = await LabApp.create({
       canvas,
       seed,
-      stand,
+      stage: standStage(stand, seed),
       experiments: [{ entry, ns: 'p', query: state.q }],
+      onProgress: (fraction, note) => {
+        status.textContent = `${Math.round(fraction * 100)}% · ${note ?? ''}`
+      },
       onError: (m) => overlay.toast(m, 'error'),
       onShaderMessage: (m) =>
         overlay.toast(m.text, m.kind === 'error' ? 'error' : 'info', m.kind === 'error' ? 10000 : 2500),
@@ -75,13 +84,14 @@ export async function runView(root: HTMLElement, state: HashState): Promise<View
       ...(det && { fixedDt: 1 / 60 }),
     })
     cleanups.push(() => app.dispose())
+    status.remove()
     const view = app.views[0]!
 
     for (const [name, poseStr] of Object.entries(manifest.cams ?? {})) {
       const pose = parsePose(poseStr)
-      if (pose) app.scene.bookmarks[name] = pose
+      if (pose) app.bookmarks[name] = pose
     }
-    const { pose } = resolveCam(state.q, app.scene.bookmarks)
+    const { pose } = resolveCam(state.q, app.bookmarks)
     if (pose) app.camera.setPose(pose)
     if (det && Number.isFinite(t)) {
       app.time = t
