@@ -56,10 +56,42 @@ fn scatter_wetness(seed: u32, xz: vec2f) -> f32 {
   return clamp(n * (0.30 + 0.70 * flat), 0.0, 1.0);
 }
 
+// Zone boundaries get a little positional jitter so neighbouring carpet zones
+// interlock like real vegetation instead of meeting along a clean contour.
+const CARPET_JITTER: f32 = 0.06;
+const QUARTER_TURN: f32 = 1.5707963;
+
 fn scatter_candidate(seed: u32, entry_index: u32, cell: vec2i, i: u32) -> ScatterPoint {
   var out: ScatterPoint;
   let entry = stand_table[entry_index];
   let h = hash4(seed, bitcast<u32>(cell.x), bitcast<u32>(cell.y), (entry_index << 16u) ^ i);
+
+  // --- Carpet layout: seamless mat of periodic tiles ------------------------
+  if (entry.carpet_div > 0.0) {
+    let n = u32(entry.carpet_div);
+    if (i >= n * n) {
+      out.exists = false;
+      return out;
+    }
+    let step = SCATTER_CELL_SIZE / entry.carpet_div;
+    let g = vec2f(f32(i % n), f32(i / n));
+    let xz = vec2f(cell) * SCATTER_CELL_SIZE + (g + 0.5) * step;
+    let jitter = (hash_f32(hash2(h, 7u)) - 0.5) * CARPET_JITTER;
+    let w = clamp(scatter_wetness(seed, xz) + jitter, 0.0, 0.9999);
+    let lo = entry.wet_center - entry.wet_width * 0.5;
+    let hi = entry.wet_center + entry.wet_width * 0.5;
+    out.exists = (w >= lo) && (w < hi);
+    out.pos = vec3f(xz.x, terrain_height(xz), xz.y);
+    // 90-degree steps only — a square periodic tile stays seamless under
+    // quarter turns, and full rotations are exactly what makes a mat read as
+    // scattered confetti.
+    out.yaw = f32(h & 3u) * QUARTER_TURN;
+    // Constant scale, sized by the builder so the tile exactly fills `step`.
+    out.scale = entry.scale_min;
+    out.phase = 0.0;
+    return out;
+  }
+
   let density = min(entry.density, SCATTER_MAX_DENSITY);
   out.exists = hash_f32(hash2(h, 0u)) < density / SCATTER_MAX_DENSITY;
   let ox = hash_f32(hash2(h, 1u));

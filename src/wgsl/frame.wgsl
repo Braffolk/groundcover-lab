@@ -44,6 +44,18 @@ struct StandEntry {
   // disables it entirely (uniform cover, the historical behaviour).
   wet_center: f32,
   wet_width: f32,
+  // Carpet layout. >0 lays this species out as a SEAMLESS MAT: carpet_div x
+  // carpet_div periodic tiles per scatter cell, grid-snapped, constant scale,
+  // and rotated only in 90-degree steps — the three things a periodic square
+  // tile needs to abut its neighbours invisibly. 0 = ordinary per-plant
+  // scatter. In carpet mode wet_center/wet_width are read as a half-open
+  // interval [c - w/2, c + w/2) and the carpet entries PARTITION the wetness
+  // axis, so exactly one of them claims each grid node and the mat has no
+  // holes.
+  carpet_div: f32,
+  _pad0: f32,
+  _pad1: f32,
+  _pad2: f32,
 }
 
 @group(0) @binding(0) var<uniform> frame: Frame;

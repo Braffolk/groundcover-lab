@@ -25,6 +25,8 @@ const TWO_PI = fround(6.2831853)
 const WET_CELL = 12
 const WET_SALT = 0x9e37
 const WET_SLOPE_SQ = fround(0.3276)
+const CARPET_JITTER = fround(0.06)
+const QUARTER_TURN = fround(1.5707963)
 
 export interface ScatterPoint {
   x: number
@@ -105,6 +107,33 @@ export class Scatter {
     const wetWidth = e.wetWidth ?? 0
     const wetCenter = e.wetCenter ?? 0
     const out: ScatterPoint[] = []
+
+    // Carpet layout — mirror of the carpet branch in scatter.wgsl.
+    const div = e.carpetDiv ?? 0
+    if (div > 0) {
+      const step = fround(SCATTER_CELL_SIZE / div)
+      const lo = fround(wetCenter - fround(wetWidth * 0.5))
+      const hi = fround(wetCenter + fround(wetWidth * 0.5))
+      for (let i = 0; i < div * div; i++) {
+        const h = hash4(this.seed, asU32(cx), asU32(cz), ((entryIndex << 16) ^ i) >>> 0)
+        const x = fround(fround(cx * SCATTER_CELL_SIZE) + fround(fround((i % div) + 0.5) * step))
+        const z = fround(fround(cz * SCATTER_CELL_SIZE) + fround(fround(Math.floor(i / div) + 0.5) * step))
+        const jitter = fround(fround(hashF32(hash2(h, 7)) - 0.5) * CARPET_JITTER)
+        const w = Math.min(Math.max(fround(this.wetness(x, z) + jitter), 0), 0.9999)
+        if (!(w >= lo && w < hi)) continue
+        out.push({
+          x,
+          y: this.terrain.height(x, z),
+          z,
+          yaw: fround((h & 3) * QUARTER_TURN),
+          scale: e.scaleMin,
+          phase: 0,
+          entry: entryIndex,
+        })
+      }
+      return out
+    }
+
     for (let i = 0; i < SCATTER_MAX_PER_CELL; i++) {
       const h = hash4(this.seed, asU32(cx), asU32(cz), ((entryIndex << 16) ^ i) >>> 0)
       if (hashF32(hash2(h, 0)) >= threshold) continue

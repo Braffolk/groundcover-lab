@@ -1,5 +1,5 @@
 import type { VramScope } from '../gpu/resources.ts'
-import { SCATTER_MAX_DENSITY } from './scatter.ts'
+import { SCATTER_CELL_SIZE, SCATTER_MAX_DENSITY, SCATTER_MAX_PER_CELL } from './scatter.ts'
 import { speciesById } from './species.ts'
 
 /**
@@ -33,6 +33,22 @@ export interface StandSpecies {
    */
   wetCenter?: number
   wetWidth?: number
+  /**
+   * Lay this species out as a SEAMLESS CARPET rather than scattering it:
+   * `carpetDiv` × `carpetDiv` periodic tiles per 4m scatter cell, grid-snapped
+   * at constant scale with 90°-only rotations, which is what a periodic square
+   * tile needs to abut its neighbours invisibly. Requires the species to have
+   * `tileM`; `scaleMin`/`scaleMax` are then computed for you so a tile exactly
+   * fills its grid step, and are ignored if you set them.
+   *
+   * In carpet mode wetCenter/wetWidth become a half-open interval
+   * [c - w/2, c + w/2) instead of a soft falloff, and carpet entries sharing a
+   * grid must PARTITION [0,1) so exactly one claims each node — otherwise the
+   * mat gets holes (gaps) or double-stacked tiles (overlaps).
+   *
+   * carpetDiv² must not exceed SCATTER_MAX_PER_CELL (128), so div ≤ 11.
+   */
+  carpetDiv?: number
 }
 
 export interface Stand {
@@ -124,13 +140,15 @@ export const STANDS: readonly Stand[] = [
       'Sphagnum palustre in its three micro-habitat states zoned across the wetness field — vigorous moss in the wet hollows, late-season on the flanks, sun-exposed on the dry hummock crests — with Calamagrostis canescens scattered through the wet hollows and a trace of Poa on the driest crests. ~460k plants over ±96m.',
     radius: 96,
     species: [
-      // Sphagnum carpet. The three states share the wetness axis, and their
-      // bands overlap so neighbouring zones intergrade instead of tiling.
-      // Scaled up because a 0.18m tile at the 8/m² scatter cap would otherwise
-      // leave gaps between cushions.
-      { ...WET_MOSS, density: 8, wetCenter: 0.82, wetWidth: 0.42 },
-      { ...MID_MOSS, density: 8, wetCenter: 0.5, wetWidth: 0.38 },
-      { ...DRY_MOSS, density: 8, wetCenter: 0.16, wetWidth: 0.44 },
+      // Sphagnum carpet: one continuous mat, laid out on an 11x11 grid per
+      // scatter cell so the periodic tiles abut exactly, with 90°-only
+      // rotations for variation. The three states PARTITION the wetness axis
+      // into thirds, so every grid node is claimed by exactly one of them —
+      // no gaps, no double-stacking — and the boundary jitter in the scatter
+      // makes the zones interlock.
+      { ...WET_MOSS, density: 8, carpetDiv: 11, wetCenter: 5 / 6, wetWidth: 1 / 3 },
+      { ...MID_MOSS, density: 8, carpetDiv: 11, wetCenter: 0.5, wetWidth: 1 / 3 },
+      { ...DRY_MOSS, density: 8, carpetDiv: 11, wetCenter: 1 / 6, wetWidth: 1 / 3 },
       // Calamagrostis canescens is genuinely a fen / wet-meadow grass, so it
       // belongs in the hollows — sparse, emergent above the carpet.
       { ...CALAMAGROSTIS, density: 1.4, wetCenter: 0.78, wetWidth: 0.26 },
@@ -152,6 +170,24 @@ export const STANDS: readonly Stand[] = [
   },
 ]
 
+/**
+ * Constant tile scale for a carpet entry: the periodic tile must exactly fill
+ * its grid step, or the mat shows seams (too small) or overlaps (too large).
+ * Returns null for ordinary scattered entries.
+ */
+export function carpetScale(entry: StandSpecies): { min: number; max: number } | null {
+  if (!entry.carpetDiv || entry.carpetDiv <= 0) return null
+  const species = speciesById(entry.species)
+  if (species.tileM === undefined) {
+    throw new Error(`stand entry "${entry.species}" uses carpetDiv but the species has no periodic tileM`)
+  }
+  if (entry.carpetDiv ** 2 > SCATTER_MAX_PER_CELL) {
+    throw new Error(`carpetDiv ${entry.carpetDiv} needs ${entry.carpetDiv ** 2} slots, over the ${SCATTER_MAX_PER_CELL} cap`)
+  }
+  const s = SCATTER_CELL_SIZE / entry.carpetDiv / species.tileM
+  return { min: s, max: s }
+}
+
 export function standById(id: string): Stand {
   const stand = STANDS.find((s) => s.id === id)
   if (!stand) throw new Error(`unknown stand "${id}" — known: ${STANDS.map((s) => s.id).join(', ')}`)
@@ -168,7 +204,12 @@ export function standPlantCounts(stand: Stand): { total: number; bySpecies: { sp
   const area = (stand.radius * 2) ** 2
   const bySpecies = stand.species.map((e) => {
     const band = e.wetWidth === undefined || e.wetWidth <= 0 ? 1 : Math.min(1, e.wetWidth)
-    return { species: e.species, count: Math.min(e.density, SCATTER_MAX_DENSITY) * area * band }
+    // Carpet coverage comes from the grid, not from `density`: div² tiles per
+    // scatter cell, of which the entry's wetness interval claims `band`.
+    const perM2 = e.carpetDiv
+      ? e.carpetDiv ** 2 / SCATTER_CELL_SIZE ** 2
+      : Math.min(e.density, SCATTER_MAX_DENSITY)
+    return { species: e.species, count: perM2 * area * band }
   })
   return { total: bySpecies.reduce((a, e) => a + e.count, 0), bySpecies }
 }
@@ -179,21 +220,26 @@ export function standPlantCounts(stand: Stand): { total: number; bySpecies: { sp
  * wetCenter, wetWidth.
  */
 export function createStandBuffer(scope: VramScope, queue: GPUQueue, stand: Stand): GPUBuffer {
-  const data = new Float32Array(stand.species.length * 8)
+  const data = new Float32Array(stand.species.length * 12)
   stand.species.forEach((entry, i) => {
     const species = speciesById(entry.species)
+    const scale = carpetScale(entry) ?? { min: entry.scaleMin, max: entry.scaleMax }
     data.set(
       [
         entry.density,
-        entry.scaleMin,
-        entry.scaleMax,
+        scale.min,
+        scale.max,
         entry.sway,
         species.heightScale,
         species.index,
         entry.wetCenter ?? 0,
         entry.wetWidth ?? 0,
+        entry.carpetDiv ?? 0,
+        0,
+        0,
+        0,
       ],
-      i * 8,
+      i * 12,
     )
   })
   const buffer = scope.createBuffer(
