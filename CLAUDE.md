@@ -2,16 +2,35 @@
 
 TypeScript only. No `.js`/`.mjs` files anywhere, including tools. All tooling is browser-first.
 
+## Experiment KINDS
+
+Experiments come in kinds, and the rules below split into a shared core (everything
+outside the per-kind sections — it binds you whatever you are building) and the
+rules for your kind.
+
+- **renderer** — draws the plants of a stand. The original kind; everything in
+  "Renderer rules" applies.
+- **material** — a surface material: channels authored as an inspectable graph
+  plus WGSL for the parallax/BRDF behaviour, previewed on standard geometry.
+  *(Being built now. Until its section here exists, do not start one.)*
+- **reference** — a stand-independent visual baseline (000-ground-truth).
+
+**Carpets are DEPRECATED.** A tiled ground mat is a *material*, not a species of
+plant, and forcing both through one renderer generalised badly: nearly every
+renderer in the repo independently mis-sized its enumeration loop and drew a
+quarter of the mat. The machinery still exists and is marked `@deprecated`; no
+stand uses it. Do not build anything new on it, and do not "fix" it.
+
 ## Adding an experiment (the only sanctioned workflow)
 
 1. `npm run new -- your-slug` → creates `experiments/<nnn>-your-slug/` from `_template`.
 2. Edit ONLY files inside your experiment directory. Never renumber; your ID is the full directory name.
-3. Run it: `npm run dev` → `http://localhost:5173/#/run/<your-id>`.
+3. Run it: `npm run dev` → `http://localhost:5175/#/run/<your-id>`.
 
 Allowed write paths: your experiment dir, `mesh/baked/<your-id>/`, `results/` (new files only), `goldens/<your-id>/`. Exception inside your own dir: `rating.json` is the OWNER'S visual verdict — never create, edit, or delete it.
 Forbidden: `src/**`, other experiments, `package.json`, any shared file. If the harness is missing something you need, write the need into your `NOTES.md` instead of patching shared code.
 
-## Experiment rules
+## Renderer rules
 
 - Import only from `@harness` (plus your own files). Set `harnessApi` in your manifest.
 - The harness owns device/canvas/camera/terrain/scatter/wind and draws the terrain+sky base pass. You append compute/render passes via `ctx.timing.renderPass/computePass` (auto-timed) with `loadOp: 'load'` against the provided color/depth targets.
@@ -37,13 +56,10 @@ Forbidden: `src/**`, other experiments, `package.json`, any shared file. If the 
   2. rigid tilt from a plane fit over the footprint — better once the footprint spans real relief, and the fit height avoids chasing one sample;
   3. per-vertex conforming — evaluate the height under each vertex and displace, so a patch actually follows a bump instead of hovering over it;
   4. warping the query itself — for ray/volume methods, bend the ray or the lookup coordinate by the local ground shape.
-  Do not assume level 1 is enough because it happens to suffice on the current terrain: that terrain is one arbitrary sample, and these methods are meant to generalise across regimes. If you deliberately choose a cheap level, say why in NOTES.md. Test on the `bog` stand across its ridged slopes, and use the `carpet-close` camera bookmark (1m straight down) to judge tile-level detail — URL `cam=x,y,z,...` poses are ABSOLUTE and the terrain sits several metres below y=0, so a hand-written "y=2" is not 2m above ground.
+  Do not assume level 1 is enough because it happens to suffice on the current terrain: that terrain is one arbitrary sample, and these methods are meant to generalise across regimes. If you deliberately choose a cheap level, say why in NOTES.md. Test across the terrain's ridged slopes, and use the `carpet-close` camera bookmark (1m straight down) to judge ground-level detail — URL `cam=x,y,z,...` poses are ABSOLUTE and the terrain sits several metres below y=0, so a hand-written "y=2" is not 2m above ground.
   For per-vertex conforming, `terrain_sample(xz)` is usually the primitive you want: it returns height **and** (nx, nz) from a single bilinear fetch, whereas calling `terrain_height` and `terrain_normal` (or `plant_basis`, which re-fetches internally) pays for the same taps twice. Note also that a per-tile plane fit is not merely cheaper than per-vertex — for a tiled species it is *wrong*, because neighbouring tiles fit different planes and crack apart at their shared edge; only per-vertex keeps the surface continuous.
-- **Carpet entries have MORE slots per cell than the scatter budget.** A carpet has exactly `carpetDiv²` slots per 4m cell — 484 for the bog moss, deliberately over `SCATTER_MAX_PER_CELL` (128), because div 22 is what puts a 0.18m tile at life size. Size buffers and drive enumeration loops from `standEntrySlots(entry)` (exported from `@harness`) or from `stand_table[i].carpet_div²`, NEVER from `SCATTER_MAX_PER_CELL`: hardcoding 128 renders roughly a quarter of the mat and leaves holes that look like a placement bug. Life size also means ~4x as many moss tiles as a 2x-oversized mat would need, so distance aggregation matters.
-- **Preserve the lattice of a carpet.** When `stand_table[i].carpet_div > 0` the species is a tiled mat, and what makes it a mat rather than confetti is that every tile shares one grid spacing and one rotation set. So the invariant is: **rotation only in 90° steps** (the only rotation under which a square periodic tile still matches its neighbours) and **scale identical for every tile of that species**. What breaks it, and has been seen breaking it: billboarding tiles to face the camera, continuous per-tile yaw, per-plant scale jitter, and shrinking with distance for LOD — anything where neighbouring tiles stop agreeing.
-  Within that invariant, a tiling trick is allowed only where it is actually needed and demonstrably artifact-free. A *uniform* overscale of every tile is permissible in principle — the grid spacing is untouched and each tile simply covers more than its cell, which is how the mesh's own overflow already works (0.24m of geometry inside a 0.18m period) — but it is NOT a default and must not be assumed to help. Measured at ×1.15 and ×1.35 on a flat single-plane tile it was clearly worse: a plane has no thickness to hide an overlap in, so every overlapped edge paints a dark line and the field becomes a chicken-wire lattice at grazing. Prove it helps at grazing and at the `carpet-close` bookmark, or leave it at 1.0. The invariant test remains "do neighbouring tiles still agree".
-  Also **do not represent a mat with vertical cards**: a flat carpet seen edge-on is almost nothing, and vertical cards slice through the ground and each other. Ground-parallel, terrain-conforming geometry is the sane default. If your technique fundamentally requires camera-facing geometry or per-plant scale, it cannot render a tiled carpet faithfully — say so in NOTES.md instead of silently breaking it.
-- **Never derive a plant's width from `height_scale`.** It happens to look fine for tall grasses, but a ground carpet (Sphagnum: 0.07m tall, 0.24m wide) comes out ~3.5x too small and a mat that should be closed shows gaps. Use `stand_table[i].footprint_m` (the species' horizontal footprint at scale 1) or extents you measured in your own bake. Test against the `bog` stand, which is mostly carpet.
+- **DEPRECATED (carpets).** Two traps lived here — that a carpet had more slots per cell than `SCATTER_MAX_PER_CELL`, and that a tiled mat must keep one grid spacing, 90°-only rotations and one constant scale. No stand uses carpets now. What still transfers, and is the reason these are kept at all: **drive every enumeration loop and buffer capacity from `standEntrySlots(entry)`, never from a hardcoded `SCATTER_MAX_PER_CELL`** — hardcoding the constant is what made ~74% of the mat silently vanish in nearly every renderer, and a renderer that asks the entry stays correct if the budget ever changes.
+- **Never derive a plant's width from `height_scale`.** It happens to look fine for tall grasses, but anything short and wide comes out badly undersized — a 0.07m-tall, 0.24m-wide ground cushion came out ~3.5x too small, leaving gaps in what should have been closed cover. Use `stand_table[i].footprint_m` (the species' horizontal footprint at scale 1) or extents you measured in your own bake.
 
 ## WGSL gotchas
 
