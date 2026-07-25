@@ -58,6 +58,33 @@ Your test scene: `http://localhost:5175/#/run/{{ID}}?stand=bog`
   but renders as flat blocky squares with no visible moss structure, because its
   atlas texel density for a 0.36 m tile is low. Beating that is a low bar. A/B against it: `#/ab/001-billboard-smoke/{{ID}}?stand=bog`.
 
+## A worked example exists — read it
+
+`001-billboard-smoke` has already been through this task. Read its carpet path
+(`main.ts`, `shaders/cull.wgsl`, `shaders/cards.wgsl`) and its `NOTES.md` before
+starting. You are not obliged to copy it — a different representation may want a
+different answer — but these findings transferred:
+
+- A carpet entry drew **one ground-parallel, tile-sized quad** and skipped the
+  camera-facing card entirely (6 verts instead of 12).
+- The top-view texture was **cropped to the tile's own square** in the mesh
+  frame, which multiplied on-screen texel density ~4x. Tile origin is `(0,0)` in
+  the mesh frame for every current source mesh — treat that as a guarantee.
+- The grass alpha reference (0.4) **punched holes in the mat**: tile alpha is
+  ~80% solid up close, but the mip chain pulls it toward the whole tile's mean
+  (27–37% covered), so distant tiles failed the test entirely. A carpet-specific
+  reference (0.06) made the mat a solid depth-writing occluder.
+- **No camera-inside fade for a carpet** — a mat you are standing on must not
+  open a hole under you.
+- Overlapping coplanar tiles z-fight; a sub-millimetre phase-based depth bias
+  fixed it. Note this only arises if you overscale.
+
+Its honest verdict, worth knowing before you start: a single flat quad reads as
+very good moss *texture on the ground* down to ~0.4m, but a card has no
+thickness — no silhouette, no cushion parallax — so the mesh's 3.3cm of
+capitulum relief is entirely lost. If your representation can express thickness,
+that is where it can beat the reference.
+
 ## Failure modes observed across renderers — check for these first
 
 1. **Cards stood upright.** Upright cards for a low cushion slice through the
@@ -94,8 +121,18 @@ capacity from `standEntrySlots(entry)` (exported from `@harness`) or from
 `stand_table[i].carpet_div²` — **never** from `SCATTER_MAX_PER_CELL`. Hardcoding
 128 renders about a quarter of the mat and leaves holes that look exactly like a
 placement bug. Life size also means ~4x as many moss tiles as an oversized mat
-would need, so if your renderer has no distance aggregation, this is where it
-will show.
+would need (~1.13M on the bog stand), so if your renderer has no distance
+aggregation, this is where it will show.
+
+**Do not conflate "slots to evaluate" with "instances to store".** This bit the
+pilot hard. Many renderers carry a density-scaled slot count
+(`SCATTER_MAX_PER_CELL * density/8`) and use it for buffer capacity, which is
+correct — but if you also drive your cull dispatch from it, you visit only that
+fraction of the slots and the rest of the plants silently vanish (in the pilot,
+22 of 128 slots for calamagrostis, so ~83% of the grass disappeared). Keep two
+numbers: **every** slot must be evaluated, while capacity only needs the
+expected survivors — for a zone-partitioned carpet that is roughly `wetWidth` of
+the slots, so sizing capacity for all 484 wastes about 3x the memory.
 
 ## The lattice invariant
 
