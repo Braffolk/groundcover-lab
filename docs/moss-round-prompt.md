@@ -94,12 +94,18 @@ field visibly falls apart into separate rotated patches. So, when
 - rotation **only in 90° steps**;
 - scale **identical for every tile** of that species.
 
-Within that invariant, tricks aimed at better tiling are welcome. A *uniform*
-overscale of every tile (say ×1.1) to deepen overlap and hide seams at grazing
-angles is legitimate and encouraged — grid spacing is untouched and each tile
-simply covers more than its cell, which is how the source mesh's own overflow
-already works (0.24 m of geometry inside a 0.18 m period). The test is not "did
-you change the number" but **"do neighbouring tiles still agree"**.
+Within that invariant, a tiling trick is permitted **only where it is actually
+needed and demonstrably artifact-free**. A *uniform* overscale of every tile is
+allowed in principle — grid spacing is untouched and each tile simply covers
+more than its cell, which is how the source mesh's own overflow already works
+(0.24 m of geometry inside a 0.18 m period). It is **not** a default, and it is
+not assumed to help: the pilot measured ×1.15 and ×1.35 as clearly *worse*,
+because a single flat plane has no thickness to hide an overlap in, so every
+overlapped edge painted a dark line and the field became a chicken-wire lattice
+at grazing. If you reach for overscale, prove at both grazing and
+`cam=carpet-close` that it removes more artifact than it introduces, and leave
+it at 1.0 otherwise. The invariant test remains **"do neighbouring tiles still
+agree"**.
 
 ## Fitting to the terrain — your choice of fidelity
 
