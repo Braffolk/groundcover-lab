@@ -4,9 +4,16 @@ import type { ExperimentContext, GcMesh } from '@harness'
 /**
  * Per-species card-proxy bake: two orthographic captures of the source mesh
  * (one SIDE view along +Z, one TOP view along -Y), each 256x256, into two
- * atlases: albedo (rgb + coverage) and normal (plant-local octahedral in rg).
+ * atlases: albedo (rgb + coverage) and normal (plant-local UNIT NORMAL in rgb,
+ * n * 0.5 + 0.5, flipped into the hemisphere around that view's capture axis).
  * These two tiles are the ONLY per-species imagery the runtime ever touches —
  * the source mesh is never processed again after this one-time bake.
+ *
+ * v4 replaced v3's raw octahedral rg normal. Averaging octahedral codes of a
+ * blade's two opposing faces cancels to (0,0), which decodes to exactly
+ * (0,1,0) — and since every cached cluster samples mip 1.5-3.5, that made the
+ * entire far field light with a straight-up normal (flat, blown out, no sun
+ * gradient). A flipped plain vector averages linearly and cannot cancel.
  *
  * Covered texels are dilated into empty neighbours on the CPU so runtime
  * bilinear taps never blend toward black. A CPU mip chain (alpha-weighted)
@@ -17,7 +24,7 @@ export const TILE = 256
 export const ATLAS_W = TILE * 2
 export const ATLAS_H = TILE
 export const MIPS = 6
-export const BAKE_VERSION = 3
+export const BAKE_VERSION = 4
 const MAGIC = 0x31434343 // 'CCC1'
 const HEADER_BYTES = 64
 
@@ -35,8 +42,9 @@ export interface CardsMeta {
 
 export interface CardsBaked {
   meta: CardsMeta
-  albedo: Uint8Array // ATLAS_W * ATLAS_H * 4
-  normal: Uint8Array // ATLAS_W * ATLAS_H * 4
+  albedo: Uint8Array // ATLAS_W * ATLAS_H * 4 — rgb = albedo, a = coverage
+  /** ATLAS_W * ATLAS_H * 4 — rgb = plant-local unit normal * 0.5 + 0.5. */
+  normal: Uint8Array
 }
 
 export function packCards(b: CardsBaked): ArrayBuffer {

@@ -11,6 +11,12 @@ export interface Gpu {
   device: GPUDevice
   /** timestamp-query granted — per-pass GPU timing available. */
   hasTimestamps: boolean
+  /**
+   * indirect-first-instance granted — a non-zero firstInstance in
+   * draw*Indirect is legal. When false, such a draw is silently DISCARDED;
+   * bind a per-batch slice instead of relying on firstInstance.
+   */
+  hasIndirectFirstInstance: boolean
   /** Preferred canvas format; also used for all offscreen color targets. */
   format: GPUTextureFormat
   info: GpuInfo
@@ -29,9 +35,15 @@ export async function createGpu(handlers: GpuHandlers): Promise<Gpu> {
   if (!adapter) throw new Error('No WebGPU adapter available.')
 
   const hasTimestamps = adapter.features.has('timestamp-query')
-  const device = await adapter.requestDevice({
-    requiredFeatures: hasTimestamps ? ['timestamp-query'] : [],
-  })
+  // 'indirect-first-instance' is opt-in, and without it WebGPU SILENTLY drops
+  // any indirect draw with a non-zero firstInstance — the scene still renders,
+  // just missing whole batches, which has already cost two experiments a
+  // wrong result. Request it whenever the adapter offers it.
+  const hasIndirectFirstInstance = adapter.features.has('indirect-first-instance')
+  const features: GPUFeatureName[] = []
+  if (hasTimestamps) features.push('timestamp-query')
+  if (hasIndirectFirstInstance) features.push('indirect-first-instance')
+  const device = await adapter.requestDevice({ requiredFeatures: features })
 
   device.onuncapturederror = (ev) => handlers.onError(ev.error.message)
   void device.lost.then((info) => {
@@ -50,7 +62,14 @@ export async function createGpu(handlers: GpuHandlers): Promise<Gpu> {
         .replace(/^-+|-+$/g, '') || 'unknown',
   }
 
-  return { adapter, device, hasTimestamps, format: navigator.gpu.getPreferredCanvasFormat(), info }
+  return {
+    adapter,
+    device,
+    hasTimestamps,
+    hasIndirectFirstInstance,
+    format: navigator.gpu.getPreferredCanvasFormat(),
+    info,
+  }
 }
 
 export function configureCanvas(gpu: Gpu, canvas: HTMLCanvasElement): GPUCanvasContext {

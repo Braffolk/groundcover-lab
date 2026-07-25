@@ -11,7 +11,7 @@ import {
   unpackCards,
   type CardsBaked,
 } from './bake.ts'
-import { DEBUG_VIEW_MODES, asU32, commitBake, hash3, hashF32, speciesById } from '@harness'
+import { DEBUG_VIEW_MODES, assetUrl, asU32, commitBake, hash3, hashF32, speciesById } from '@harness'
 import type { DebugViewMode, Experiment, ExperimentContext, FrameInfo, ViewTargets } from '@harness'
 import type { PARAMS } from './manifest.ts'
 
@@ -144,7 +144,7 @@ interface Slot {
   camZ: number
   lastVisible: number
   valid: boolean
-  /** Debug-view generation this slot's imagery was reconstructed under. */
+  /** Shading generation (debug view + grounding) this slot was built under. */
   epoch: number
   meta: Float32Array // 32 floats, matches SlotMeta in composite.wgsl
   vp: Float32Array
@@ -177,7 +177,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
     let b: CardsBaked | null = null
     // The dev server answers missing baked files with index.html — validate
     // magic/size ourselves rather than trusting the fetch.
-    const committed = await fetch(`/mesh/baked/${ctx.id}/${key}.bin`).catch(() => null)
+    const committed = await fetch(assetUrl(`/mesh/baked/${ctx.id}/${key}.bin`)).catch(() => null)
     if (committed?.ok) b = unpackCards(await committed.arrayBuffer())
     if (!b) {
       const mesh = await ctx.meshes.load(speciesById(speciesId).meshId)
@@ -491,7 +491,14 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
   let lastHash = ''
   let debugMode = 0
   let bakedDebug = 0
-  let debugEpoch = 0
+  /**
+   * Bumped whenever the shading baked into a slot would change (debug view
+   * selector or grounding depth) — every cached slot then counts as stale and
+   * re-reconstructs under the normal refresh budget while still drawing.
+   */
+  let shadeEpoch = 0
+  let baseShade = 0
+  let bakedShade = -1
   const readDebugMode = (): number => {
     const h = location.hash
     if (h === lastHash) return debugMode
@@ -633,10 +640,15 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       const frameIdx = frame.frameIndex
       const tau = ctx.params.refreshTau
       const directR = Math.min(ctx.params.directRadius, 48)
+      baseShade = ctx.params.baseShade
+      // The cache holds SHADED imagery, so anything that changes how a fragment
+      // is shaded has to re-reconstruct every slot: the debug view selector and
+      // the grounding depth both do.
       const dbg = readDebugMode()
-      if (dbg !== bakedDebug) {
+      if (dbg !== bakedDebug || baseShade !== bakedShade) {
         bakedDebug = dbg
-        debugEpoch++
+        bakedShade = baseShade
+        shadeEpoch++
       }
 
       // Live-camera frustum planes (left/right/bottom/top, Gribb-Hartmann).
@@ -732,7 +744,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
           drawSet.add(si)
           const err = Math.hypot(cam[0] - slot.camX, cam[1] - slot.camY, cam[2] - slot.camZ) / Math.max(leaf.dist, 1)
           // Stale on parallax error, or because the debug view changed under it.
-          const wrongView = slot.epoch !== debugEpoch
+          const wrongView = slot.epoch !== shadeEpoch
           if (err > tau || wrongView) scheduled.push({ leaf, priority: (wrongView ? 4 : err) * leaf.solid })
         } else {
           scheduled.push({ leaf, priority: leaf.solid * 4 })
@@ -796,7 +808,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
           slot.camY = cam[1]
           slot.camZ = cam[2]
           slot.valid = true
-          slot.epoch = debugEpoch
+          slot.epoch = shadeEpoch
           slot.lastVisible = frameIdx
           if (!leaf.sticky) drawSet.add(si)
           const s = S0 << leaf.level
@@ -857,6 +869,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         ringU[9] = NEAR_CAP
         ringU[10] = 0
         cardsData[20] = screenPxAngle
+        cardsData[23] = baseShade
       }
       refreshJobs.forEach((job, j) => {
         const o = ((j + 1) * RING_STRIDE) / 4
@@ -880,6 +893,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         cardsData[o + 20] = slot.pxAngle
         cardsData[o + 21] = 1.7 // min card px in the slot
         cardsData[o + 22] = job.base
+        cardsData[o + 23] = baseShade
 
         // Far clusters draw ONE card; the other two quads used to be emitted
         // and immediately clipped — 3x the vertex work on the biggest jobs.

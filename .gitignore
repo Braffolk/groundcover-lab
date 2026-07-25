@@ -15,3 +15,6 @@ mesh/raw/**/*.bin
 # anything over 100MB is rejected by GitHub outright.
 mesh/baked/005-octa-impostors/views-v2-11x512-*.bin
 mesh/baked/005-octa-impostors/views-v2-11x128-*.bin
+mesh/baked/008-relief-tap/views-v1-g5t256-calamagrostis-canescens.bin
+mesh/baked/008-relief-tap/views-v1-g5t256-elymus-repens.bin
+mesh/baked/008-relief-tap/views-v1-g5t256-poa-pratensis.bin

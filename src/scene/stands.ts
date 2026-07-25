@@ -235,7 +235,7 @@ export function createStandBuffer(scope: VramScope, queue: GPUQueue, stand: Stan
         entry.wetCenter ?? 0,
         entry.wetWidth ?? 0,
         entry.carpetDiv ?? 0,
-        0,
+        species.tileM ?? 0,
         0,
         0,
       ],

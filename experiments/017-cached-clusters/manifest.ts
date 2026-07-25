@@ -11,6 +11,13 @@ export const PARAMS = {
   /** Freeze all cache refreshes to inspect staleness/invalidation visually. */
   freezeCache: p.bool(false),
   /**
+   * Grounding occlusion depth at a card's root (0 = none). Deep groundcover
+   * self-shadows and the shared light model has no shadowing term, so without
+   * this the base of every plant is lit exactly like its tip and the field
+   * reads flat. Multiplies into the light term, never the albedo.
+   */
+  baseShade: p.num(0.4, { min: 0, max: 0.8, step: 0.02 }),
+  /**
    * Method-specific inspection: tint each CACHED cluster by its quadtree level
    * (LOD structure) or by its cache slot (pool churn / eviction). The direct
    * near ring stays untinted, so the handoff boundary is visible too.
@@ -27,6 +34,6 @@ export default defineExperiment({
   harnessApi: HARNESS_API,
   species: ['calamagrostis-canescens', 'elymus-repens', 'poa-pratensis'],
   params: PARAMS,
-  bakeVersion: 3,
+  bakeVersion: 4,
   load: () => import('./main.ts'),
 })

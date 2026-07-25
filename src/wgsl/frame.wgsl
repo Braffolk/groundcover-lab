@@ -53,9 +53,16 @@ struct StandEntry {
   // axis, so exactly one of them claims each grid node and the mat has no
   // holes.
   carpet_div: f32,
+  /**
+   * Horizontal footprint of the species at scale 1 (metres) — the periodic
+   * tile size, or 0 if unknown. NEVER size a plant's width from height_scale:
+   * that is only ~right for tall grasses, and it makes a ground carpet like
+   * Sphagnum (0.07m tall, 0.24m wide) about 3.5x too small, leaving gaps in
+   * what should be a closed mat. Use this, or the extents you baked yourself.
+   */
+  footprint_m: f32,
   _pad0: f32,
   _pad1: f32,
-  _pad2: f32,
 }
 
 @group(0) @binding(0) var<uniform> frame: Frame;

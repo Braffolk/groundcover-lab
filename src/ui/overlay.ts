@@ -10,6 +10,11 @@ export class Overlay {
   }
 
   toast(text: string, kind: 'error' | 'warn' | 'info' = 'info', ttlMs = 6000): void {
+    // Errors go to the console FIRST, before any de-duplication, so headless
+    // screenshot scripts that only listen to console output can never miss a
+    // WebGPU validation error. (They otherwise report "0 console errors" while
+    // the page shows a toast — that has already hidden a real bug.)
+    if (kind === 'error') console.error(text)
     // Collapse identical repeats within 2s (per-frame validation errors spam).
     const now = performance.now()
     const last = this.recent.get(text)
@@ -21,7 +26,6 @@ export class Overlay {
     el.textContent = text
     this.toasts.appendChild(el)
     setTimeout(() => el.remove(), ttlMs)
-    if (kind === 'error') console.error(text)
   }
 
   fatal(title: string, detail?: string): void {

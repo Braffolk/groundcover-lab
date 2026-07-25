@@ -1,8 +1,23 @@
 // One-time card-proxy bake: orthographic capture of the GCMESH1 source mesh
 // into one 256x256 tile per view (side, top), selected via viewport. MRT:
-// target0 = albedo.rgb + coverage, target1 = plant-local octahedral normal.
+// target0 = albedo.rgb + coverage, target1 = plant-local unit normal packed as
+// rgb = n * 0.5 + 0.5, FLIPPED into the hemisphere around the capture axis.
 // Hardware depth keeps the nearest surface — the card shows the plant's
 // visible shell from that direction.
+//
+// Two reasons the normal is stored as a flipped plain vector rather than a raw
+// octahedral pair (which is what v3 did, and which is why 017 lit flat):
+//  1. Two-sidedness. A blade's two faces carry opposite mesh normals, but a
+//     card must light both like the front — the same rule 000-ground-truth
+//     applies per fragment. Flipping toward the capture axis bakes it in.
+//  2. Mip safety. The runtime samples this atlas at mip 1.5-3.5 for every
+//     cached cluster. Box-averaging *octahedral* codes of opposing normals
+//     cancels to (0,0), which decodes to exactly (0,1,0) — so the whole far
+//     field lit with a straight-up normal: maximum half-lambert AND maximum
+//     hemisphere term, i.e. a flat, blown-out field. Once every normal in a
+//     tile sits in one hemisphere, an alpha-weighted box average is a genuine
+//     aggregate normal and it cannot cancel; plain vectors also average
+//     linearly, which octahedral codes do not do across the fold.
 
 struct ViewU {
   right: vec4f,   // xyz = ortho right axis, w = half width (m)
@@ -31,19 +46,6 @@ fn oct_decode(e: vec2f) -> vec3f {
   return normalize(vec3f(x, y, z));
 }
 
-fn sign_not_zero2(v: vec2f) -> vec2f {
-  return select(vec2f(-1.0), vec2f(1.0), v >= vec2f(0.0));
-}
-
-fn oct_encode(n: vec3f) -> vec2f {
-  let s = abs(n.x) + abs(n.y) + abs(n.z);
-  var p = vec2f(n.x, n.z) / max(s, 1e-6);
-  if (n.y < 0.0) {
-    p = (vec2f(1.0) - abs(vec2f(p.y, p.x))) * sign_not_zero2(p);
-  }
-  return p * 0.5 + 0.5;
-}
-
 @vertex
 fn vs(@location(0) a0: vec4<u32>, @location(1) a1: vec4<u32>) -> VOut {
   let q = vec3f(f32(a0.x), f32(a0.y), f32(a0.z)) / 65535.0;
@@ -58,7 +60,14 @@ fn vs(@location(0) a0: vec4<u32>, @location(1) a1: vec4<u32>) -> VOut {
   o.pos = vec4f(cx, cy, clamp(dlin, 0.0, 1.0), 1.0);
   o.color = vec3f(f32(a0.w), f32(a1.x), f32(a1.y)) / 65535.0;
   let e = vec2f(f32(a1.z), f32(a1.w)) / 65535.0 * 2.0 - 1.0;
-  o.normal = oct_decode(e);
+  // Thin foliage is lit from both sides: flip the mesh normal into the
+  // hemisphere around the capture axis so the card's front face is what gets
+  // lit, and so the mip chain averages a coherent set (see header).
+  var n = oct_decode(e);
+  if (dot(n, view_u.fwd.xyz) < 0.0) {
+    n = -n;
+  }
+  o.normal = n;
   return o;
 }
 
@@ -71,6 +80,6 @@ struct FOut {
 fn fs(i: VOut) -> FOut {
   var o: FOut;
   o.albedo = vec4f(i.color, 1.0);
-  o.nrm = vec4f(oct_encode(normalize(i.normal)), 0.0, 1.0);
+  o.nrm = vec4f(normalize(i.normal) * 0.5 + 0.5, 1.0);
   return o;
 }
