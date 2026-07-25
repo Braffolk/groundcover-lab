@@ -22,6 +22,9 @@ struct EntryInfo {
   top_frac: f32,           // top card height as fraction of [y0, y1]
   bottom_shade: f32,       // grounding gradient strength
   carpet_over: f32,        // uniform overscale of every carpet tile (>= 1)
-  _pad1: f32,
+  slots_per_cell: f32,     // candidate slots per scatter cell for THIS entry:
+                           // carpet_div^2 for a mat (484 at life size, i.e.
+                           // deliberately over SCATTER_MAX_PER_CELL), else 128.
+                           // Hardcoding 128 renders a fraction of the mat.
   _pad2: f32,
 }

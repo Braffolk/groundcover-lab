@@ -47,6 +47,7 @@ interface EntryGpu {
   indirectBuffer: GPUBuffer
   cullBindGroup: GPUBindGroup
   drawBindGroup: GPUBindGroup
+  enumSlots: number
   slotsPerFrame: number
 }
 
@@ -105,10 +106,20 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
     const isCarpet = carpetDiv > 0
     // A carpet entry fills carpetDiv^2 of the cell's slots and ignores
     // `density`; a scattered entry uses density/8 of all SCATTER_MAX_PER_CELL.
-    const slotsPerCell = isCarpet
-      ? Math.min(carpetDiv * carpetDiv, SCATTER_MAX_PER_CELL)
+    // Carpet slots are NOT bounded by the scatter budget: life size needs
+    // div 22 = 484 slots, and clamping to 128 renders only the first ~6 rows of
+    // every cell, i.e. bands of moss with bare gaps between them.
+    // TWO DIFFERENT NUMBERS — conflating them drops plants:
+    //  * enumSlots is how many candidate slots the cull must EVALUATE per cell.
+    //    Every slot must be visited or plants silently disappear.
+    //  * expectedPerCell is how many are expected to SURVIVE, which is all the
+    //    instance buffer needs to hold.
+    const enumSlots = isCarpet ? carpetDiv * carpetDiv : SCATTER_MAX_PER_CELL
+    const bandFraction = Math.min(1, standEntry.wetWidth ?? 1)
+    const expectedPerCell = isCarpet
+      ? carpetDiv * carpetDiv * Math.min(1, bandFraction * 1.25)
       : SCATTER_MAX_PER_CELL * (Math.min(standEntry.density, 8) / 8)
-    const capacity = Math.ceil(sideMax * sideMax * slotsPerCell * 1.06) + 1024
+    const capacity = Math.ceil(sideMax * sideMax * expectedPerCell * 1.06) + 1024
     const infoBuffer = ctx.res.createBuffer(
       {
         label: `${ctx.id}/info-${entryIndex}`,
@@ -158,6 +169,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       indirectBuffer,
       cullBindGroup,
       drawBindGroup,
+      enumSlots,
       slotsPerFrame: 0,
     }
   })
@@ -227,9 +239,10 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         info[39] = TOP_FRAC
         info[40] = ctx.params.bottomShade
         info[41] = ctx.params.carpetOverscale
+        info[42] = entry.enumSlots
         device.queue.writeBuffer(entry.infoBuffer, 0, info)
         device.queue.writeBuffer(entry.indirectBuffer, 0, indirectReset)
-        entry.slotsPerFrame = sideX * sideZ * SCATTER_MAX_PER_CELL
+        entry.slotsPerFrame = sideX * sideZ * entry.enumSlots
       })
     },
 
