@@ -93,6 +93,39 @@ context compaction). Facts and hard-won gotchas only — the rules that bind
   ~7 experiments that fetch `/mesh/baked/...` directly; converting them to
   `assetUrl()` and deleting the shim is outstanding (task #12).
 
+## Harness bugs the moss fleet found (MINE to fix, when nothing is running)
+
+All three were reported independently by 3-5 agents with consistent
+measurements, and all three are verified in shared code. They are deliberately
+NOT fixed mid-round: a change to `src/` recompiles every shader, moves
+placement, and invalidates the before/after images of every agent still in
+flight.
+
+1. **The scatter twins disagree for carpet entries.** `Scatter.cell()`
+   (`src/scene/scatter.ts:132`) returns `scale: e.scaleMin` — the stand's
+   PLACEHOLDER (1.7 / 1.6 / 1.4 for the three Sphagnum states) — while
+   `createStandBuffer()` writes `carpetScale()` (1.0101) into
+   `stand_table.scale_min`, which `scatter.wgsl:98` reads. So every renderer
+   that materializes instances in TS draws the bog moss 1.4-1.7x life size,
+   and the "bit-identical twins" invariant is simply false for carpets. Fix:
+   apply `carpetScale()` in the TS carpet branch.
+2. **`carpetScale()` is not exported from `@harness`**, so TypeScript cannot
+   see a carpet's real scale at all — `ctx.stand.species[i].scaleMin` is the
+   stale placeholder. Any CPU-side bound sized from it is silently wrong.
+   Fix: export it (and consider resolving the scale on the `ctx.stand` object
+   the experiment sees, so the placeholder is unreachable).
+3. **The drawn ground is not the sampled ground.** `basePass.ts` draws
+   `TERRAIN_QUADS = 256` over a 256 m terrain (1 m triangles, linear across
+   each), while `terrain_sample()` is bilinear over a 512² / 0.5 m heightmap.
+   Three agents measured the same thing: the drawn surface sits ABOVE the
+   sampled one by >1 cm over ~21% of the bog and up to ~6.5-7.2 cm — more than
+   an entire 7 cm Sphagnum tile, so a correctly conforming mat gets buried by
+   the terrain the harness itself draws. Invisible for 1 m grass, fatal for a
+   carpet. Preferred fix: raise the drawn grid to match the heightmap (512) so
+   there is ONE ground surface; it costs 4x terrain verts in the base pass and
+   shifts the base-pass row of every historical bench, which is worth saying
+   out loud but does not touch experiments' own pass timings.
+
 ## Measuring performance under contention
 
 Absolute milliseconds are meaningless while agents share the GPU. Use the
@@ -122,10 +155,15 @@ parity. A proper comparison needs both orderings or solo benches on an idle GPU
 
 ## In flight / queued (as of this writing)
 
-- **RUNNING** `w1hf8i2cc` — moss round, 33 agents (002–034), 7 waves of 5, from
-  `.claude/moss-round.js`. On completion: commit per-experiment code (not the
-  artifacts, pending the storage decision), and collect every
-  `interfaceFeedback` field.
+- **RUNNING** `w1hf8i2cc` = run `wf_a5a3432c-55e` — moss round, 33 agents
+  (002–034), waves of 5, from `.claude/moss-round.js`. Started 13:58 on
+  2026-07-25; 002–011 landed by ~17:50 (committed as `6181a17`). Read progress
+  from
+  `~/.claude/projects/<proj>/<session>/subagents/workflows/wf_a5a3432c-55e/journal.jsonl`
+  — `started` / `result` records, one per agent; the task `.output` file stays
+  EMPTY until the whole workflow finishes, so do not read emptiness as death.
+  On completion: commit per-experiment code (not the artifacts, pending the
+  storage decision), and collect every `interfaceFeedback` field.
 - **RUNNING** background agent on `039-nd-moss` — deriving a moss technique from
   Naughty Dog's Uncharted 4 tech-art paper (`/tmp/nd-techart.pdf`).
 - **OWED**: `035`–`038` (the raycast four) still need a moss pass; they were
