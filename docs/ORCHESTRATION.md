@@ -93,38 +93,43 @@ context compaction). Facts and hard-won gotchas only — the rules that bind
   ~7 experiments that fetch `/mesh/baked/...` directly; converting them to
   `assetUrl()` and deleting the shim is outstanding (task #12).
 
-## Harness bugs the moss fleet found (MINE to fix, when nothing is running)
+## Harness bugs the moss fleet found
 
 All three were reported independently by 3-5 agents with consistent
-measurements, and all three are verified in shared code. They are deliberately
-NOT fixed mid-round: a change to `src/` recompiles every shader, moves
-placement, and invalidates the before/after images of every agent still in
-flight.
+measurements, and all three are verified in shared code.
 
-1. **The scatter twins disagree for carpet entries.** `Scatter.cell()`
-   (`src/scene/scatter.ts:132`) returns `scale: e.scaleMin` — the stand's
+**Bugs 1 and 2 are CLOSED as won't-fix (2026-07-25).** Both exist only in the
+carpet path, and carpets were deprecated when the lab split materials out from
+plant renderers — a tiled ground mat is a material, not a species of plant. No
+stand sets `carpetDiv` any more. Do not repair a deprecated path; the notes are
+kept because the *shape* of the bug (a TS/WGSL twin silently disagreeing) is the
+recurring hazard, not the carpet specifics.
+
+1. ~~**The scatter twins disagree for carpet entries.**~~ `Scatter.cell()`
+   (`src/scene/scatter.ts`) returns `scale: e.scaleMin` — the stand's
    PLACEHOLDER (1.7 / 1.6 / 1.4 for the three Sphagnum states) — while
    `createStandBuffer()` writes `carpetScale()` (1.0101) into
-   `stand_table.scale_min`, which `scatter.wgsl:98` reads. So every renderer
-   that materializes instances in TS draws the bog moss 1.4-1.7x life size,
-   and the "bit-identical twins" invariant is simply false for carpets. Fix:
-   apply `carpetScale()` in the TS carpet branch.
-2. **`carpetScale()` is not exported from `@harness`**, so TypeScript cannot
-   see a carpet's real scale at all — `ctx.stand.species[i].scaleMin` is the
-   stale placeholder. Any CPU-side bound sized from it is silently wrong.
-   Fix: export it (and consider resolving the scale on the `ctx.stand` object
-   the experiment sees, so the placeholder is unreachable).
-3. **The drawn ground is not the sampled ground.** `basePass.ts` draws
+   `stand_table.scale_min`, which `scatter.wgsl` reads. So every renderer that
+   materialized instances in TS drew the bog moss 1.4-1.7x life size, and the
+   "bit-identical twins" invariant was simply false for carpets. Now recorded as
+   a deliberate non-fix in a `@deprecated` comment at both sites.
+2. ~~**`carpetScale()` is not exported from `@harness`.**~~ Same reason.
+3. **The drawn ground is not the sampled ground.** STILL LIVE and still worth
+   fixing — it has nothing to do with carpets. `basePass.ts` draws
    `TERRAIN_QUADS = 256` over a 256 m terrain (1 m triangles, linear across
    each), while `terrain_sample()` is bilinear over a 512² / 0.5 m heightmap.
    Three agents measured the same thing: the drawn surface sits ABOVE the
    sampled one by >1 cm over ~21% of the bog and up to ~6.5-7.2 cm — more than
-   an entire 7 cm Sphagnum tile, so a correctly conforming mat gets buried by
-   the terrain the harness itself draws. Invisible for 1 m grass, fatal for a
-   carpet. Preferred fix: raise the drawn grid to match the heightmap (512) so
-   there is ONE ground surface; it costs 4x terrain verts in the base pass and
-   shifts the base-pass row of every historical bench, which is worth saying
-   out loud but does not touch experiments' own pass timings.
+   an entire 7 cm Sphagnum tile, so anything conforming to the sampled surface
+   gets buried by the terrain the harness itself draws. Preferred fix: raise the
+   drawn grid to match the heightmap (512) so there is ONE ground surface; it
+   costs 4x terrain verts in the base pass and shifts the base-pass row of every
+   historical bench, which is worth saying out loud but does not touch
+   experiments' own pass timings.
+   There is a second, visual symptom worth knowing: at grazing the 1 m triangles
+   read as ~1 m blocky facets through any ground-conforming surface. Seen
+   identically in 001 and 039, i.e. it is the harness's ground, not a renderer
+   bug — which makes this a look fix as well as a geometry fix.
 
 ## Measuring performance under contention
 
@@ -153,22 +158,46 @@ parity. A proper comparison needs both orderings or solo benches on an idle GPU
 - Before believing a speedup, demand a control. One agent nearly reported a fake
   25 % win that was six silently dropped draws.
 
+## The pivot (2026-07-25) — read this before anything below it
+
+The lab was built on one idea: an experiment is a *renderer of a stand*. The moss
+round ended that. Forcing a tiled ground carpet and upright plants through one
+renderer generalised badly — nearly every renderer independently mis-sized its
+enumeration loop and drew a quarter of the mat — and the best moss result
+(`039-nd-moss`) turned out not to be a geometry technique at all: Uncharted 4's
+moss is a **surface material** on geometry that owns the silhouette.
+
+So experiments now get **kinds**, and the kind being built is **materials**:
+graph-authored, channel-inspectable, previewed on standard geometry,
+A/B-comparable, with node outputs bakeable to PNG. The full design is in the
+approved plan (`~/.claude/plans/read-the-readme-plan-cozy-shannon.md`).
+
+What changed on disk:
+- The three Sphagnum meshes (1.5 GB) and the `bog` stand are **deleted**. Their
+  measured maps survive as PNGs in `assets/materials/sphagnum-*` — albedo,
+  height, normal, cavity AO, plus `measured.json` with the tip/base colours and
+  plane/apex heights the shading needs. Those cannot be regenerated; treat them
+  as source data now.
+- 1.1 GB of baked moss artifacts deleted with them.
+- Carpets are `@deprecated` but intact. `tileM`/`footprint_m` are NOT deprecated —
+  they are load-bearing for the grasses.
+- Species indices 3-5 are retired and must never be reused: the index goes into
+  the GPU stand table and the catalog is append-only.
+
 ## In flight / queued (as of this writing)
 
-- **RUNNING** `w1hf8i2cc` = run `wf_a5a3432c-55e` — moss round, 33 agents
-  (002–034), waves of 5, from `.claude/moss-round.js`. Started 13:58 on
-  2026-07-25; 002–011 landed by ~17:50 (committed as `6181a17`). Read progress
-  from
-  `~/.claude/projects/<proj>/<session>/subagents/workflows/wf_a5a3432c-55e/journal.jsonl`
-  — `started` / `result` records, one per agent; the task `.output` file stays
-  EMPTY until the whole workflow finishes, so do not read emptiness as death.
-  On completion: commit per-experiment code (not the artifacts, pending the
-  storage decision), and collect every `interfaceFeedback` field.
-- **RUNNING** background agent on `039-nd-moss` — deriving a moss technique from
-  Naughty Dog's Uncharted 4 tech-art paper (`/tmp/nd-techart.pdf`).
-- **OWED**: `035`–`038` (the raycast four) still need a moss pass; they were
-  excluded from `w1hf8i2cc` because two were still running.
-- Open tasks: #12 (merge leftovers: delete the fetch shim), #13 (moss round).
+- The moss round (`w1hf8i2cc` = run `wf_a5a3432c-55e`) was **stopped by the owner
+  at 25 of 33** on weekly-limit grounds, with all completed work kept and
+  committed (002–026). 027–034 and 035–038 never got a moss pass and now never
+  will — the pivot obsoleted the task. Useful mechanic learned: read a live
+  workflow's progress from
+  `~/.claude/projects/<proj>/<session>/subagents/workflows/<runId>/journal.jsonl`
+  (`started`/`result` records); the task `.output` file stays EMPTY until the
+  whole workflow finishes, so do not read emptiness as death.
+- `039-nd-moss` landed: Uncharted 4's material measured off the source mesh.
+  It is the port target for the first material experiment.
+- Still open from before the pivot: delete the `installAssetBaseShim()` global
+  fetch monkeypatch by converting ~7 experiments to `assetUrl()`.
 
 ## Round history and verdicts
 
