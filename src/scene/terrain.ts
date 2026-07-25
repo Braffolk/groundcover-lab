@@ -130,6 +130,25 @@ export class Terrain {
     const [, nx, nz] = this.sample(x, z)
     return fround(fround(nx * nx) + fround(nz * nz))
   }
+
+  /**
+   * Least-squares ground plane over a footprint, from 5 taps — the CPU twin of
+   * terrain_plane_fit() in src/wgsl/terrain.wgsl. `h` is the fitted height at
+   * (x, z), which over a bumpy footprint sits at the local mean rather than the
+   * exact centre sample. See CLAUDE.md for the ladder of terrain-fitting
+   * options; this is one primitive, not a prescribed method.
+   */
+  planeFit(x: number, z: number, radius: number): { up: [number, number, number]; h: number } {
+    const c = this.height(x, z)
+    const hx0 = this.height(x - radius, z)
+    const hx1 = this.height(x + radius, z)
+    const hz0 = this.height(x, z - radius)
+    const hz1 = this.height(x, z + radius)
+    const dhdx = (hx1 - hx0) / (2 * radius)
+    const dhdz = (hz1 - hz0) / (2 * radius)
+    const inv = 1 / Math.hypot(dhdx, 1, dhdz)
+    return { up: [-dhdx * inv, inv, -dhdz * inv], h: (c + hx0 + hx1 + hz0 + hz1) * 0.2 }
+  }
 }
 
 /**
