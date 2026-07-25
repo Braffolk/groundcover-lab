@@ -19,7 +19,7 @@ struct BakeView {
   fwd_axis: vec4f,   // xyz: toward the bake camera
   box_c: vec4f,      // node center xyz; w: horizontal support radius
   box_y: vec4f,      // y0, y1 of the tile's vertical range
-  b_min: vec4f,      // mesh bounds min (dequantization)
+  b_min: vec4f,      // xyz: mesh bounds min (dequantization); w: tile wrap period
   b_range: vec4f,    // mesh bounds max - min
 }
 @group(0) @binding(0) var<uniform> bake_view: BakeView;
@@ -44,9 +44,19 @@ fn oct_decode_mesh(e: vec2f) -> vec3f {
 }
 
 @vertex
-fn vs(@location(0) q_pos: vec4<u32>, @location(1) q_attr: vec4<u32>) -> VOut {
+fn vs(
+  @builtin(instance_index) ii: u32,
+  @location(0) q_pos: vec4<u32>,
+  @location(1) q_attr: vec4<u32>,
+) -> VOut {
   // Vertex record: [x y z r] [g b octU octV], all u16 UNORM against bounds.
-  let p = bake_view.b_min.xyz + (vec3f(vec3<u32>(q_pos.xyz)) / 65535.0) * bake_view.b_range.xyz;
+  // Periodic tile capture: b_min.w is the tile period and the draw is 9
+  // instances, so the mesh is stamped at its 3x3 wrap offsets and whatever
+  // overflows one edge of the tile square arrives from the other — the capture
+  // then tiles exactly. Every other view leaves b_min.w at 0 and draws one
+  // instance, so the offset is identically zero for them.
+  let wrap = vec3f(f32(i32(ii % 3u) - 1), 0.0, f32(i32(ii / 3u) - 1)) * bake_view.b_min.w;
+  let p = bake_view.b_min.xyz + (vec3f(vec3<u32>(q_pos.xyz)) / 65535.0) * bake_view.b_range.xyz + wrap;
   let color = vec3f(f32(q_pos.w), f32(q_attr.x), f32(q_attr.y)) / 65535.0;
   let oct = (vec2f(f32(q_attr.z), f32(q_attr.w)) / 65535.0) * 2.0 - 1.0;
 

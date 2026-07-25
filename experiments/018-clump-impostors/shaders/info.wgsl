@@ -15,6 +15,8 @@ const N_VIEWS: u32 = 9u;    // 8 side + 1 top
 const NEAR_BINS: u32 = 3u;
 const FAR_BINS: u32 = 4u;
 const N_BINS: u32 = 7u;
+// Ground-parallel shells per CARPET tile in the near LOD (see carpet.ts).
+const SHELLS: u32 = 4u;
 
 struct ClumpDyn {
   planes: array<vec4f, 6>, // world-space frustum planes (nx,ny,nz,d), normalized
@@ -45,8 +47,15 @@ struct ClumpDyn {
   // same on-screen density as the merged card.
   near_alpha_bias: f32,
 
-  _pad1: f32,
-  _pad2: f32,
+  // Candidate slots per scatter cell for THIS entry. A carpet entry has
+  // carpet_div^2 of them (484 at life size) — deliberately more than the
+  // SCATTER_MAX_PER_CELL budget, and hardcoding 128 renders a quarter of the
+  // mat as 4m-pitch stripes.
+  slots_per_cell: f32,
+  // How much a carpet shell is darkened when it is drawn well below the
+  // cushion apex above it — the shell stack's depth cue.
+  carpet_shade: f32,
+
   _pad3: f32,
   _pad4: f32,
   _pad5: f32,
@@ -59,6 +68,16 @@ struct ClumpAtlas {
   unit_box: array<vec4f, N_UNITS>,
   // Per unit: y1, 0, 0, 0.
   unit_ext: array<vec4f, N_UNITS>,
+  // CARPET entries only (see carpet.ts). x,y = capture box y0, y1 (metres at
+  // scale 1); z = height of the single far-LOD quad; w = the shell span the
+  // depth shade normalises by — all as fractions of [y0, y1] except x,y.
+  carpet_box: vec4f,
+  // Shell heights (fraction of [y0, y1]), descending — shell 0 is the top.
+  shell_y: vec4f,
+  // Per-shell lower height threshold; a fragment is kept on shell s when its
+  // baked apex height is >= shell_t[s]. The last is -1, so the bottom shell is
+  // the mat's closed skirt.
+  shell_t: vec4f,
   // Per tile, two vec4 each (tile index = unit * N_VIEWS + view):
   //   [2t]   uv rect already narrowed to the baked alpha bbox: u0, v0, du, dv
   //   [2t+1] the same rect in the unit's local card space: lx0, ly0, lw, lh

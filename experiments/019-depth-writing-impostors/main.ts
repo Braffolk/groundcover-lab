@@ -1,12 +1,16 @@
+import carpetSrc from './shaders/carpet.wgsl'
 import cullSrc from './shaders/cull.wgsl'
 import impostorSrc from './shaders/impostor.wgsl'
-import { MIP_LEVELS, N_LAYERS, TILE, loadSpeciesViews, mipTexels, type ViewSet } from './bake.ts'
+import { MIP_LEVELS, N_LAYERS, TILE, TOP_LAYER, levelOffsetTexels, loadSpeciesViews, mipTexels, type ViewSet } from './bake.ts'
 import {
   SCATTER_CELL_SIZE,
-  SCATTER_MAX_PER_CELL,
+  SCATTER_MAX_DENSITY,
+  speciesById,
+  standEntrySlots,
   type Experiment,
   type ExperimentContext,
   type FrameInfo,
+  type StandSpecies,
   type ViewTargets,
 } from '@harness'
 import type { PARAMS } from './manifest.ts'
@@ -31,7 +35,16 @@ import type { PARAMS } from './manifest.ts'
 
 const CELL = SCATTER_CELL_SIZE
 const REGION_MAX = 128 // keep equal to the manifest's regionRadius max
-const INFO_FLOATS = 96
+const INFO_FLOATS = 112
+/** Cull workgroup width — slot counts are padded up to this. */
+const CULL_WG = 64
+/**
+ * Shell area (m^2) below which a carpet's instance capacity is sized for the
+ * FULL grid rate rather than the entry's expected share of the wetness axis:
+ * a small shell can easily sit entirely inside one zone, where the entry owns
+ * every node, while a large annulus averages over many zones.
+ */
+const CARPET_FULL_RATE_AREA = 800
 /**
  * Outer radius (m) of each distance shell. Fixed, not param-derived, so the
  * per-shell instance capacities are allocated once and the LOD params only
@@ -50,6 +63,25 @@ interface SpeciesGpu {
   albedoTex: GPUTexture
   geoTex: GPUTexture
   viewBuffer: GPUBuffer
+  /** Layer index of the straight-down view in the UPLOADED texture. */
+  topLayer: number
+}
+
+/**
+ * Everything a mat tile needs, all constant. A carpet species is a periodic
+ * community tile, so the runtime only ever samples the straight-down view, and
+ * only the tile's own square of it.
+ */
+interface CarpetConst {
+  /** footprint_m * carpet scale — one grid step, the quad's exact size. */
+  tileWorld: number
+  /** Height of the quad plane above the ground (the capture centre). */
+  quadY: number
+  /** World metres spanned by the full [-0.5, 0.5] depth code. */
+  reliefM: number
+  tLo: [number, number]
+  tSpan: [number, number]
+  tPerM: [number, number]
 }
 
 interface EntryGpu {
@@ -63,6 +95,10 @@ interface EntryGpu {
   cullBindGroup: GPUBindGroup
   drawBindGroups: GPUBindGroup[]
   slotsPerFrame: number
+  /** Candidate slots per cell, padded to the cull workgroup width. */
+  slotsPerCell: number
+  /** Non-null for a mat species (stand entry with carpetDiv > 0). */
+  carpet: CarpetConst | null
 }
 
 export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Experiment> {
@@ -77,12 +113,19 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
     addressModeV: 'clamp-to-edge',
   })
 
+  // A species drawn only as a mat never samples anything but the straight-down
+  // view: the other 16 layers are pure dead weight (10.1 of 10.7 MiB per
+  // plane), so they are not uploaded at all.
+  const matOnly = (id: string): boolean =>
+    ctx.stand.species.some((e) => e.species === id && (e.carpetDiv ?? 0) > 0) &&
+    !ctx.stand.species.some((e) => e.species === id && (e.carpetDiv ?? 0) <= 0)
+
   // Sequential: the poa bake transiently needs several hundred MB.
   const speciesGpu = new Map<string, SpeciesGpu>()
   for (const entry of ctx.stand.species) {
     if (speciesGpu.has(entry.species)) continue
     const set = await loadSpeciesViews(ctx, entry.species)
-    speciesGpu.set(entry.species, upload(ctx, entry.species, set))
+    speciesGpu.set(entry.species, upload(ctx, entry.species, set, matOnly(entry.species)))
   }
 
   const cullBgl = device.createBindGroupLayout({
@@ -107,7 +150,18 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
 
   const entries: EntryGpu[] = ctx.stand.species.map((standEntry, entryIndex) => {
     const gpu = speciesGpu.get(standEntry.species)!
-    const density = Math.min(standEntry.density, 8)
+    const carpet = carpetConstants(ctx, standEntry, gpu.set)
+    // Slots to EVALUATE per cell is not the same number as instances to store:
+    // a carpet has carpet_div^2 of them (484 for the bog moss), and visiting
+    // only SCATTER_MAX_PER_CELL of those renders a quarter of the mat.
+    const slotsPerCell = Math.ceil(standEntrySlots(standEntry) / CULL_WG) * CULL_WG
+    // Expected survivors per m^2. A carpet ignores `density` entirely — its
+    // cover comes from the grid — and its wetness interval is a hard spatial
+    // partition, so a small shell can sit wholly inside one zone at the full
+    // grid rate while a large annulus averages over many zones.
+    const band = standEntry.wetWidth && standEntry.wetWidth > 0 ? Math.min(1, standEntry.wetWidth) : 1
+    const gridRate = carpet ? standEntrySlots(standEntry) / (CELL * CELL) : Math.min(standEntry.density, SCATTER_MAX_DENSITY)
+    const bandRate = carpet ? gridRate * Math.min(1, band * 1.15) : gridRate
     // Per-shell capacity from its annulus area. The frustum keeps at most a
     // ~90-degree horizontal wedge, so the outer shells are sized well below
     // their full-annulus bound; a clamp only ever drops a few of the most
@@ -118,7 +172,8 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
     for (let i = 0; i < N_SHELLS; i++) {
       const r0 = i === 0 ? 0 : SHELL_R[i - 1]!
       const area = Math.PI * (SHELL_R[i]! ** 2 - r0 * r0)
-      const cap = Math.ceil((area * density * SHELL_FILL[i]! + SHELL_SLACK[i]!) / ALIGN) * ALIGN
+      const perM2 = area < CARPET_FULL_RATE_AREA ? gridRate : bandRate
+      const cap = Math.ceil((area * perM2 * SHELL_FILL[i]! + SHELL_SLACK[i]!) / ALIGN) * ALIGN
       caps.push(cap)
       bases.push(total)
       total += cap
@@ -181,8 +236,13 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       cullBindGroup,
       drawBindGroups,
       slotsPerFrame: 0,
+      slotsPerCell,
+      carpet,
     }
   })
+
+  const upright = entries.filter((e) => e.carpet === null)
+  const mats = entries.filter((e) => e.carpet !== null)
 
   let cullPipeline!: GPUComputePipeline
   const drawPipelines = new Map<string, GPURenderPipeline>()
@@ -211,6 +271,22 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         }),
       )
     }
+    // Mat species draw a ground-parallel, terrain-conformed tile instead of a
+    // screen-aligned card — a different shape, so a different shader.
+    const carpetModule = ctx.shaders.module(carpetSrc)
+    for (const fs of ['fs_carpet_near', 'fs_carpet_mid', 'fs_carpet_far']) {
+      drawPipelines.set(
+        fs,
+        device.createRenderPipeline({
+          label: `${ctx.id}/${fs}`,
+          layout,
+          vertex: { module: carpetModule, entryPoint: 'vs_carpet' },
+          fragment: { module: carpetModule, entryPoint: fs, targets: [{ format: ctx.colorFormat }] },
+          primitive: { topology: 'triangle-list', cullMode: 'none' },
+          depthStencil: { format: ctx.depthFormat, depthCompare: 'less', depthWriteEnabled: true },
+        }),
+      )
+    }
   }
   build()
   const unsubscribe = ctx.shaders.onReload(build)
@@ -223,6 +299,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
   for (let i = 0; i < N_SHELLS; i++) indirectReset[i * 4] = 6
   /** Fragment entry point each shell draws with, refreshed when params move. */
   const shellPipe: GPURenderPipeline[] = []
+  const carpetShellPipe: GPURenderPipeline[] = []
 
   return {
     update(frame: FrameInfo): void {
@@ -244,16 +321,20 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       // no-warp shells begin with a silhouette that already matches.
       let warpEnd = SHELL_R[0]!
       shellPipe.length = 0
+      carpetShellPipe.length = 0
       for (let i = 0; i < N_SHELLS; i++) {
         const inner = i === 0 ? 0 : SHELL_R[i - 1]!
         if (inner < ctx.params.depthDist) {
           shellPipe.push(drawPipelines.get('fs_near')!)
+          carpetShellPipe.push(drawPipelines.get('fs_carpet_near')!)
           warpEnd = SHELL_R[i]!
         } else if (inner < ctx.params.warpDist) {
           shellPipe.push(drawPipelines.get('fs_mid')!)
+          carpetShellPipe.push(drawPipelines.get('fs_carpet_mid')!)
           warpEnd = SHELL_R[i]!
         } else {
           shellPipe.push(drawPipelines.get('fs_far')!)
+          carpetShellPipe.push(drawPipelines.get('fs_carpet_far')!)
         }
       }
 
@@ -286,7 +367,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
           info[77 + i] = s.rowOffset[i] ?? 0
         }
         info[81] = s.nRows
-        info[82] = s.topLayer
+        info[82] = entry.gpu.topLayer
         info[83] = ctx.params.alphaRef
         info[84] = Math.hypot(s.hx, s.hy, s.hz)
         info[85] = 0.012
@@ -297,9 +378,23 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         info[90] = TILE
         info[91] = MIP_LEVELS - 1
         info[92] = ctx.params.warpBlur
+        info[93] = entry.slotsPerCell
+        const c = entry.carpet
+        info[94] = c ? c.tileWorld : 0
+        info[95] = c ? c.quadY : 0
+        info[96] = c ? c.reliefM : 0
+        info[97] = c ? c.tLo[0] : 0
+        info[98] = c ? c.tLo[1] : 0
+        info[99] = c ? c.tSpan[0] : 1
+        info[100] = c ? c.tSpan[1] : 1
+        info[101] = c ? c.tPerM[0] : 0
+        info[102] = c ? c.tPerM[1] : 0
+        info[103] = ctx.params.carpetAlphaRef
+        info[104] = entry.gpu.topLayer
+        info[105] = 0.004
         device.queue.writeBuffer(entry.infoBuffer, 0, info)
         device.queue.writeBuffer(entry.indirectBuffer, 0, indirectReset)
-        entry.slotsPerFrame = sideX * sideZ * SCATTER_MAX_PER_CELL
+        entry.slotsPerFrame = sideX * sideZ * entry.slotsPerCell
       })
     },
 
@@ -322,10 +417,21 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       // Near to far: each shell lays down hard-edged depth that rejects the
       // shells behind it before they ever reach the texture units.
       for (let i = 0; i < N_SHELLS; i++) {
-        pass.setPipeline(shellPipe[i]!)
-        for (const entry of entries) {
-          pass.setBindGroup(1, entry.drawBindGroups[i]!)
-          pass.drawIndirect(entry.indirectBuffer, i * 16)
+        // Cards first, then mats: two shapes, so two pipelines per shell —
+        // grouped so the switch happens twice, not once per entry.
+        if (upright.length > 0) {
+          pass.setPipeline(shellPipe[i]!)
+          for (const entry of upright) {
+            pass.setBindGroup(1, entry.drawBindGroups[i]!)
+            pass.drawIndirect(entry.indirectBuffer, i * 16)
+          }
+        }
+        if (mats.length > 0) {
+          pass.setPipeline(carpetShellPipe[i]!)
+          for (const entry of mats) {
+            pass.setBindGroup(1, entry.drawBindGroups[i]!)
+            pass.drawIndirect(entry.indirectBuffer, i * 16)
+          }
         }
       }
       pass.end()
@@ -338,14 +444,25 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
   }
 }
 
-/** Upload the baked mip chains into two 2d-array textures. */
-function upload(ctx: ExperimentContext<typeof PARAMS>, speciesId: string, set: ViewSet): SpeciesGpu {
+/**
+ * Upload the baked mip chains into two 2d-array textures. `matOnly` uploads
+ * ONLY the straight-down layer: a species drawn as a carpet never samples an
+ * azimuth view, so the other 16 layers would be 20 MiB of dead VRAM.
+ */
+function upload(
+  ctx: ExperimentContext<typeof PARAMS>,
+  speciesId: string,
+  set: ViewSet,
+  matOnly: boolean,
+): SpeciesGpu {
   const { device } = ctx
+  const layers = matOnly ? 1 : N_LAYERS
+  const srcLayer = matOnly ? TOP_LAYER : 0
   const mk = (tag: string): GPUTexture =>
     ctx.res.createTexture(
       {
         label: `${ctx.id}/${speciesId}/${tag}`,
-        size: [TILE, TILE, N_LAYERS],
+        size: [TILE, TILE, layers],
         format: 'rgba8unorm',
         mipLevelCount: MIP_LEVELS,
         usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
@@ -355,30 +472,85 @@ function upload(ctx: ExperimentContext<typeof PARAMS>, speciesId: string, set: V
   const albedoTex = mk('view-albedo')
   const geoTex = mk('view-geo')
 
-  let texelOffset = 0
   let size = TILE
   for (let level = 0; level < MIP_LEVELS; level++) {
+    // The chain is level-major then layer-major, so one layer of one level is
+    // a contiguous run either way.
+    const texelOffset = levelOffsetTexels(TILE, level, N_LAYERS) + size * size * srcLayer
     const layout = { offset: texelOffset * 4, bytesPerRow: size * 4, rowsPerImage: size }
-    device.queue.writeTexture({ texture: albedoTex, mipLevel: level }, set.albedo, layout, [size, size, N_LAYERS])
-    device.queue.writeTexture({ texture: geoTex, mipLevel: level }, set.geo, layout, [size, size, N_LAYERS])
-    texelOffset += size * size * N_LAYERS
+    device.queue.writeTexture({ texture: albedoTex, mipLevel: level }, set.albedo, layout, [size, size, layers])
+    device.queue.writeTexture({ texture: geoTex, mipLevel: level }, set.geo, layout, [size, size, layers])
     size = Math.max(1, size >> 1)
   }
-  if (texelOffset !== mipTexels(TILE, MIP_LEVELS) * N_LAYERS) {
+  if (levelOffsetTexels(TILE, MIP_LEVELS, N_LAYERS) !== mipTexels(TILE, MIP_LEVELS) * N_LAYERS) {
     console.warn(`[${ctx.id}] mip chain size mismatch for ${speciesId}`)
   }
 
+  const table = matOnly ? set.viewTable.slice(TOP_LAYER * 16, (TOP_LAYER + 1) * 16) : set.viewTable
   const viewBuffer = ctx.res.createBuffer(
     {
       label: `${ctx.id}/${speciesId}/view-table`,
-      size: set.viewTable.byteLength,
+      size: table.byteLength,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     },
     { species: speciesId, tag: 'view-table' },
   )
-  device.queue.writeBuffer(viewBuffer, 0, set.viewTable)
+  device.queue.writeBuffer(viewBuffer, 0, table)
 
-  return { set, albedoTex, geoTex, viewBuffer }
+  return { set, albedoTex, geoTex, viewBuffer, topLayer: matOnly ? 0 : TOP_LAYER }
+}
+
+/**
+ * Constants for a mat species, all derived from the bake and the stand. Null
+ * for an ordinary scattered entry.
+ *
+ * The straight-down view has R along +X and U along -Z, so the map from a mesh
+ * point (px, pz) to a texcoord is separable — one tile period is a rectangle in
+ * texture space, and the runtime needs nothing but its origin and extent.
+ */
+function carpetConstants(
+  ctx: ExperimentContext<typeof PARAMS>,
+  standEntry: StandSpecies,
+  set: ViewSet,
+): CarpetConst | null {
+  const div = standEntry.carpetDiv ?? 0
+  if (div <= 0) return null
+  const tileM = speciesById(standEntry.species).tileM
+  if (tileM === undefined || tileM <= 0) {
+    throw new Error(`[${ctx.id}] carpet entry "${standEntry.species}" has no periodic tileM`)
+  }
+  // The constant scale a carpet tile is placed at, i.e. one tile exactly fills
+  // its grid step. Recomputed rather than read from the entry, because
+  // standEntry.scaleMin still holds the stand's placeholder and the harness
+  // does not export carpetScale() (see NOTES.md, interface feedback).
+  const scale = CELL / div / tileM
+  const vt = set.viewTable
+  const o = TOP_LAYER * 16
+  const rx = vt[o]!
+  const rz = vt[o + 2]!
+  const eu = vt[o + 3]!
+  const ux = vt[o + 4]!
+  const uz = vt[o + 6]!
+  const ev = vt[o + 7]!
+  const ew = vt[o + 11]!
+  // t = (0.5 + (p-C).R / 2eu, 0.5 - (p-C).U / 2ev), evaluated at the tile
+  // square's (0, 0) corner — every current source mesh puts its periodic tile
+  // origin at the mesh origin.
+  const tLoX = 0.5 + (-set.cx * rx - set.cz * rz) / (2 * eu)
+  const tLoY = 0.5 - (-set.cx * ux - set.cz * uz) / (2 * ev)
+  const tSpanX = (tileM * rx) / (2 * eu)
+  const tSpanY = (-tileM * uz) / (2 * ev)
+  const skew = Math.max(Math.abs(rz), Math.abs(ux))
+  if (skew > 1e-4) console.warn(`[${ctx.id}] top view is not axis-aligned (skew ${skew}) — carpet uv will be wrong`)
+  const tileWorld = tileM * scale
+  return {
+    tileWorld,
+    quadY: set.cy * scale,
+    reliefM: 2 * ew * scale,
+    tLo: [tLoX, tLoY],
+    tSpan: [tSpanX, tSpanY],
+    tPerM: [tSpanX / tileWorld, tSpanY / tileWorld],
+  }
 }
 
 /** Gribb–Hartmann frustum planes from a column-major view-proj matrix. */

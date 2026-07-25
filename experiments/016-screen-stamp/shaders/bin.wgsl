@@ -19,7 +19,8 @@
 //        tint-only — footprint too large for individual plants (very high
 //                    camera): leave the list empty, the resolve pass paints
 //                    the aggregate meadow field;
-//   3. every candidate plant (procedural scatter twin, no arrays anywhere)
+//   3. every candidate SCATTERED plant (procedural scatter twin, no arrays
+//      anywhere; carpet species are resolved per pixel in carpet.wgsl)
 //      is sphere-tested against the tile's 4 frustum planes, wind-swayed,
 //      faded (near/far), assigned its hemi-octa atlas view, packed to 32 B
 //      and appended to the tile list;
@@ -43,10 +44,14 @@ const ENUM_MAX_DIM: i32 = 4;       // bbox cell span allowed for enumerate mode
 const TWO_PI_S: f32 = 6.2831853;
 
 struct StampParams {
-  dims: vec4u,                 // x,y unused, z = seed, w = entry_count
-  tuning: vec4f,               // x = max_dist, y = tint_strength, z = tile overlay, w unused
-  entry_meta: array<vec4f, 4>, // impostor local center.xyz, bounding radius
-  entry_info: array<vec4f, 4>, // species average albedo rgb, pad
+  dims: vec4u,                  // x = card slots, y = carpet slots, z = seed, w = stand entries
+  tuning: vec4f,                // x = max_dist, y = tint_strength, z = tile overlay, w = tint coverage
+  cards: vec4u,                 // stand entry index per card slot
+  carpets: vec4u,               // stand entry index per carpet slot
+  grid: vec4f,                  // carpet grid (see carpet.wgsl) — unused here
+  entry_meta: array<vec4f, 4>,  // per card slot: impostor local center.xyz, radius
+  entry_info: array<vec4f, 4>,  // per card slot: species average albedo rgb
+  carpet_zone: array<vec4f, 4>, // per carpet slot: wet_lo, wet_hi, h_mean, y_range
 }
 @group(1) @binding(0) var<uniform> sp: StampParams;
 @group(1) @binding(1) var<storage, read_write> tile_lists: array<u32>;
@@ -113,10 +118,12 @@ fn plane_n(a: vec3f, b: vec3f, inward_ref: vec3f) -> vec3f {
   return normalize(n);
 }
 
-// Evaluate one procedural scatter slot; if the plant exists and its sphere
+// Evaluate one procedural scatter slot of one CARD slot (carpet species never
+// enter the lists — see carpet.wgsl); if the plant exists and its sphere
 // intersects this tile's frustum (within the bin limit), append it.
 // Hash math is a bit-identical mirror of scatter_candidate() with early outs.
-fn try_plant(cell: vec2i, entry_index: u32, slot: u32) {
+fn try_plant(cell: vec2i, card_slot: u32, slot: u32) {
+  let entry_index = sp.cards[card_slot];
   let entry = stand_table[entry_index];
   let h = hash4(sp.dims.z, bitcast<u32>(cell.x), bitcast<u32>(cell.y), (entry_index << 16u) ^ slot);
   let density = min(entry.density, SCATTER_MAX_DENSITY);
@@ -125,12 +132,18 @@ fn try_plant(cell: vec2i, entry_index: u32, slot: u32) {
   let ox = hash_f32(hash2(h, 1u));
   let oz = hash_f32(hash2(h, 2u));
   let xz = (vec2f(cell) + vec2f(ox, oz)) * SCATTER_CELL_SIZE;
+  // Habitat band, exactly as scatter_candidate() resolves it (hash slot 6):
+  // without this the bog's fen grasses grow on the dry hummock crests too.
+  if (entry.wet_width > 0.0) {
+    let wdist = abs(scatter_wetness(sp.dims.z, xz) - entry.wet_center) / entry.wet_width;
+    if (hash_f32(hash2(h, 6u)) >= clamp(1.0 - wdist, 0.0, 1.0)) { return; }
+  }
   let yaw = hash_f32(hash2(h, 3u)) * TWO_PI_S;
   let scale = mix(entry.scale_min, entry.scale_max, hash_f32(hash2(h, 4u)));
   let phase = hash_f32(hash2(h, 5u)) * TWO_PI_S;
 
   let pos = vec3f(xz.x, terrain_height(xz), xz.y);
-  let im = sp.entry_meta[entry_index];
+  let im = sp.entry_meta[card_slot];
   let r_world = im.w * scale;
   let swayv = wind_sway(pos, frame.time, entry.sway, phase);
   let center = pos + rot_y_v(im.xyz * scale, yaw) + swayv * 0.6;
@@ -174,7 +187,8 @@ fn try_plant(cell: vec2i, entry_index: u32, slot: u32) {
 
   let yaw8 = u32(round(yaw * (255.0 / TWO_PI_S))) & 255u;
   let fade8 = u32(round(fade * 255.0));
-  let packed = entry_index | (ni << 3u) | (nj << 8u) | (yaw8 << 13u) | (fade8 << 21u);
+  // Low 3 bits are the CARD SLOT (which atlas pair), not the stand entry index.
+  let packed = card_slot | (ni << 3u) | (nj << 8u) | (yaw8 << 13u) | (fade8 << 21u);
   wg_e[idx][0] = bitcast<u32>(center.x);
   wg_e[idx][1] = bitcast<u32>(center.y);
   wg_e[idx][2] = bitcast<u32>(center.z);
@@ -206,7 +220,9 @@ fn process_cell(cell: vec2i) {
     if (dot(g_planes[i], csph) < -crad) { return; }
   }
   if (g_lid == 0u) { atomicAdd(&wg_cells, 1u); }
-  let n_items = sp.dims.w * SCATTER_MAX_PER_CELL;
+  // Card slots only, and every scattered entry has exactly
+  // SCATTER_MAX_PER_CELL slots (a carpet's carpet_div^2 slots are not binned).
+  let n_items = sp.dims.x * SCATTER_MAX_PER_CELL;
   for (var idx = g_lid; idx < n_items; idx += WG_SIZE) {
     try_plant(cell, idx / SCATTER_MAX_PER_CELL, idx % SCATTER_MAX_PER_CELL);
   }

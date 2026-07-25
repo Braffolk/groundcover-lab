@@ -18,7 +18,8 @@ struct EntryInfo {
   cfg0: vec4f,             // seed, entry index, region radius, tuft radius
   cfg1: vec4f,             // band-0 capacity, band-1 capacity, alpha ref, ground shade
   cfg2: vec4f,             // dissolve grazing, dissolve overhead, plant height, root half width
-  cfg3: vec4f,             // cull radius, _, _, _
+  cfg3: vec4f,             // cull radius, slots per cell, carpet tile size (m, world), parallax limit (m)
+  cfg4: vec4f,             // carpet: reference height fraction, capture span (m), y0 (m), relief gain
 }
 
 // Canopy shell block (shell.wgsl).

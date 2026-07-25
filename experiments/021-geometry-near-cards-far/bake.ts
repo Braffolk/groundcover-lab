@@ -1,4 +1,5 @@
 import bakeShaderSrc from './shaders/bake.wgsl'
+import bakeTileSrc from './shaders/bake_tile.wgsl'
 import { bakedArtifact, commitBake, speciesById, type ExperimentContext, type GcMesh } from '@harness'
 import type { PARAMS } from './manifest.ts'
 
@@ -713,6 +714,364 @@ function processGrid(
     normalOct.set(octEncode(nrm[s3]!, nrm[s3 + 1]!, nrm[s3 + 2]!), i * 2)
   }
   return { albedo, normalOct, bounds, bands }
+}
+
+// ---------------------------------------------------------------------------
+// CARPET TILE bake — the second artifact kind, for `carpet_div > 0` species.
+//
+// A Sphagnum tile is not a plant with a silhouette; it is 0.18m of periodic
+// cushion, 0.09m tall, that lies on the ground. Azimuth cards are the wrong
+// primitive for it entirely (see NOTES), so a carpet species gets ONE
+// straight-down capture of exactly its own period, plus a HEIGHT channel. The
+// near LOD stacks that one texture into N ground-parallel shells, each keeping
+// only the texels whose surface reaches its height, so the 3.3cm of capitulum
+// relief becomes real geometry instead of a flat photo.
+//
+// Artifact layout (little-endian):
+//   u32  magic 'GNCC', version, px, pad                        (16B)
+//   f32  tileM, y0, y1, hLo, hMid, hHi, pad, pad, pad, pad, pad, pad (48B)
+//   u8   albedo rgba8 [px*px]   (rgb, a = coverage)
+//   u8   nrmh   rgba8 [px*px]   (n*0.5+0.5, a = surface height, normalized)
+// ---------------------------------------------------------------------------
+
+export const CARPET_PX = 512
+const CARPET_SS = 2
+const CARPET_MAGIC = 0x43434e47 // 'GNCC'
+const CARPET_VERSION = 1
+const CARPET_HEADER = 64
+const CARPET_PLANE = CARPET_PX * CARPET_PX * 4
+const CARPET_BYTES = CARPET_HEADER + CARPET_PLANE * 2
+/** Height percentiles the shell stack spans (of the visible surface). */
+const SHELL_LO_PCT = 0.05
+const SHELL_HI_PCT = 0.97
+
+export interface CarpetTile {
+  /** Periodic tile size (m) — the capture is exactly [0, tileM]^2. */
+  tileM: number
+  y0: number
+  y1: number
+  /** Height (m, mesh frame) of the lowest / mean / highest shell plane. */
+  hLo: number
+  hMid: number
+  hHi: number
+  albedo: Uint8Array<ArrayBuffer>
+  nrmh: Uint8Array<ArrayBuffer>
+}
+
+export function unpackTile(buf: ArrayBuffer): CarpetTile | null {
+  if (buf.byteLength !== CARPET_BYTES) return null
+  const u = new Uint32Array(buf, 0, 4)
+  if (u[0] !== CARPET_MAGIC || u[1] !== CARPET_VERSION || u[2] !== CARPET_PX) return null
+  const f = new Float32Array(buf, 16, 12)
+  return {
+    tileM: f[0]!,
+    y0: f[1]!,
+    y1: f[2]!,
+    hLo: f[3]!,
+    hMid: f[4]!,
+    hHi: f[5]!,
+    albedo: new Uint8Array(buf, CARPET_HEADER, CARPET_PLANE),
+    nrmh: new Uint8Array(buf, CARPET_HEADER + CARPET_PLANE, CARPET_PLANE),
+  }
+}
+
+function packTile(t: CarpetTile): ArrayBuffer {
+  const buf = new ArrayBuffer(CARPET_BYTES)
+  new Uint32Array(buf, 0, 4).set([CARPET_MAGIC, CARPET_VERSION, CARPET_PX, 0])
+  new Float32Array(buf, 16, 12).set([t.tileM, t.y0, t.y1, t.hLo, t.hMid, t.hHi])
+  new Uint8Array(buf, CARPET_HEADER, CARPET_PLANE).set(t.albedo)
+  new Uint8Array(buf, CARPET_HEADER + CARPET_PLANE, CARPET_PLANE).set(t.nrmh)
+  return buf
+}
+
+/** Load (OPFS cache / committed file) or bake this species' carpet tile. */
+export async function loadSpeciesTile(ctx: BakeCtx, speciesId: string): Promise<CarpetTile> {
+  const key = `carpet-v${CARPET_VERSION}-${speciesId}`
+  let bakedFresh = false
+  const runBake = async (): Promise<ArrayBuffer> => {
+    bakedFresh = true
+    const mesh = await ctx.meshes.load(speciesById(speciesId).meshId)
+    return bakeSpeciesTile(ctx, mesh)
+  }
+
+  let buf = await bakedArtifact({ expId: ctx.id, key }, runBake)
+  let tile = unpackTile(buf)
+  if (!tile) {
+    buf = await runBake()
+    tile = unpackTile(buf)
+    if (!tile) throw new Error(`[${ctx.id}] carpet bake for ${speciesId} produced an invalid artifact`)
+    await opfsRepair(`${ctx.id}__${key}`, buf)
+  }
+  if (bakedFresh) {
+    try {
+      await commitBake(ctx.id, key, buf)
+    } catch (err) {
+      console.warn(`[${ctx.id}] commitBake failed (static build?):`, err)
+    }
+  }
+  return tile
+}
+
+async function bakeSpeciesTile(ctx: BakeCtx, mesh: GcMesh): Promise<ArrayBuffer> {
+  const { device } = ctx
+  const hdr = mesh.header
+  const tileM = hdr.tileSize[0]
+  if (!(tileM > 0)) throw new Error(`[${ctx.id}] carpet bake needs a periodic mesh (tileSize = 0)`)
+  const y0 = Math.min(0, hdr.boundsMin[1]!)
+  const y1 = hdr.boundsMax[1]!
+  const big = CARPET_PX * CARPET_SS
+
+  const verts = mesh.vertices
+  const indices = mesh.indices()
+  const vbuf = ctx.res.createBuffer(
+    { label: `${ctx.id}/tile-verts`, size: verts.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST },
+    { tag: 'bake-scratch' },
+  )
+  device.queue.writeBuffer(vbuf, 0, verts)
+  const ibuf = ctx.res.createBuffer(
+    { label: `${ctx.id}/tile-idx`, size: indices.byteLength, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST },
+    { tag: 'bake-scratch' },
+  )
+  device.queue.writeBuffer(ibuf, 0, indices)
+
+  const uni = ctx.res.createBuffer(
+    { label: `${ctx.id}/tile-uni`, size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST },
+    { tag: 'bake-scratch' },
+  )
+  const [bx0, by0, bz0] = hdr.boundsMin
+  const [bx1, by1, bz1] = hdr.boundsMax
+  device.queue.writeBuffer(
+    uni,
+    0,
+    new Float32Array([bx0!, by0!, bz0!, 0, bx1! - bx0!, by1! - by0!, bz1! - bz0!, 0, tileM, y0, y1, 0]),
+  )
+
+  const bgl = device.createBindGroupLayout({
+    label: `${ctx.id}/tile-bgl`,
+    entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform' } }],
+  })
+  const bg = device.createBindGroup({
+    label: `${ctx.id}/tile-bg`,
+    layout: bgl,
+    entries: [{ binding: 0, resource: { buffer: uni } }],
+  })
+  const module = ctx.shaders.module(bakeTileSrc)
+  const pipeline = device.createRenderPipeline({
+    label: `${ctx.id}/tile-pipe`,
+    layout: device.createPipelineLayout({ label: `${ctx.id}/tile-pl`, bindGroupLayouts: [bgl] }),
+    vertex: {
+      module,
+      entryPoint: 'vs',
+      buffers: [
+        {
+          arrayStride: 16,
+          attributes: [
+            { shaderLocation: 0, offset: 0, format: 'uint16x4' },
+            { shaderLocation: 1, offset: 8, format: 'uint16x4' },
+          ],
+        },
+      ],
+    },
+    fragment: { module, entryPoint: 'fs', targets: [{ format: 'rgba8unorm' }, { format: 'rgba8unorm' }] },
+    primitive: { topology: 'triangle-list', cullMode: 'none' },
+    depthStencil: { format: 'depth32float', depthCompare: 'less', depthWriteEnabled: true },
+  })
+
+  const mk = (name: string, format: GPUTextureFormat, usage: number): GPUTexture =>
+    ctx.res.createTexture({ label: `${ctx.id}/${name}`, size: [big, big], format, usage }, { tag: 'bake-scratch' })
+  const rt = GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC
+  const albTex = mk('tile-albedo', 'rgba8unorm', rt)
+  const nrmTex = mk('tile-nrmh', 'rgba8unorm', rt)
+  const depthTex = mk('tile-depth', 'depth32float', GPUTextureUsage.RENDER_ATTACHMENT)
+
+  const enc = device.createCommandEncoder({ label: `${ctx.id}/tile-enc` })
+  const pass = enc.beginRenderPass({
+    label: `${ctx.id}/tile-pass`,
+    colorAttachments: [
+      { view: albTex.createView(), clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: 'clear', storeOp: 'store' },
+      { view: nrmTex.createView(), clearValue: { r: 0.5, g: 1, b: 0.5, a: 0 }, loadOp: 'clear', storeOp: 'store' },
+    ],
+    depthStencilAttachment: {
+      view: depthTex.createView(),
+      depthClearValue: 1,
+      depthLoadOp: 'clear',
+      depthStoreOp: 'store',
+    },
+  })
+  pass.setPipeline(pipeline)
+  pass.setVertexBuffer(0, vbuf)
+  pass.setIndexBuffer(ibuf, 'uint32')
+  pass.setBindGroup(0, bg)
+  // 3x3 copies: the mesh overflows its period, so a neighbour's overhang has
+  // to be inside our square for the mat to close. Everything outside the tile
+  // square is clipped away by the ortho projection.
+  pass.drawIndexed(indices.length, 9)
+  pass.end()
+
+  const readback = (tex: GPUTexture, label: string): GPUBuffer => {
+    const buf = ctx.res.createBuffer(
+      { label: `${ctx.id}/${label}`, size: big * big * 4, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ },
+      { tag: 'bake-scratch' },
+    )
+    enc.copyTextureToBuffer({ texture: tex }, { buffer: buf, bytesPerRow: big * 4, rowsPerImage: big }, [big, big])
+    return buf
+  }
+  const rbAlb = readback(albTex, 'rb-tile-albedo')
+  const rbNrm = readback(nrmTex, 'rb-tile-nrmh')
+  device.queue.submit([enc.finish()])
+  await Promise.all([rbAlb.mapAsync(GPUMapMode.READ), rbNrm.mapAsync(GPUMapMode.READ)])
+  const bigAlb = new Uint8Array(rbAlb.getMappedRange()).slice()
+  const bigNrm = new Uint8Array(rbNrm.getMappedRange()).slice()
+  rbAlb.unmap()
+  rbNrm.unmap()
+  for (const r of [vbuf, ibuf, uni, albTex, nrmTex, depthTex, rbAlb, rbNrm]) r.destroy()
+
+  const tile = processTile(bigAlb, bigNrm, big)
+  const span = y1 - y0
+  return packTile({
+    tileM,
+    y0,
+    y1,
+    hLo: y0 + tile.hLo * span,
+    hMid: y0 + tile.hMid * span,
+    hHi: y0 + tile.hHi * span,
+    albedo: tile.albedo,
+    nrmh: tile.nrmh,
+  })
+}
+
+/**
+ * Coverage-weighted SSxSS downsample of the tile capture, dilation into empty
+ * texels, and the height percentiles the shell stack spans. The normal is
+ * stored as a plain unit vector in the upper hemisphere (NOT octahedral):
+ * every normal here faces up, so a box-filtered mip of the raw vector is a
+ * genuine average, while oct-encoded values average into nonsense.
+ */
+function processTile(
+  bigAlb: Uint8Array,
+  bigNrm: Uint8Array,
+  bigW: number,
+): { albedo: Uint8Array<ArrayBuffer>; nrmh: Uint8Array<ArrayBuffer>; hLo: number; hMid: number; hHi: number } {
+  const T = CARPET_PX
+  const albedo = new Uint8Array(T * T * 4)
+  const nrmh = new Uint8Array(T * T * 4)
+  const filled = new Uint8Array(T * T)
+  const hist = new Float64Array(256)
+  let covered = 0
+  let hSum = 0
+
+  for (let y = 0; y < T; y++) {
+    for (let x = 0; x < T; x++) {
+      let aSum = 0
+      let r = 0
+      let g = 0
+      let b = 0
+      let nx = 0
+      let ny = 0
+      let nz = 0
+      let h = 0
+      for (let j = 0; j < CARPET_SS; j++) {
+        for (let i = 0; i < CARPET_SS; i++) {
+          const s = ((y * CARPET_SS + j) * bigW + (x * CARPET_SS + i)) * 4
+          const a = bigAlb[s + 3]!
+          if (a === 0) continue
+          aSum += a
+          r += bigAlb[s]! * a
+          g += bigAlb[s + 1]! * a
+          b += bigAlb[s + 2]! * a
+          nx += (bigNrm[s]! / 127.5 - 1) * a
+          ny += (bigNrm[s + 1]! / 127.5 - 1) * a
+          nz += (bigNrm[s + 2]! / 127.5 - 1) * a
+          h += (bigNrm[s + 3]! / 255) * a
+        }
+      }
+      if (aSum === 0) continue
+      const idx = y * T + x
+      const d = idx * 4
+      albedo[d] = Math.round(r / aSum)
+      albedo[d + 1] = Math.round(g / aSum)
+      albedo[d + 2] = Math.round(b / aSum)
+      albedo[d + 3] = Math.round(aSum / (CARPET_SS * CARPET_SS))
+      const len = Math.hypot(nx, ny, nz) || 1
+      nrmh[d] = Math.round(((nx / len) * 0.5 + 0.5) * 255)
+      nrmh[d + 1] = Math.round(((ny / len) * 0.5 + 0.5) * 255)
+      nrmh[d + 2] = Math.round(((nz / len) * 0.5 + 0.5) * 255)
+      const hn = h / aSum
+      nrmh[d + 3] = Math.round(hn * 255)
+      filled[idx] = 1
+      covered++
+      hSum += hn
+      const bin = Math.min(255, Math.round(hn * 255))
+      hist[bin] = hist[bin]! + 1
+    }
+  }
+
+  // Height percentiles over the visible surface only.
+  const pct = (p: number): number => {
+    const want = covered * p
+    let acc = 0
+    for (let i = 0; i < 256; i++) {
+      acc += hist[i]!
+      if (acc >= want) return i / 255
+    }
+    return 1
+  }
+  const hLo = covered > 0 ? pct(SHELL_LO_PCT) : 0
+  const hHi = covered > 0 ? pct(SHELL_HI_PCT) : 1
+  const hMid = covered > 0 ? hSum / covered : 0.5
+
+  // Dilate colour / normal / height into empty texels (coverage stays 0), so
+  // bilinear filtering and the mip chain never blend toward background black.
+  let cur = filled
+  for (let p = 0; p < DILATE_PASSES; p++) {
+    const next = cur.slice()
+    for (let y = 0; y < T; y++) {
+      for (let x = 0; x < T; x++) {
+        const idx = y * T + x
+        if (cur[idx]! !== 0) continue
+        let count = 0
+        let ar = 0
+        let ag = 0
+        let ab = 0
+        let nx = 0
+        let ny = 0
+        let nz = 0
+        let nh = 0
+        for (let j = -1; j <= 1; j++) {
+          const yy = y + j
+          if (yy < 0 || yy >= T) continue
+          for (let i = -1; i <= 1; i++) {
+            const xx = x + i
+            if ((i === 0 && j === 0) || xx < 0 || xx >= T) continue
+            const n = yy * T + xx
+            if (cur[n]! === 0) continue
+            count++
+            const s = n * 4
+            ar += albedo[s]!
+            ag += albedo[s + 1]!
+            ab += albedo[s + 2]!
+            nx += nrmh[s]!
+            ny += nrmh[s + 1]!
+            nz += nrmh[s + 2]!
+            nh += nrmh[s + 3]!
+          }
+        }
+        if (count === 0) continue
+        const d = idx * 4
+        albedo[d] = Math.round(ar / count)
+        albedo[d + 1] = Math.round(ag / count)
+        albedo[d + 2] = Math.round(ab / count)
+        nrmh[d] = Math.round(nx / count)
+        nrmh[d + 1] = Math.round(ny / count)
+        nrmh[d + 2] = Math.round(nz / count)
+        nrmh[d + 3] = Math.round(nh / count)
+        next[idx] = 1
+      }
+    }
+    cur = next
+  }
+
+  return { albedo, nrmh, hLo, hMid, hHi }
 }
 
 /** Octahedral encode, y-primary — exact inverse of the decode in gcmesh.ts. */

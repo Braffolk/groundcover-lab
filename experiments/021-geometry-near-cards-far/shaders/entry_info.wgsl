@@ -1,6 +1,6 @@
 // Per-stand-entry parameters shared by the cull compute pass (cull.wgsl) and
 // the plant draws (plants.wgsl). Written every frame by main.ts — keep the
-// field order in sync with the info[] writes there (INFO_FLOATS = 100).
+// field order in sync with the info[] writes there (INFO_FLOATS = 144).
 
 const NEAR_LAYERS: u32 = 4u;  // N_CARDS vertical cards + 1 top card
 const N_CARDS: u32 = 3u;
@@ -40,4 +40,15 @@ struct EntryInfo {
   // Per near card, per height band, the ink's (u0,u1): two bands per vec4,
   // indexed (card * BANDS + band). 3 cards x 6 bands = 18 pairs = 9 vec4.
   card_bands: array<vec4f, 9>,
+  // --- CARPET species only (stand_table[i].carpet_div > 0) ------------------
+  // A mat is drawn as ground-parallel shells cut from ONE top-down tile
+  // capture with a height channel; these are its parameters. Unused (zero) for
+  // upright species, whose fields above are unchanged.
+  //   x,y,z = shell plane heights lo / mean / hi (m at scale 1, mesh frame)
+  //   w     = shell count in the near bucket
+  shell_span: vec4f,
+  //   x = shell-LOD radius (m), y = carpet alpha reference,
+  //   z = cushion occlusion (deepest shell darkening),
+  //   w = mean shell fraction of the visible surface (for the far LOD's shade)
+  shell_more: vec4f,
 }

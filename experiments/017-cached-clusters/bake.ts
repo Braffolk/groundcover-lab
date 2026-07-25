@@ -119,6 +119,86 @@ function dilate(albedo: Uint8Array, normal: Uint8Array, x0: number, iterations =
   }
 }
 
+/** Wrapped border, in texels, around the rebuilt carpet tile. */
+export const CARPET_BORDER = 32
+/** The periodic tile occupies this fraction of the top capture tile. */
+export const CARPET_UV_SPAN = (TILE - 2 * CARPET_BORDER) / TILE
+export const CARPET_UV0 = CARPET_BORDER / TILE
+
+/**
+ * Rewrite the TOP capture of a periodic community tile as the tile square
+ * itself, with a wrapped border. Two separate problems, one fix:
+ *
+ * 1. The capture is an orthographic top view of the whole source mesh, and for
+ *    a Sphagnum tile that is 0.245m of geometry inside a 0.18m period — the
+ *    overflow is what covers the seam when copies are laid on the grid. A
+ *    renderer must crop to the tile square (or every tile is 1.36x oversized
+ *    and overlaps its neighbours), and cropping loses exactly that overflow:
+ *    the tile square's own coverage DIPS at its boundary (outer 2-3 texels
+ *    average 0.75-0.83 alpha against 0.95 inside), which alpha-tests into a
+ *    continuous dark line along every tile edge — a lattice over the whole mat.
+ * 2. Worse, the MIP CHAIN is built over the full 256px capture, whose mean
+ *    coverage is only 0.61 against the tile square's 0.97. Every mip texel a
+ *    distant tile samples is therefore contaminated by the sparse overhang
+ *    around the tile, and the deeper the mip the more it drags coverage and
+ *    colour toward the wrong values — a mid-distance moiré between the mip
+ *    grid and the tile grid.
+ *
+ * Both vanish if the stored tile IS the periodic square: sample the capture at
+ * the tile's own coordinates (falling back to a copy one period away where a
+ * texel is uncovered, which is the geometry the real carpet would have there),
+ * and surround it with a WRAPPED border so filtering — bilinear at mip 0 up to
+ * a single texel at mip 5 — only ever sees genuine tile content. The border is
+ * why this needs the whole 256px tile rather than just the crop.
+ *
+ * Runs at LOAD time on the committed artifact: no bake version bump, no
+ * re-baking a 479MB source mesh. Only species the stand lays out as a CARPET
+ * are rewritten; nothing else in the atlas is touched.
+ */
+export function rebuildCarpetTopTile(b: CardsBaked, tileM: number): void {
+  const { center, topHalfW, topHalfH } = b.meta
+  const texX = (p: number): number => Math.round(((p - center[0] + topHalfW) / (2 * topHalfW)) * TILE - 0.5)
+  const texY = (p: number): number => Math.round(((p - center[2] + topHalfH) / (2 * topHalfH)) * TILE - 0.5)
+  const src = b.albedo.slice()
+  const srcN = b.normal.slice()
+  const at = (x: number, y: number): number => (y * ATLAS_W + TILE + x) * 4
+  const inner = TILE - 2 * CARPET_BORDER
+  const wrap = (t: number): number => t - Math.floor(t)
+  for (let y = 0; y < TILE; y++) {
+    // Tile-local coordinate; outside [0,1) in the border, where it wraps.
+    const tz = wrap((y - CARPET_BORDER + 0.5) / inner) * tileM
+    for (let x = 0; x < TILE; x++) {
+      const tx = wrap((x - CARPET_BORDER + 0.5) / inner) * tileM
+      const dst = at(x, y)
+      // Nearest sample (the rebuild is ~1:1: 193 source texels into 192).
+      const clampT = (t: number): number => Math.min(TILE - 1, Math.max(0, t))
+      let found = at(clampT(texX(tx)), clampT(texY(tz)))
+      if (src[found + 3]! === 0) {
+        // Uncovered: try the periodic copies. In the real carpet this texel is
+        // covered by the neighbouring period's overflow; where none of them
+        // covers it either, it is a genuine gap down to the peat and stays.
+        for (let dj = -1; dj <= 1; dj++) {
+          for (let di = -1; di <= 1; di++) {
+            if (di === 0 && dj === 0) continue
+            const sx = texX(tx + di * tileM)
+            const sy = texY(tz + dj * tileM)
+            if (sx < 0 || sy < 0 || sx >= TILE || sy >= TILE) continue
+            const s = at(sx, sy)
+            if (src[s + 3]! === 0) continue
+            found = s
+            dj = 2
+            break
+          }
+        }
+      }
+      for (let c = 0; c < 4; c++) {
+        b.albedo[dst + c] = src[found + c]!
+        b.normal[dst + c] = srcN[found + c]!
+      }
+    }
+  }
+}
+
 /** Alpha-weighted 2x box downsample chain. Returns levels 0..MIPS-1. */
 export function buildMips(base: Uint8Array): { data: Uint8Array; w: number; h: number }[] {
   const levels: { data: Uint8Array; w: number; h: number }[] = [{ data: base, w: ATLAS_W, h: ATLAS_H }]

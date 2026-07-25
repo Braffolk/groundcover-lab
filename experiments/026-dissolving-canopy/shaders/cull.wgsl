@@ -11,10 +11,18 @@
 // The segments are radial, so drawing band 0 before band 1 is also a coarse
 // front-to-back order (early-z keeps the far band cheap).
 //
+// A CARPET entry (stand carpet_div > 0, e.g. the Sphagnum mat) has no bands: a
+// tile is always ONE ground-parallel quad, so every survivor goes to band 0 and
+// band 1 stays empty.
+//
 // Cost is O(region area), never O(total plants in the stand): a workgroup is 64
-// invocations and a cell holds SCATTER_MAX_PER_CELL = 128 candidate slots, so
-// every workgroup covers exactly half of ONE cell and the two cell-level
-// rejects below are workgroup-uniform — whole workgroups exit before a single
+// invocations and a cell holds info.cfg3.y candidate slots — SCATTER_MAX_PER_CELL
+// = 128 for a scattered entry, but carpet_div^2 = 484 for the life-size moss
+// carpet, which is deliberately ABOVE the scatter budget (div 22 is what puts a
+// 0.18m tile at life size). Driving this loop from the 128 budget would visit
+// only the first ~6 of 22 tile rows in every cell, i.e. render a quarter of the
+// mat as bands with bare peat between them. The two cell-level rejects below are
+// workgroup-uniform whichever it is — whole workgroups exit before a single
 // heightmap texel is fetched.
 
 struct PlantInst {
@@ -32,14 +40,15 @@ const TERRAIN_BOUND_SLACK: f32 = 1.05;
 @compute @workgroup_size(64)
 fn cs_cull(@builtin(global_invocation_id) gid: vec3<u32>) {
   let side_x = u32(info.region.z);
-  let total = side_x * u32(info.region.w) * SCATTER_MAX_PER_CELL;
+  let slots = u32(info.cfg3.y);
+  let total = side_x * u32(info.region.w) * slots;
   let idx = gid.x;
   if (idx >= total) {
     return;
   }
 
-  let slot = idx % SCATTER_MAX_PER_CELL;
-  let cell_lin = idx / SCATTER_MAX_PER_CELL;
+  let slot = idx % slots;
+  let cell_lin = idx / slots;
   let cx = i32(info.region.x) + i32(cell_lin % side_x);
   let cz = i32(info.region.y) + i32(cell_lin / side_x);
   let region_r = info.cfg0.z;
@@ -95,7 +104,9 @@ fn cs_cull(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
   }
 
-  let near = distance(sp.pos.xz, frame.camera_pos.xz) < info.cfg0.w;
+  // A carpet tile is one ground-parallel quad at every distance — no sub-tuft
+  // band, no whole-plant band, so it always lands in segment 0.
+  let near = entry.carpet_div > 0.0 || distance(sp.pos.xz, frame.camera_pos.xz) < info.cfg0.w;
   let band = select(1u, 0u, near);
   let cap = select(u32(info.cfg1.y), u32(info.cfg1.x), near);
   let base = select(u32(info.cfg1.x), 0u, near);

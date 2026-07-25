@@ -44,3 +44,26 @@ fn fs_normal(@builtin(position) pos: vec4f) -> @location(0) vec4f {
   }
   return acc * 0.25;
 }
+
+// Carpet normal maps store PLAIN unit vectors in the +Y hemisphere (rgb) plus
+// coverage (a), not an octahedral pair — octahedral encoding is not
+// mip-averageable. Averaging the vectors is linear and safe; weighting by
+// coverage keeps empty texels from dragging the average toward the dilation
+// fringe. The result is renormalized, so every level stays a unit vector.
+@fragment
+fn fs_normal_cov(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+  let base = vec2i(pos.xy) * 2;
+  var v = vec3f(0.0);
+  var a_sum = 0.0;
+  for (var j = 0; j < 2; j++) {
+    for (var i = 0; i < 2; i++) {
+      let t = src_texel(base, i, j);
+      let w = t.a + 0.002;
+      v += (t.xyz * 2.0 - 1.0) * w;
+      a_sum += t.a;
+    }
+  }
+  let len = length(v);
+  let n = select(vec3f(0.0, 1.0, 0.0), v / len, len > 1e-5);
+  return vec4f(n * 0.5 + 0.5, a_sum * 0.25);
+}

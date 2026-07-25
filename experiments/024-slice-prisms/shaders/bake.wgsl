@@ -14,7 +14,12 @@
 // Outputs:
 //   target 0: rgb = authored albedo, a = coverage
 //   target 1: rgb = mesh-frame normal * 0.5 + 0.5 (flipped toward the bake
-//             camera so both faces of a blade light like the front), a = 1
+//             camera so both faces of a blade light like the front),
+//             a = the winning surface's normalized depth along the bake axis.
+//             The prism resolve ignores that alpha; the CARPET resolve uses it
+//             as a free full-resolution HEIGHT FIELD of the visible surface —
+//             free because it falls out of the same depth test that already
+//             decided which surface the texel shows.
 // No @group(0) frame include here — the bake is self-contained.
 
 struct BakeView {
@@ -22,7 +27,10 @@ struct BakeView {
   up_axis: vec4f,    // xyz: tile V axis for the top view
   fwd_axis: vec4f,   // xyz: toward the bake camera; w: 1 = top view
   capture: vec4f,    // cx, cz, y0, y1
-  extent: vec4f,     // x: horizontal support radius r; y,z: slab [d_lo, d_hi)
+  extent: vec4f,     // x: horizontal support radius r; y,z: slab [d_lo, d_hi);
+                     // w: 1 = write the normalized depth as colour instead of
+                     // albedo (the carpet bake histograms the VISIBLE surface
+                     // height before it decides where to cut its slices)
   b_min: vec4f,      // mesh bounds min (dequantization)
   b_range: vec4f,    // mesh bounds max - min
 }
@@ -98,7 +106,16 @@ fn fs(in: VOut) -> FOut {
     discard;
   }
   var out: FOut;
+  // Depth probe: the colour target carries the normalized height of whatever
+  // surface won the depth test, so the CPU can quantile the VISIBLE surface.
+  if (bake_view.extent.w > 0.5) {
+    out.albedo = vec4f(in.slab_d, in.slab_d, in.slab_d, 1.0);
+    out.nrm = vec4f(0.5, 0.5, 0.5, 1.0);
+    return out;
+  }
   out.albedo = vec4f(in.color, 1.0);
-  out.nrm = vec4f(normalize(in.nrm) * 0.5 + 0.5, 1.0);
+  // alpha carries the depth of whatever won here (see the header): the carpet
+  // resolve turns it into a height field, the prism resolve ignores it.
+  out.nrm = vec4f(normalize(in.nrm) * 0.5 + 0.5, clamp(in.slab_d, 0.0, 1.0));
   return out;
 }

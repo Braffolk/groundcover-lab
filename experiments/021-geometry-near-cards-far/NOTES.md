@@ -92,6 +92,95 @@ Cost collapses with distance in this order: 18 band quads + 1 top card (near) �
 near plane once the region/inside fade erodes the card entirely → not emitted at
 all outside `regionRadius`.
 
+## Carpet species: the same idea rotated 90 degrees
+
+**Near: a stack of ground-parallel relief shells. Far: the one flat quad. Both
+cut from ONE top-down capture of the tile's own square that carries a HEIGHT
+channel.**
+
+Sphagnum palustre is not a plant with a silhouette — it is a 0.18m periodic
+community tile, 0.07-0.09m tall, laid out by the `bog` stand as a life-size mat
+(22x22 tiles per 4m cell, constant scale 1.0101, 90-degree yaw only). Rendered
+through the card path it was indefensible: three vertical planes 0.3m across
+slicing through the ground and through each other, every tile drawn at the card
+radius instead of its footprint, and — the worst of it — only 128 of its 484
+slots enumerated, so the mat came out as *stripes*: six tile rows of moss then
+bare peat, over and over, all the way to the horizon.
+
+The near/far split survives, but the axis of the decomposition changes. For an
+upright plant the interesting variation is around the vertical axis, so the
+cards are vertical. For a cushion the entire variation is *height above the
+ground*, so the "cards" are horizontal:
+
+* shell k is a ground-parallel quad over the tile's own square at height
+  `mix(hLo, hHi, k/(n-1))`, and it keeps only the texels whose baked surface
+  height reaches its own plane. The stack is therefore a terraced
+  reconstruction of the real 3.3cm of capitulum relief, and — because coverage
+  is nested — seen from straight above it reproduces the true ortho top view
+  exactly, just at the right depths.
+* shell 0 carries no height gate at all. It is the closed base of the mat: a
+  carpet that dissolves is worse than a carpet with no relief.
+* past `shellRadius` (8m) a tile is one quad at the surface's mean height —
+  precisely what `001-billboard-smoke` draws, which is all a 17px tile can show.
+
+One capture serves both LODs, so nothing can move, resize or re-light at the
+handover; the only thing that changes is how many planes it is sliced into.
+
+### What changed, smallest first
+
+1. **Enumerate `carpet_div²` slots, not `SCATTER_MAX_PER_CELL`.** The cull now
+   takes its slots-per-cell from the stand entry (484 for the bog moss, 128 for
+   everything else). This alone is the difference between a quarter of the mat
+   and all of it. Capacity is kept separate from enumeration: every slot is
+   *visited*, but the instance buffer is sized for the entry's wetness share
+   (measured worst local share on the bog is 0.58 of a nominal 1/3 band, so
+   `wetWidth * 1.9`).
+2. **Instance capacity clamped to the stand.** `min(region, stand span)` cells,
+   as 001 does. Identical on the ±128m stands, ~3.5x smaller on the ±96m bog.
+3. **A second draw shape, on its own pipelines** (`vs_carpet` / `vs_carpet_far`
+   / `fs_carpet`). The card path is untouched — same interpolants, same
+   instruction count, bit-identical output on `default`.
+4. **Footprint from `stand_table.footprint_m`**, never from the capture radius
+   or `height_scale`, and the exact carpet scale from `stand_table.scale_min`
+   rather than the 12-bit instance value (0.08% is enough to stop tiles
+   abutting). Yaw is decoded as an exact quarter turn.
+5. **Per-vertex terrain conforming (ladder rung 3)** — see below.
+6. **A carpet alpha reference of 0.06** instead of the grass 0.4, so distant
+   tiles cannot fail the test wholesale and punch holes in the mat, and **no
+   camera-inside fade** — a mat you are standing on must not open under you.
+7. **A dedicated carpet bake** (see Bake) and the height channel that makes the
+   shells possible.
+8. **LOD brightness matched by measurement.** The shells darken with depth
+   (`cushionShade`, cavity occlusion). The far quad shades itself with the
+   *area-weighted mean* of the shells it replaces, computed at load from the
+   tile's own height histogram (0.50 for all three states), so no ring sweeps
+   the field at the handover radius.
+
+### Terrain fitting: rung 3 (per-vertex), and it is not optional here
+
+Every shell corner gets its own `terrain_sample(xz)` — height and the ground
+normal's (nx, nz) from one bilinear fetch, so the shading basis is free.
+
+Rung 3 rather than 1 or 2 for a structural reason, not a quality preference:
+neighbouring tiles **share their corner positions exactly** (the grid step *is*
+the tile size), so a per-vertex fit is the only rung that keeps the whole mat
+C0-continuous. Any rung that fits one plane per tile — point normal or
+`terrain_plane_fit` — lets two neighbours choose two different planes and leaves
+a wedge-shaped crack along every tile boundary. The cheap rungs are not cheaper
+here, they are wrong. Verified on a 31-degree bog ridge at 0.45m eye height: the
+mat follows the slope with no buried or floating edges and no visible tile grid.
+`slope_align` is not read by the carpet path at all — `carpet_div > 0` already
+means "this is a mat", and a mat conforms fully by definition.
+
+### The lattice invariant
+
+Grid step, 90-degree yaw and constant scale come from the stand and are used as
+given. No billboarding, no per-tile jitter, no distance shrink, **no overscale**
+(1.0, exact abutment — the pilot measured overscale as a net loss on a flat
+tile, and the shells give an overlap even less room to hide). Every shell of
+every tile is at the same height above its own ground, so neighbours agree
+plane-for-plane as well as edge-for-edge.
+
 ## VRAM budget math
 
 Per species, as the HUD reads it: **15.6-16.3 MB of 25 MB.**
@@ -114,6 +203,26 @@ independently, so no tile bleeds into its neighbour at coarse mips and no UV
 inset is needed. 256px far tiles are deliberate — the handover is at ≥16m, where
 a 1.2m plant is ~50px, so 256 is already ~5× oversampled and the smaller working
 set filters better.
+
+**A carpet species: 14.8 MB of 25 (HUD-verified, bog stand).**
+
+| item | size | bytes |
+|---|---|---|
+| tile albedo+coverage, rgba8 512², 10 mips | one layer | 1.40 MB |
+| tile normal+height, rgba8 512², 10 mips | one layer | 1.40 MB |
+| far instance list (±96m stand × 484 slots × share 0.63) | ~735k × 16 B | 11.8 MB |
+| shell instance list (8m disc… 24m at the param's max) | ~35k × 16 B | 0.56 MB |
+| **total** | | **~15.2 MB** |
+
+The allocation is the point. Through the card path the same species cost
+**26.0 MB — over budget** — and spent 9.8 MB of it on three wedge cards and
+eight azimuth views of a thing that has no silhouette, at a texel density
+diluted by a capture box 1.55x wider than the tile. Here the imagery is 2.8 MB
+of *only* what a mat shows (the top surface, at 0.35 mm/texel over the tile's
+own square, 1.55x denser than cropping the tile out of a whole-mesh capture),
+and the memory instead goes where a life-size mat actually needs it: one
+instance per tile over a ±96m stand. Both far slots of the bind group point at
+the same two textures — a mat's far LOD is the same picture, drawn once.
 
 ## Bake
 
@@ -145,11 +254,46 @@ is left behind.
 
 Mip chains are generated on the GPU at load, per layer per level.
 
+### Carpet bake (`carpet-v1-<species>.bin`, 2.10 MB each)
+
+A separate, much smaller artifact for `carpet_div > 0` species — `bake_tile.wgsl`
+plus `bakeSpeciesTile()`. The three `cloud-v3-spaghnum-*` artifacts are deleted;
+nothing stale is left behind.
+
+1. One orthographic straight-down pass over exactly `[0, tileM]²` in the mesh
+   frame (tile origin is (0,0) for every current source mesh), 1024² supersampled
+   2x into 512².
+2. **The mesh is drawn 3x3 times, offset by its period.** The mesh overflows its
+   own tile (0.24m of geometry inside a 0.18m period), so a neighbour's overhang
+   has to be inside our square or the mat cannot close. Measured coverage after
+   this: **97-99.5%** of the tile. It also makes opposite edges identical by
+   periodicity, which is why no tile lattice is visible even at 0.3m.
+3. Targets: albedo+coverage, and (normal, height). The normal is stored as a
+   **plain unit vector flipped into the upper hemisphere, not octahedral**,
+   precisely so that box-filtered mips stay a real average (CLAUDE.md's
+   octahedral trap); the height is normalized over the capture box `[y0, y1]`.
+4. Post: coverage-weighted 2x downsample, 6 dilation passes, and the height
+   percentiles the shell stack spans — `hLo` = p5 and `hHi` = p97 of the visible
+   surface, `hMid` = its mean. Measured shell coverage for the wet state:
+   95 / 84 / 55 / 20 / 2.6% of the tile's ink at the 5 default planes.
+
+The bake is ~2 min per species, dominated by parsing and uploading a 479 MB
+19.8M-triangle mesh; the rasterization itself is one pass. Transient GPU memory
+is the vertex + index buffers (~420 MB), tagged `bake-scratch` and destroyed.
+
 ## Status
 
 **working** — seen working at all four standard cameras, all six debug views, on
 `default` and on `scaling-100m`. No console errors.
 `npx tsc --noEmit | grep 021-geometry-near-cards-far` is clean.
+
+Carpet path verified on `bog` at grazing / topdown / inside-plant /
+carpet-close, a 31-degree ridge at 0.45m eye height, a wide sloped view, two
+macro views (0.3m and 0.12m above ground) and albedo / normals / lighting /
+coverage. No toasts, no console errors. `default` is **unchanged**: the mean RGB
+of eight horizontal scene bands is byte-identical before vs after at
+`cam=grazing`, `cam=topdown` and `cam=inside-plant`, and VRAM reads the same
+16.3 / 15.6 / 16.3 MB.
 
 ## Findings
 
@@ -261,9 +405,143 @@ What the A/B wipe and same-camera solo captures actually showed:
   continues) and only adds gradient work, so both taps stay in front of the
   discard, exactly as the baseline does it.
 
+### Moss — what improved, what is still bad
+
+All from screenshots at the same cameras before and after (1400x800, `det=1&t=3`,
+seed 42), plus band-mean measurements of the scene.
+
+**Before** (the card path applied to a mat): the bog read as *corduroy* — six
+rows of dark moss slabs per 4m cell then bare peat, repeated to the horizon,
+because only 128 of the 484 carpet slots were enumerated. Each surviving tile
+was three vertical 0.3m planes crossing through the ground; from 1m straight
+down the mat was a field of dark X-shaped crosses on bare peat with metre-wide
+gaps between them. VRAM was 26.0 / 25.3 / 24.3 MB — over budget.
+
+**After**: a closed, continuous mat at every distance from 0.3m to the horizon,
+with the three micro-habitat states reading as coherent interlocking zones.
+Specifically, and each of these was looked at:
+
+* **carpet-close (1m straight down)**: fine mottled moss, no seams, no holes, no
+  tile lattice anywhere — better than `001-billboard-smoke` at the same pose,
+  which shows thin dark lines along its tile boundaries (its crop misses the
+  neighbours' overhang; the 3x3 bake fixes that here).
+* **Macro, 0.3m at 34 degrees**: this is where the shells earn their keep. Same
+  camera at `shellCount=2` vs `5` vs `8`: 2 is visibly a flat photograph with a
+  few bright specks, 5 reads as a dense springy cushion with depth between the
+  capitula, 8 begins to smear vertically (each surface texel is drawn on every
+  shell below it, so more shells means more repeats of the same texel along the
+  view ray). 5 is the default for that reason.
+* **31-degree ridge at 0.45m**: the mat follows the slope continuously, no
+  buried or floating edges, no cracks between tiles, no stair-stepping of the
+  grid. This is rung 3 doing its job.
+* **Grazing / inside-plant**: the moss reads as ground *cover* rather than
+  ground *texture*, but honestly the shells contribute almost nothing at eye
+  level — see the verdict below.
+* **Debug views**: `coverage` is solid white with hard speckled edges (a
+  depth-writing occluder, no dither anywhere); `normals` shows real per-texel
+  variation at close range (the tile's mean n.y is 0.61 with 29% of texels at
+  45-60 degrees from up — measured from the artifact) and flattens toward up
+  with distance exactly as `001` does, which is the shared normal-mip
+  limitation, not a bug in this path; `albedo` and `lighting` divide out.
+* Band means at `cam=grazing` (near→far): this renderer 74-99 vs `001`'s 89-103,
+  i.e. **~15% darker overall** at the same hue. Roughly half of that is the
+  deliberate cushion occlusion (`cushionShade`, folded into albedo the way the
+  card path folds its grounding gradient), the rest is that real per-texel
+  normals near the camera are genuinely darker than `001`'s oct-mip normals,
+  which drift toward straight up.
+* In `debug=albedo` the field brightens **~23% from 2m to 14m** (`001`: ~6% over
+  the same range). ~9% of that is the shells-vs-quad occlusion difference and
+  the rest is coverage convergence — near, the alpha test opens the genuine gaps
+  down to the peat and you see dark terrain through them; far, the mip closes
+  them. It is the same sign of drift `001` has, larger because this path has
+  more contrast to lose.
+
+**Still bad:**
+
+* **No distance aggregation.** Life size means ~1.13M tiles on the bog and every
+  one of them past 8m is still its own 6-vertex quad with four terrain taps.
+  That is where the bog's frame time goes (`plants` 2.5-3.8 ms vs `001`'s
+  3.0-3.5 ms on a contended GPU). The obvious fix — one quad per 2x2 or 4x4
+  block of tiles with a repeat sampler past ~40m — is a real change to how zone
+  boundaries resolve at distance and was out of scope for this pass.
+* **The shells are invisible at eye level**, and there is no way around that: a
+  3.3cm relief seen from 1.7m at 3m distance is under a pixel of vertical
+  extent. They pay off between roughly 0.2m and 1.5m.
+* **Shell smear.** Because coverage is nested, a tall texel is painted on every
+  shell beneath it, so at oblique angles the surface streaks along the vertical.
+  It reads as plush/velvet at 5 shells and as combing at 8. The alternative —
+  giving each shell only its own height band — removes the smear but opens the
+  risers as see-through gaps, which is worse.
+* The wet-vigorous state is a strongly saturated flat green in the source
+  authoring (`debug=albedo` confirms it is the capture, not the lighting), so
+  its zone still reads as poster paint next to the ochre states.
+* 512px per tile is 4x oversampled at the `carpet-close` bookmark but becomes
+  the limit below ~0.3m. 768 or 1024 would fit the budget (the imagery is only
+  2.8 MB); not done because nothing in the standard camera set asks for it.
+
+### Is this representation suited to moss?
+
+**Partly, and more than a flat card — but the win is narrow and honest.**
+
+What works: a mat is a heightfield, and a heightfield decomposes into
+ground-parallel shells cleanly. Nothing about the technique fights the lattice
+(the shells are all horizontal, so tiles agree plane-for-plane), nothing needs
+camera-facing geometry, the closed base shell keeps the mat a solid occluder,
+and one capture with a height channel serves both LODs — so it is *cheaper* in
+memory than the flat-card baseline while carrying strictly more information.
+Between 0.2m and 1.5m the cushion genuinely has thickness: layers occlude each
+other, the parallax when the camera moves is real geometric parallax, and the
+depth between capitula is visible.
+
+What does not work: past ~2m the relief is sub-pixel and this collapses to
+exactly the baseline's flat quad — correctly, but it means the improvement is
+confined to the range where you are almost lying in the moss. And the shells are
+an approximation with their own signature (terracing, and the vertical smear
+from nested coverage) that a real displaced surface would not have. The *card
+cloud* half of this experiment — the three vertical wedge planes that make it
+what it is — contributes nothing at all to a carpet and had to be switched off
+entirely; what renders the moss here is a new shape that shares only the
+experiment's near/far structure. So: this renderer can render moss decently, but
+it does it by becoming a different renderer for that species, and the honest
+ceiling of a shell stack on a 7cm cushion is "convincing ground cover you can
+crouch over", not "a cushion you could press with your hand".
+
+### Harness notes (what was missing or awkward)
+
+* `standEntrySlots()` exists in TS but there is **no WGSL twin**: a shader has to
+  write `u32(entry.carpet_div) * u32(entry.carpet_div)` with the
+  `carpet_div == 0 → SCATTER_MAX_PER_CELL` fallback by hand. A
+  `scatter_entry_slots(entry_index)` in `scatter.wgsl` would put the one number
+  that silently deletes three quarters of a mat in exactly one place.
+* Nothing exposes an entry's **expected occupancy**. Every renderer that sizes
+  an instance buffer for a zoned carpet has to guess how much of `[0,1)` its
+  wetness interval actually claims; I had to measure the field offline (worst
+  local share 0.58 of a nominal 1/3) and hardcode `wetWidth * 1.9`. A
+  `standEntryShare(entry)` — even a coarse precomputed bound — would remove a
+  guess that is invisible when wrong until tiles start vanishing.
+* The mesh header's `tileSize` / `tileOrigin` are exactly what a carpet bake
+  needs and were enough; `stand_table.footprint_m` matched them. Good.
+* `terrain_sample()` returning (h, nx, nz) in one fetch is the right primitive
+  for per-vertex conforming — the shading basis came out free. Nothing missing.
+* `slope_align` had no use here: for a mat, `carpet_div > 0` already implies
+  full conformance, and for the bog's calamagrostis (0.3) the card path would
+  have to tilt its whole card basis, which is a change to the grass path that
+  the "do not regress `default`" bar makes unattractive for a 13k-plant entry.
+  Not a complaint — just a report that the field went unread.
+* The dev server still answers a missing `/mesh/baked/...` with `index.html` at
+  200, so every artifact load needs the magic-validation shim. A 404 would let
+  experiments delete that code.
+
 ### Links
 
 * run: `#/run/021-geometry-near-cards-far?stand=default&cam=grazing`
+* moss: `#/run/021-geometry-near-cards-far?stand=bog&cam=carpet-close`
+  (also `cam=grazing`, `cam=topdown`, `cam=inside-plant`)
+* the shells, on and off: the bog run URL with `p.shellCount=2` vs `p.shellCount=5`
+  vs `p.shellCount=8` at `cam=0.28,-7.51,0.28,-0.7854,-0.60,50`
+* handover: same URL with `p.shellRadius=0` (all flat quads) vs `p.shellRadius=24`
+* A/B vs the champion on the mat:
+  `#/ab/001-billboard-smoke/021-geometry-near-cards-far?stand=bog&cam=carpet-close&seed=42`
 * A/B vs the champion:
   `#/ab/001-billboard-smoke/021-geometry-near-cards-far?stand=default&cam=grazing&seed=42`
   (also `cam=topdown`, `cam=far-horizon`, `cam=inside-plant`)

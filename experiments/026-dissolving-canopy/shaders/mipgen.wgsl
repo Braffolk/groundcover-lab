@@ -6,6 +6,11 @@
 //                   filter over oct pairs drifts toward nonsense at distance)
 //   fs_aux    rgba8 canopy aux: oct normal decoded/averaged/re-encoded in rg,
 //                   plain average of the height byte in b
+//   fs_aux_ao rgba8 same, plus the plain average of the baked cavity occlusion
+//                   in a — averaging the OCCLUSION (rather than deriving it
+//                   from the averaged height) is what keeps a mat's shading
+//                   constant with distance instead of brightening as the
+//                   height field flattens
 
 @group(0) @binding(0) var src_level: texture_2d<f32>;
 
@@ -99,4 +104,21 @@ fn fs_aux(@builtin(position) pos: vec4f) -> @location(0) vec4f {
     }
   }
   return vec4f(oct_encode_mip(normalize(n)), h * 0.25, 1.0);
+}
+
+@fragment
+fn fs_aux_ao(@builtin(position) pos: vec4f) -> @location(0) vec4f {
+  let base = vec2i(pos.xy) * 2;
+  var n = vec3f(0.0);
+  var h = 0.0;
+  var ao = 0.0;
+  for (var j = 0; j < 2; j++) {
+    for (var i = 0; i < 2; i++) {
+      let t = src_texel(base, i, j);
+      n += oct_decode_mip(t.xy * 2.0 - 1.0);
+      h += t.z;
+      ao += t.w;
+    }
+  }
+  return vec4f(oct_encode_mip(normalize(n)), h * 0.25, ao * 0.25);
 }

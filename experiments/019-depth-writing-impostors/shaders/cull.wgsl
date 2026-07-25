@@ -10,10 +10,16 @@
 // behind it are rejected before they shade. Cost is O(region area), never
 // O(total plants in the stand).
 //
-// A workgroup is 64 invocations and a cell holds SCATTER_MAX_PER_CELL = 128
-// candidate slots, so every workgroup covers exactly half of ONE cell: the
-// cell-level region/frustum rejects below are workgroup-uniform and let whole
-// workgroups exit before a single terrain texel is fetched.
+// A cell holds info.slots_per_cell candidate slots for THIS entry, which is
+// NOT always SCATTER_MAX_PER_CELL: a carpet entry has carpet_div^2 of them
+// (484 for the bog moss, deliberately over the 128 scatter budget, because
+// div 22 is what puts a 0.18m tile at life size). Driving this loop from the
+// constant renders about a quarter of the mat and leaves holes that look
+// exactly like a placement bug. main.ts rounds the count up to a multiple of
+// the 64-wide workgroup, so every workgroup still covers part of exactly ONE
+// cell and the cell-level region/frustum rejects below stay workgroup-uniform:
+// whole workgroups exit before a single terrain texel is fetched. Slots past
+// carpet_div^2 fall out of scatter_candidate() as `exists = false`.
 
 struct PlantInst {
   pos: vec3f,
@@ -31,14 +37,15 @@ const TERRAIN_BOUND_SLACK: f32 = 1.05;
 @compute @workgroup_size(64)
 fn cs_cull(@builtin(global_invocation_id) gid: vec3<u32>) {
   let side_x = u32(info.side_x);
-  let total = side_x * u32(info.side_z) * SCATTER_MAX_PER_CELL;
+  let slots = u32(info.slots_per_cell);
+  let total = side_x * u32(info.side_z) * slots;
   let idx = gid.x;
   if (idx >= total) {
     return;
   }
 
-  let slot = idx % SCATTER_MAX_PER_CELL;
-  let cell_lin = idx / SCATTER_MAX_PER_CELL;
+  let slot = idx % slots;
+  let cell_lin = idx / slots;
   let cx = i32(info.origin_cell_x) + i32(cell_lin % side_x);
   let cz = i32(info.origin_cell_z) + i32(cell_lin / side_x);
 

@@ -66,6 +66,18 @@ the switch. Near is drawn first, giving coarse front-to-back for early-z. Hard
 alpha test + depth write throughout: no dither anywhere, no blending, no
 `frag_depth`.
 
+**Carpets take a third shape.** A species the stand lays out as a mat
+(`carpet_div > 0`, the bog Sphagnum) cannot be a camera-facing card: cards would
+slice through the ground and through each other, and per-tile view alignment
+destroys the lattice that makes a mat a mat. So a carpet entry draws **one
+ground-parallel quad exactly one periodic tile across**, per-vertex conformed to
+the terrain, textured from the **straight-down view only** — and the same
+per-texel depth field becomes a **tangent-plane parallax offset** measured from
+the quad's plane, i.e. classic one-step parallax mapping rather than a warp
+along the eye ray. That is the one thing this method can give a mat that a flat
+card cannot: capitula above the plane and hollows below it slide against each
+other as the camera moves. Details in **Findings → Sphagnum carpet**.
+
 **O(1) in plant count.** Nothing is ever materialised for the whole stand.
 Verified: `default` (557k plants) and `scaling-100m` (134.2M plants, ±2048 m)
 render at the same cost and the same VRAM.
@@ -84,6 +96,25 @@ Per species, HUD-verified:
 
 **Default stand: 23.1 / 25 MB per species** (elymus 22.8). Worst defined stand,
 `dense-mixed` at density 5: **24.6 / 25 MB**. No overrun anywhere.
+
+**Carpet species spend the budget somewhere else entirely.** A mat samples
+exactly ONE of the 25 baked views, so the other 24 are dead VRAM — 20 MB of an
+atlas that a plant with no silhouette can never use. A carpet species therefore
+uploads only the straight-down tile (384² albedo + 128² geometry, both mipped),
+and the instance lists are sized from `carpetDiv²·wetWidth`, not from `density`:
+
+| item (per Sphagnum species, bog stand) | size |
+|---|---|
+| straight-down albedo tile 384² rgba8 + mips | 0.79 MiB |
+| straight-down geometry tile 128² rgba8 + mips | 0.09 MiB |
+| culled instances, near (π·44²·12.6, 16 B) | 1.47 MiB |
+| culled instances, far (π·112²·12.6, 16 B) | 8.0 MiB |
+
+**Bog stand: 10.3 / 25 MB per moss species** (HUD-verified), down from 26.9
+before — the only thing that was over budget anywhere in this experiment. The
+grasses in the same stand are unchanged at 21.9 / 21.3. Cropping to one tile
+also gives the mip chain a tile of its own instead of one shared across the 5×5
+grid, so distant tiles never blend a neighbouring view's imagery in.
 
 Byte-for-byte the albedo atlas spends what the baseline spends on its
 albedo+normal pair, but on 25 views instead of 9, so per-view resolution is
@@ -169,7 +200,171 @@ the straight-down tile. Re-spending four tiles fixed it completely.
 `001-billboard-smoke`. Zero console errors or warnings in every run.
 `npx tsc --noEmit` clean.
 
+The **`bog` stand** (Sphagnum carpet) was added in a later pass and is verified
+the same way: `grazing`, `topdown`, `inside-plant`, `carpet-close`, a knee-height
+oblique, a 0.55-gradient hillside at 1.1 m and at 4 m, `debug=normals` /
+`lighting` / `coverage` / `albedo`, and the A/B page against
+`001-billboard-smoke` at three cameras. No toasts, no console errors. The
+`default` stand is **pixel-identical** before and after that pass (mean |Δ| 0.00
+/255 at `grazing` and `inside-plant` over the whole frame below the HUD).
+
 ## Findings
+
+### Sphagnum carpet (`bog` stand)
+
+Where it started: every moss tile was drawn as an **upright, camera-facing card
+0.21 m wide**, and only **128 of the 484** slots per cell were evaluated, so the
+mat came out as brown ribbons of standing cards covering roughly a quarter of
+the ground with bare peat between them. All five failure modes at once.
+
+The fixes, smallest first:
+
+1. **Drive the cull's slot count from `carpet_div²`, not `SCATTER_MAX_PER_CELL`**
+   (one uniform field, `info.carpet.x`). 128 → 484 slots. This alone is the
+   difference between a quarter of the mat and all of it. Instance capacity is
+   sized from a *different* number — `carpetDiv²/16 · min(1, wetWidth·1.25)` per
+   m², i.e. the expected survivors of the three-way wetness partition, which is
+   ~3× less than sizing for every slot.
+2. **A ground-parallel carpet quad** (`vs_carpet` + `fs_carpet_near/far`), sized
+   from `stand_table.footprint_m` (never `height_scale` — that would make a
+   0.24 m-wide cushion 0.07 m wide), taking the stand's 90°-step yaw and
+   constant scale **as given**, with **no camera-inside fade** (a mat you stand
+   on must not open a hole) and a carpet-specific alpha reference of **0.06**
+   instead of the grass 0.4, so mipped distant tiles cannot dissolve. Overscale
+   stays at 1.0: tiles abut exactly, so there is no overlap to z-fight and no
+   need for a depth bias.
+3. **Per-vertex terrain conforming — rung 3 of the ladder.** `terrain_sample()`
+   under each of the four corners (height and ground normal in one bilinear
+   fetch), and the baked normal is lifted into that ground basis rather than
+   merely yawed. Rungs 1–2 are not merely cheaper here, they are *wrong*: a mat
+   is tiled, and neighbouring tiles that each fit their own plane crack apart
+   along their shared edge. Only per-vertex keeps the surface C0. Checked on the
+   bog's ridged flanks at 1.1 m and 4 m — the mat follows the relief with no
+   floating edges, no buried edges and no cracks.
+4. **Parallax relief from the same depth field.** Instead of the eye-ray warp
+   (which needs a near plane the ray actually crosses — hopeless for a
+   ground-parallel plane at grazing), the carpet fragment does textbook
+   tangent-space parallax: read `q` at the un-offset UV, convert it to a depth
+   below the quad's plane, and slide the sample along the view ray by
+   `-(V.xz/V.y)·depth/footprint`. Scale cancels, so it is a pure tile fraction;
+   the magnitude is smoothly saturated at half a tile and `V.y` is clamped at
+   0.22 so a grazing ray cannot demand an unbounded offset. **The offset wraps
+   (`fract`) — the tile is periodic, so it walks into the neighbour's imagery
+   instead of clamping at an edge.** Measured effect: parallax 1 vs 0 at the
+   same frozen knee-height camera differs by mean **10.95/255** over the mat
+   while the mean luma is unchanged (56.0 vs 56.3) — displacement, not a global
+   shift. The plane sits at 0.74 of the capture height (the mesh's mean
+   capitulum apex), so the offset moves the imagery *both* ways.
+5. **Upload only the straight-down tile** for a carpet species — see the VRAM
+   section. 26.9 → 10.3 MB per species.
+6. **Make the baked tile actually periodic, at load time.** This was the biggest
+   remaining artifact and it is worth stating carefully. The bake renders ONE
+   mesh instance, and a community tile overflows its own period (0.24 m of moss
+   inside a 0.18 m step). So the captured square holds this tile plus *its own*
+   overhang, and the overhang of the four neighbours — which in a real mat grows
+   back into this square — was never drawn. Show that square as one quad and
+   every tile edge is short of coverage: the mat gets a visible lattice of thin
+   dark seams, and it did, at every distance. **No rebake was needed, because
+   everything missing is already in the image**: the mesh is periodic, so the
+   neighbour's overhang at *p* is the mesh's own overhang at *p* ± period. A
+   9-tap composite over the lattice (the more-covered sample wins — a top-down
+   view of a mat sees the fuller surface) fills the deficit *and* makes the
+   result exactly periodic, so the sampling window can then be any window one
+   period wide and its two edges match by construction. Mean coverage over the
+   sampled window goes **0.951 → 0.984** (wet-vigorous), **0.853 → 0.934**
+   (late-season), **0.886 → 0.930** (sun-exposed) — a few points on the mean,
+   but all of it concentrated in the edge strips, which is exactly why it read
+   as a lattice. Gone in `debug=coverage` and in the render. It also removes a
+   second bug for free: the tile square's true phase inside the capture box is
+   not derivable from the artifact (see Harness wishlist), and after the
+   composite the phase no longer matters.
+7. **Smooth the shading normals for a carpet, and only for a carpet.** Sphagnum
+   leaflets are far below one geometry texel (1.6 mm), so the bake's
+   *point-picked* normal — exactly right for a grass blade, which spans many
+   texels, and the single biggest looks fix in the original experiment — is
+   per-texel noise here. It turned the sun-visibility cone into salt and pepper:
+   `debug=lighting` was a pixel-level black/white check pattern. A 5×5 average
+   of the decoded vectors, done once at load, fixes it. This is safe *in this
+   one case* despite the standing rule that octahedral normals are not
+   mip-averageable: that trap needs opposing front/back faces, and a
+   straight-down capture of a mat has every normal in the upper hemisphere.
+   Capitula are ~15 texels across, so their shape survives the filter.
+8. **Carpet-specific occlusion constants.** The bake occludes each plant with a
+   ring of 8 neighbours at the mesh's own periodic spacing; for a scattered
+   grass that is an approximation of the stand, but **for a carpet it IS the
+   stand**, so the `canopyDepth` compounding (2.6) does not apply — the carpet
+   path uses exponent 1.0. The residual floors also had to move: 7 % sun / 10 %
+   sky is right for a deep canopy, but a moss cushion is a *surface*, where a
+   crevice wall sits millimetres from a lit capitulum of the same bright green
+   and short-range interreflection is strong. At the grass floors the mat came
+   out 21 % darker than the billboard baseline and read as mud; at 26 %/30 % it
+   lands at luma 62 vs the baseline's 71, keeping the crevice contrast that
+   makes it read as a cushion. `occlusion=0` (plain `light_surface`) is visibly
+   *worse* — a smooth featureless wash — which is the useful evidence that the
+   baked visibility is what carries the moss structure here.
+
+**Before / after, from the screenshots.** Before: `carpet-close` (1 m straight
+down) showed a grid of dark rectangles — cards seen edge-on — over bare ground;
+`grazing` showed brown ribbons of standing cards on green terrain; the slope
+views showed the same ribbons draped nowhere. After: `carpet-close` is a
+continuous, granular cushion with capitulum-scale clumping and darker crevices,
+no grid; `grazing` and the knee-height oblique show a closed mat with the three
+wetness zones reading as ecology; `topdown` (42 m) shows smooth zoned fields
+with no speckle; the 0.55-gradient hillside at 1.1 m and the 4 m view across it
+show the mat following ridges and hollows continuously, and `inside-plant`
+keeps solid ground under the camera.
+
+**Against `001-billboard-smoke`, same frame** (`#/ab/001-billboard-smoke/023-baked-self-occlusion?stand=bog&cam=carpet-close`):
+the baseline is a smooth, uniform texture with its tile grid still faintly
+visible; this side is granular, has visible capitulum clumping and darker
+crevices, and has no grid at all. That is the honest win: **structure and
+seamlessness**, not resolution — the baseline's albedo is at a slightly higher
+texel density than this one's 384 px tile.
+
+**What is still bad.**
+
+- **No thickness at grazing.** A single ground-parallel quad has no silhouette.
+  At `grazing` and at the horizon the mat is a painted surface: the parallax
+  offset saturates (the clamp at `V.y = 0.22` is doing all the work) and the
+  0.09 m of cushion height contributes nothing to the outline. Nothing short of
+  standing geometry off the ground fixes this, and that is not what "cards"
+  means. Vertical cards are not an option — they slice the ground and each other.
+- **Zone boundaries are tile-quantised** into visible stair-steps at mid
+  distance. That is the stand's per-node wetness partition, identical in the
+  baseline, not a renderer artifact.
+- **The geometry atlas is the resolution floor.** 128 px over a 0.21 m box is
+  1.6 mm/texel — about 15 texels per capitulum, which is enough for relief and
+  AO but not for a crisp capitulum edge. With the carpet now spending 0.9 MB
+  where it used to spend 20.8, there is ~14 MB of headroom for a carpet-specific
+  bake at 1024² per channel (0.2 mm/texel, 8× the relief detail). That is the
+  single biggest remaining lever and it is a bake change, deliberately not taken
+  in this pass.
+- **`debug=lighting` still saturates to white** on the lit tops. That is the
+  shared model (`sun_color` 1.15 + `ambient` 0.25 ≥ 1 at full sun), identical on
+  the grass path; the crevice structure is clearly legible underneath it.
+- **Three cull dispatches evaluate the same 484 nodes.** The three moss states
+  partition one grid, so each entry re-evaluates every node and keeps a third.
+  Folding them into one dispatch with three output lists would cut the carpet
+  cull cost ~3×. Structural, not done here.
+
+**Is this representation suited to moss?** Partly, and honestly so. The parts of
+the method that are *fields* — baked per-texel openness, bent normals, surface
+depth — transfer beautifully to a cushion: they are what makes it read as an
+intricate 3D surface rather than a printed texture, and they beat the baseline
+visibly. The part that is a *card* does not transfer at all: the whole point of
+a view-aligned card is to fake a silhouette, and a mat's silhouette is the thing
+it does not have. So what survives for moss is "baked self-occlusion", not
+"cards" — and the result is a very good ground surface with real relief
+response, sitting on a proxy that can never have thickness.
+
+**Perf (same-frame A/B only; sibling agents shared the GPU).** B measures
+~1.26–1.35× slower than A for identical work, so raw ratios below are upper
+bounds. `bog`: cull+cards B/A **0.75** at `grazing`, **0.78** at knee height,
+**0.86** at `carpet-close` — i.e. the carpet path is *cheaper* than the
+billboard baseline on this stand even before the correction. `default`: B/A
+**1.41**, unchanged from this experiment's documented ~1.4×. Solo, `default`
+`grazing` reads Σp50 **8.43 ms** (8.31 before the carpet work) — inside the 9 ms
+budget and within run-to-run noise.
 
 ### Does it beat the billboard baseline on looks? Yes at every camera except one.
 
@@ -297,4 +492,33 @@ All five route through the shared `debug_shade()`, and fog is applied only when
   `/mesh/baked/**` would let every experiment drop the magic-validation shim.
 - A scalar/aux debug channel would have saved a round trip: diagnosing "the
   canopy is uniformly bright" needed a Node script to dump the baked atlas,
-  because there is no way to visualise a custom per-texel field in-app.
+  because there is no way to visualise a custom per-texel field in-app. The same
+  gap cost another round trip on the moss: "why is the mat muddy" needed the
+  baked `ao` and `q` channels dumped to PNG outside the app.
+- **`MeshInfo` exposes `tileSize` but not the mesh bounds or the tile origin.**
+  To locate a periodic tile square inside a baked view you need the capture
+  box's offset from the tile — i.e. the mesh AABB centre — and the only way to
+  get it is to load the 500 MB binary or to re-fetch `mesh/raw/<id>/manifest.json`
+  by hand. `MeshInfo.bounds` (and `tileOrigin`, even if it is `(0,0)` for every
+  current mesh) would be three lines and would save every carpet renderer the
+  same detour. This one bit hard enough to change the design: rather than
+  guessing the phase, the tile is made periodic at load time so the phase stops
+  mattering.
+- **A periodic top-down capture would be better done once in the harness than
+  five times in five experiments.** Every renderer that draws a community tile
+  as one quad hits the identical bug — the mesh's own overhang is present, the
+  neighbours' is not, so the mat grows a seam lattice — and every one of them
+  has to discover it from a `debug=coverage` screenshot. Either bake the top view
+  with the 3×3 periodic ring (the visibility bake in this experiment already
+  draws 9 instances, so the machinery exists), or document the lattice composite
+  as the standard fix next to the `carpet_div` notes.
+- **`slope_align` has no natural insertion point for a camera-facing card**, and
+  the bog's calamagrostis (0.3) is consequently still drawn bolt upright here.
+  Tilting a view-aligned card means transforming the eye ray into a tilted plant
+  frame, which is a real change to the impostor mapping rather than a basis
+  swap. Not a defect in the harness — just worth knowing that the primitive that
+  is easy for geometry (`plant_basis`) is not easy for an impostor.
+- `standEntrySlots()` is exported and correct, but the trap it guards is on the
+  GPU side, where the equivalent is `stand_table[i].carpet_div²`. A named WGSL
+  helper (`stand_entry_slots(i)`) next to `scatter_candidate` would put the fix
+  where the bug happens.

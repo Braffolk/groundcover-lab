@@ -5,10 +5,14 @@
 // stored — appearance is factored out into the 3D volumes baked on CPU.
 
 struct BakeTile {
-  center: vec3f, inv_r: f32,
-  right: vec3f, _p0: f32,
-  up: vec3f, _p1: f32,
-  fwd: vec3f, _p2: f32,   // points from plant toward the capture camera
+  center: vec3f, _p0: f32,
+  // Each axis carries 1 / (the bbox support along it), i.e. this view's ortho
+  // half-extent. Framing on the box instead of the bounding sphere is what
+  // keeps a flat cushion or a thin stem from spending most of its texels on
+  // empty space; the runtime recomputes the same supports from half_u.
+  right: vec3f, inv_sup_x: f32,
+  up: vec3f, inv_sup_y: f32,
+  fwd: vec3f, inv_sup_z: f32,   // fwd points from plant toward the capture camera
   bmin: vec3f, _p3: f32,
   bmax: vec3f, _p4: f32,
 }
@@ -26,9 +30,9 @@ fn vs(@location(0) a0: vec4<u32>) -> VOut {
   // Orthographic projection onto the tile basis. z mapped to [0,1]: points
   // nearer the capture camera (larger dot with fwd) get smaller z, so
   // depthCompare 'less' keeps the first hit of each ortho ray bundle.
-  let cx = dot(rel, bake_tile.right) * bake_tile.inv_r;
-  let cy = dot(rel, bake_tile.up) * bake_tile.inv_r;
-  let cz = 0.5 - dot(rel, bake_tile.fwd) * bake_tile.inv_r * 0.5;
+  let cx = dot(rel, bake_tile.right) * bake_tile.inv_sup_x;
+  let cy = dot(rel, bake_tile.up) * bake_tile.inv_sup_y;
+  let cz = 0.5 - dot(rel, bake_tile.fwd) * bake_tile.inv_sup_z * 0.5;
   var o: VOut;
   o.pos = vec4f(cx, cy, cz, 1.0);
   return o;
@@ -48,6 +52,10 @@ fn fs(@builtin(position) pos: vec4f) -> @location(0) vec4f {
 
 @group(0) @binding(0) var strip_tex: texture_2d<f32>;
 
+/// Height of one atlas row in pixels (= the view tile size). Set per pipeline
+/// so a species can trade angular for spatial resolution inside one 3072 atlas.
+override tile_px: u32 = 128u;
+
 @vertex
 fn vs_down(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
   // Fullscreen triangle; the caller's viewport maps it onto one atlas row.
@@ -58,7 +66,7 @@ fn vs_down(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
 @fragment
 fn fs_down(@builtin(position) pos: vec4f) -> @location(0) vec4f {
   let ax = u32(pos.x);
-  let ay = u32(pos.y) % 128u; // atlas rows are 128px; the strip is one row
+  let ay = u32(pos.y) % tile_px; // the strip holds exactly one atlas row
   let base = vec2u(ax * 2u, ay * 2u);
   var min_d = 1.0;
   var hits = 0.0;

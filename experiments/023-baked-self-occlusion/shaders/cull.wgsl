@@ -7,10 +7,14 @@
 // into TWO instance lists — near (parallax-warped cards) and far (flat cards).
 // Cost is O(region area), never O(total plants in the stand).
 //
-// A workgroup is 64 invocations and a cell holds SCATTER_MAX_PER_CELL = 128
-// candidate slots, so every workgroup covers exactly half of ONE cell: the
-// cell-level region/frustum rejects are workgroup-uniform and let whole
-// workgroups exit before a single terrain texel is fetched.
+// A workgroup is 64 invocations. A scattered entry holds SCATTER_MAX_PER_CELL
+// = 128 candidate slots per cell, so a workgroup covers half of ONE cell; a
+// CARPET entry holds carpet_div^2 instead (484 at Sphagnum life size, well over
+// the scatter budget) and simply takes more workgroups per cell. Either way the
+// slot count comes from info.carpet.x — hardcoding 128 renders about a quarter
+// of a mat, in bands, which looks exactly like a placement bug. The cell-level
+// region/frustum rejects below stay workgroup-uniform, so whole workgroups exit
+// before a single terrain texel is fetched.
 
 struct PlantInst {
   pos: vec3f,
@@ -30,14 +34,15 @@ const WIND_MARGIN: f32 = 0.35;
 @compute @workgroup_size(64)
 fn cs_cull(@builtin(global_invocation_id) gid: vec3<u32>) {
   let side_x = u32(info.region.z);
-  let total = side_x * u32(info.region.w) * SCATTER_MAX_PER_CELL;
+  let slots = u32(info.carpet.x);
+  let total = side_x * u32(info.region.w) * slots;
   let idx = gid.x;
   if (idx >= total) {
     return;
   }
 
-  let slot = idx % SCATTER_MAX_PER_CELL;
-  let cell_lin = idx / SCATTER_MAX_PER_CELL;
+  let slot = idx % slots;
+  let cell_lin = idx / slots;
   let cx = i32(info.region.x) + i32(cell_lin % side_x);
   let cz = i32(info.region.y) + i32(cell_lin / side_x);
   let region_r = info.ids.z;
@@ -50,8 +55,10 @@ fn cs_cull(@builtin(global_invocation_id) gid: vec3<u32>) {
     return;
   }
 
+  // A mat is rigid (sway 0), so it needs no wind margin on its bounds.
+  let margin = select(WIND_MARGIN, 0.02, info.carpet.z > 0.5);
   let s_max = stand_table[u32(info.ids.y)].scale_max;
-  let rad_max = info.caps.w * s_max + WIND_MARGIN;
+  let rad_max = info.caps.w * s_max + margin;
   let mid_y = info.aabb_c.y * s_max;
   let h_bound = frame.terrain_height_scale * TERRAIN_BOUND_SLACK;
   let box_c = vec3f(cell_mid.x, mid_y * 0.5, cell_mid.y);
@@ -74,7 +81,7 @@ fn cs_cull(@builtin(global_invocation_id) gid: vec3<u32>) {
   }
 
   let center = sp.pos + vec3f(0.0, info.aabb_c.y * sp.scale, 0.0);
-  let rad = info.caps.w * sp.scale + WIND_MARGIN;
+  let rad = info.caps.w * sp.scale + margin;
   for (var i = 0; i < 6; i++) {
     if (dot(info.planes[i].xyz, center) + info.planes[i].w < -rad) {
       return;

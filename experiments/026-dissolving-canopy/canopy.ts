@@ -1,5 +1,5 @@
-import { hash2, hash4, hashF32, type Stand } from '@harness'
-import { ALB_W, TILE_H, TILE_W, TOP_PX, type CanopyBake } from './bake.ts'
+import { SCATTER_CELL_SIZE, hash2, hash4, hashF32, type Stand } from '@harness'
+import { ALB_W, CT_PX, TILE_H, TILE_W, TOP_PX, type CanopyBake, type CarpetTileBake } from './bake.ts'
 
 /**
  * The continuous end of the dissolve, built at init (not baked): ONE tileable
@@ -77,7 +77,10 @@ const TOP_MIN_COV = 0.15
 const DEPTH_FALLOFF = 3
 
 interface Stamp {
-  bake: CanopyBake
+  /** rgba8 source planes: rgb + coverage, and oct normal + height. */
+  srcA: Uint8Array
+  srcX: Uint8Array
+  srcPx: number
   px: number
   pz: number
   sizePx: number
@@ -85,9 +88,70 @@ interface Stamp {
   orient: number
 }
 
-export function compositeCanopy(stand: Stand, bakes: Map<string, CanopyBake>, seed: number): CanopyTile {
+/** Downsample a carpet tile to `n` px, coverage-weighted, for stamping. */
+function shrinkTile(tile: CarpetTileBake, n: number): { a: Uint8Array; x: Uint8Array } {
+  const S = CT_PX
+  const k = Math.floor(S / n)
+  const a = new Uint8Array(n * n * 4)
+  const x = new Uint8Array(n * n * 4)
+  for (let y = 0; y < n; y++) {
+    for (let i = 0; i < n; i++) {
+      let cov = 0
+      let w = 0
+      let cr = 0
+      let cg = 0
+      let cb = 0
+      let nx = 0
+      let ny = 0
+      let nz = 0
+      let h = 0
+      for (let j = 0; j < k; j++) {
+        for (let m = 0; m < k; m++) {
+          const s = ((y * k + j) * S + i * k + m) * 4
+          const av = tile.albedo[s + 3]!
+          cov += av
+          if (av === 0) continue
+          w += av
+          cr += tile.albedo[s]! * av
+          cg += tile.albedo[s + 1]! * av
+          cb += tile.albedo[s + 2]! * av
+          // Oct pairs are NOT box-filterable: decode, average, re-encode.
+          const d = octDecodeOriented((tile.aux[s]! / 255) * 2 - 1, (tile.aux[s + 1]! / 255) * 2 - 1, 0)
+          nx += d[0] * av
+          ny += d[1] * av
+          nz += d[2] * av
+          h += tile.aux[s + 2]! * av
+        }
+      }
+      const o = (y * n + i) * 4
+      a[o + 3] = Math.round(cov / (k * k))
+      if (w === 0) continue
+      a[o] = clamp255(cr / w)
+      a[o + 1] = clamp255(cg / w)
+      a[o + 2] = clamp255(cb / w)
+      const [u, v] = octEncode(nx / w, ny / w, nz / w)
+      x[o] = u
+      x[o + 1] = v
+      x[o + 2] = Math.round(h / w)
+    }
+  }
+  return { a, x }
+}
+
+export function compositeCanopy(
+  stand: Stand,
+  bakes: Map<string, CanopyBake>,
+  seed: number,
+  tiles?: Map<string, CarpetTileBake>,
+): CanopyTile {
   const N = CANOPY_TEX
   const pxPerM = N / CANOPY_TILE_M
+  /** Constant tile scale of a carpet entry, or null for a scattered entry. */
+  const carpetOf = (e: Stand['species'][number]): { tile: CarpetTileBake; scale: number } | null => {
+    const div = e.carpetDiv ?? 0
+    const tile = div > 0 ? tiles?.get(e.species) : undefined
+    return tile ? { tile, scale: SCATTER_CELL_SIZE / div / tile.tileM } : null
+  }
 
   let heightMax = 0.1
   let swayNum = 0
@@ -98,7 +162,12 @@ export function compositeCanopy(stand: Stand, bakes: Map<string, CanopyBake>, se
   for (const e of stand.species) {
     const b = bakes.get(e.species)
     if (!b) continue
-    heightMax = Math.max(heightMax, b.plantH * e.scaleMax)
+    const carpet = carpetOf(e)
+    // A carpet's scaleMin/scaleMax in the stand are placeholders — the real
+    // scale is the one that makes a tile fill its grid step (life size, ~1.01).
+    // Taking the placeholders literally composited the moss at ~2x height and
+    // width, which put the shell's surface 20cm above a 7cm bog.
+    heightMax = Math.max(heightMax, carpet ? (carpet.tile.y1 - carpet.tile.y0) * carpet.scale : b.plantH * e.scaleMax)
     swayNum += e.density * e.sway
     swayDen += e.density
     const top = meanSideColor(b, 0, FLOWER_BAND)
@@ -121,15 +190,52 @@ export function compositeCanopy(stand: Stand, bakes: Map<string, CanopyBake>, se
   }
 
   const stamps: Stamp[] = []
+  // Carpet entries share ONE grid and partition it, exactly as they partition
+  // the wetness axis in the stand: a node is claimed by one of them, so the
+  // composite gets the mat's real mix instead of three overlapping mats.
+  const carpetEntries = stand.species.filter((e) => carpetOf(e) !== null)
   stand.species.forEach((e, entryIndex) => {
     const bake = bakes.get(e.species)
     if (!bake) return
+    const carpet = carpetOf(e)
+    if (carpet) {
+      const { tile, scale } = carpet
+      const step = tile.tileM * scale
+      const n = Math.max(1, Math.round(CANOPY_TILE_M / step))
+      const stepPx = (CANOPY_TILE_M / n) * pxPerM
+      // 512px stamped into ~12px would alias badly; pre-reduce once instead.
+      const small = shrinkTile(tile, 32)
+      const ord = carpetEntries.indexOf(e)
+      for (let j = 0; j < n; j++) {
+        for (let i = 0; i < n; i++) {
+          // NODE-only hash — hashing the entry index in would let the three
+          // states disagree about who owns a node, which is exactly how the
+          // scatter's own zoning once grew holes and double stacks.
+          const h = hash4(seed, 0x5eed, j * n + i, 0x51ed2701)
+          if (carpetEntries.length > 1 && hash2(h, 7) % carpetEntries.length !== ord) continue
+          stamps.push({
+            srcA: small.a,
+            srcX: small.x,
+            srcPx: 32,
+            px: i * stepPx,
+            pz: j * stepPx,
+            sizePx: stepPx,
+            plantH: (tile.y1 - tile.y0) * scale,
+            // Quarter turns only: a mat's tiles must agree with their neighbours.
+            orient: hash2(h, 4) & 3,
+          })
+        }
+      }
+      return
+    }
     const count = Math.max(1, Math.round(e.density * CANOPY_TILE_M * CANOPY_TILE_M))
     for (let k = 0; k < count; k++) {
       const h = hash4(seed, entryIndex, k, 0x9e3779b9)
       const scale = e.scaleMin + (e.scaleMax - e.scaleMin) * hashF32(hash2(h, 3))
       stamps.push({
-        bake,
+        srcA: bake.topAlbedo,
+        srcX: bake.topAux,
+        srcPx: TOP_PX,
         px: hashF32(hash2(h, 1)) * CANOPY_TILE_M * pxPerM,
         pz: hashF32(hash2(h, 2)) * CANOPY_TILE_M * pxPerM,
         sizePx: 2 * bake.rootHalfW * scale * pxPerM,
@@ -256,11 +362,11 @@ type Visitor = (
 /** Walk one plant copy's destination texels, torus-wrapped and box-filtered. */
 function visit(s: Stamp, fn: Visitor): void {
   const N = CANOPY_TEX
-  const S = TOP_PX
+  const S = s.srcPx
   const span = Math.max(1, Math.ceil(s.sizePx))
   const taps = Math.min(2, Math.max(1, Math.round(S / Math.max(s.sizePx, 1))))
-  const srcA = s.bake.topAlbedo
-  const srcX = s.bake.topAux
+  const srcA = s.srcA
+  const srcX = s.srcX
   const x0 = Math.floor(s.px - s.sizePx * 0.5)
   const z0 = Math.floor(s.pz - s.sizePx * 0.5)
 

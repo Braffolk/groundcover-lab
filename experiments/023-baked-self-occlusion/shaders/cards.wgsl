@@ -1,4 +1,5 @@
 #include "src/wgsl/wind.wgsl"
+#include "src/wgsl/terrain.wgsl"
 #include "src/wgsl/lighting.wgsl"
 #include "src/wgsl/debug.wgsl"
 #include "./info.wgsl"
@@ -20,6 +21,19 @@
 //     Sun visibility comes out of a cone test against those two numbers, so
 //     interiors stay dark, tips catch light, and the shading changes when the
 //     sun moves.
+//
+// CARPET SPECIES (stand carpet_div > 0, e.g. Sphagnum) take a third shape:
+// ONE GROUND-PARALLEL quad exactly the size of the species' periodic tile,
+// conformed to the terrain per vertex, textured from the straight-down baked
+// view only. A camera-facing card cannot be a mat — it would slice through the
+// ground and through its neighbours, and it would break the lattice (the tile's
+// 90-degree yaw and constant scale come from the stand and are used AS GIVEN).
+// The same per-texel depth field still does the 3D work, but as a tangent-space
+// PARALLAX OFFSET measured from the quad's plane rather than as a warp along
+// the eye ray: capitula above the plane and hollows below it slide against each
+// other as the camera moves, which is the cushion relief a flat card cannot
+// have. The offset wraps (the tile is periodic), so it walks into the
+// neighbouring tile's imagery instead of smearing at an edge.
 //
 // LOD: beyond `nearSplit` the plant is drawn by vs_far/fs_far, which resolves
 // the same tile UV at the SIX quad vertices instead of per fragment (the eye
@@ -56,6 +70,36 @@ const ROW_SW3: f32 = 0.9903; // sin(82deg)
 // Largest parallax offset, in tile widths, the single warp step is allowed to
 // produce (0.16 tile ~= 12 cm on a calamagrostis clump).
 const INV_WARP_LIMIT2: f32 = 39.0625; // 1 / 0.16^2
+
+const TOP_TILE: u32 = 24u;
+// Alpha reference for carpet tiles, INSTEAD of the params' alphaRef. A mat is a
+// closed surface and must not dissolve with distance: tile alpha is ~80% up
+// close, but the mip chain pulls it toward the whole tile's mean, and at the
+// 0.4 grass reference whole distant tiles then fail the test and punch holes in
+// the carpet. A low reference keeps the mat a solid depth-writing occluder
+// while the genuinely empty texels — the gaps down to the peat — still open.
+const CARPET_ALPHA_REF: f32 = 0.06;
+// Canopy-depth exponent for a mat. The 25-view bake occludes each plant with
+// its 8 neighbours at the mesh's own periodic spacing — which for a CARPET is
+// not an approximation of the stand, it IS the stand. So the baked openness
+// needs NONE of the compounding the scattered grasses get from the canopyDepth
+// param (2.6); pushing it there turns moss into tar.
+const CARPET_CANOPY: f32 = 1.0;
+// (sun, sky) residual for a fully occluded texel. A deep grass canopy gets very
+// little bounced light, so the scattered path uses 7%/10%. A moss cushion is a
+// SURFACE, not a canopy: a crevice wall sits millimetres from a lit capitulum
+// of the same bright green, so short-range interreflection is strong and the
+// floors have to be much higher — at the grass floors the mat came out 21%
+// darker than the billboard baseline and read as mud rather than as relief.
+const CANOPY_FLOORS: vec2f = vec2f(0.07, 0.10);
+const CARPET_FLOORS: vec2f = vec2f(0.26, 0.30);
+// Largest tangent-plane parallax offset, in tile widths. Half a tile is already
+// beyond where a one-step offset is accurate; the saturation below turns
+// everything past it into a lag rather than a smear.
+const INV_CARPET_LIMIT2: f32 = 4.0; // 1 / 0.5^2
+// The view ray's vertical component is clamped before dividing by it, so a
+// grazing ray cannot demand an unbounded offset.
+const CARPET_MIN_COS: f32 = 0.22;
 
 fn rot_y(v: vec3f, c: f32, s: f32) -> vec3f {
   return vec3f(c * v.x + s * v.z, v.y, -s * v.x + c * v.z);
@@ -307,6 +351,142 @@ fn fs_far(in: FarOut) -> @location(0) vec4f {
 }
 
 // ---------------------------------------------------------------------------
+// Carpet tier — one ground-parallel tile, terrain-conformed, parallax relief.
+// ---------------------------------------------------------------------------
+
+struct CarpetOut {
+  @builtin(position) pos: vec4f,
+  @location(0) uv: vec2f,                        // tile-local [0,1]^2, u along mesh +X
+  @location(1) world: vec3f,
+  @location(2) up_ws: vec3f,                     // ground normal under this vertex
+  @location(3) @interpolate(flat) yaw_cs: vec2f,
+  @location(4) @interpolate(flat) erode: f32,
+  @location(5) @interpolate(flat) warp_k: f32,
+}
+
+@vertex
+fn vs_carpet(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> CarpetOut {
+  let inst = insts[ii];
+  let bits = inst.packed_bits;
+  let yaw = f32(bits & 1023u) * (6.2831853 / 1024.0);
+  let scale = f32((bits >> 10u) & 4095u) * (4.0 / 4095.0);
+  let base = inst.pos;
+  let entry = stand_table[u32(info.ids.y)];
+  let cs = cos(yaw);
+  let sn = sin(yaw);
+
+  var corners = array<vec2f, 6>(
+    vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(-1.0, 1.0),
+    vec2f(1.0, -1.0), vec2f(1.0, 1.0), vec2f(-1.0, 1.0),
+  );
+  let c = corners[vi];
+  // Width comes from the species' periodic FOOTPRINT, never from its height:
+  // Sphagnum is 0.07m tall and 0.24m wide, and sizing off height_scale would
+  // make every tile ~3.5x too small and open gaps in a closed mat.
+  let half_m = entry.footprint_m * 0.5 * scale;
+  let off = rot_y(vec3f(c.x * half_m, 0.0, c.y * half_m), cs, sn);
+  let xz = base.xz + off.xz;
+
+  // Rung 3 of the terrain-fitting ladder: sample the ground under EVERY vertex.
+  // Neighbouring tiles share corner positions, so the mat stays C0 continuous;
+  // any per-tile plane fit (rungs 1-2) gives adjacent tiles different planes and
+  // cracks them apart along their shared edge. terrain_sample returns height and
+  // (nx, nz) from one bilinear fetch, so the shading basis is free.
+  let g = terrain_sample(xz);
+  let up = vec3f(g.y, sqrt(max(1.0 - g.y * g.y - g.z * g.z, 0.0)), g.z);
+  let world = vec3f(xz.x, g.x + info.carpet.y * scale, xz.y);
+
+  // Region rim only — NO camera-inside fade: a mat you are standing on must not
+  // open a hole under you. Measured from the tile CENTRE so all six vertices
+  // agree; a per-vertex fade would stretch a partly-clipped quad into a sliver.
+  let d_xz = length(frame.camera_pos.xz - base.xz);
+  let fade = 1.0 - smoothstep(info.ids.z * 0.86, info.ids.z, d_xz);
+
+  var out: CarpetOut;
+  if (fade < CARPET_ALPHA_REF) {
+    out.pos = vec4f(0.0, 0.0, -1.0, 1.0);
+  } else {
+    out.pos = frame.view_proj * vec4f(world, 1.0);
+  }
+  out.uv = c * 0.5 + 0.5;
+  out.world = world;
+  out.up_ws = up;
+  out.yaw_cs = vec2f(cs, sn);
+  out.erode = CARPET_ALPHA_REF / max(fade, 1e-3);
+  // Instance-uniform distance (tile centre), so the relief fades out at exactly
+  // the same range for all six vertices and agrees with the cull's near split.
+  let dist = distance(frame.camera_pos, base + vec3f(0.0, info.carpet.y * scale, 0.0));
+  out.warp_k = info.shade.w * (1.0 - smoothstep(info.ids.w * 0.6, info.ids.w, dist));
+  return out;
+}
+
+/// Tile-local [0,1]^2 -> the straight-down view's UV (the whole texture for a
+/// carpet species, which uploads that one tile).
+fn carpet_uv(uv: vec2f) -> vec2f {
+  return (uv - vec2f(0.5)) * info.carpet_uv.xy + info.carpet_uv.zw;
+}
+
+/// Ground basis (tangent, up, bitangent) for a tile: plant_basis_from_up()
+/// inlined, because the card already carries cos/sin(yaw) rather than the angle.
+/// Column 0 is the mesh +X axis, column 2 the mesh +Z axis, so tangent-space
+/// x/z line up with the tile's u/v.
+fn carpet_basis(up_in: vec3f, yaw_cs: vec2f) -> mat3x3f {
+  let up = normalize(up_in);
+  var t = vec3f(yaw_cs.x, 0.0, -yaw_cs.y);
+  let proj = t - up * dot(up, t);
+  t = select(normalize(vec3f(up.y, -up.x, 0.0)), normalize(proj), dot(proj, proj) > 1.0e-6);
+  return mat3x3f(t, up, cross(t, up));
+}
+
+@fragment
+fn fs_carpet_near(in: CarpetOut) -> @location(0) vec4f {
+  let uv0 = carpet_uv(in.uv);
+  // Gradients from the UNWRAPPED coordinate: it is smooth across the quad, so
+  // mip selection never explodes at the fract() seam. Taken before any discard.
+  let gx = dpdx(uv0);
+  let gy = dpdy(uv0);
+  let q = textureSample(atlas_geom, geom_sampler, uv0).a;
+
+  let basis = carpet_basis(in.up_ws, in.yaw_cs);
+  let v = normalize(frame.camera_pos - in.world);
+  let vt = vec3f(dot(v, basis[0]), dot(v, basis[1]), dot(v, basis[2]));
+
+  // Depth of the sampled surface BELOW the quad's plane, in plant-local metres:
+  // the straight-down view stores q as 0 at its near plane and 1 at its far
+  // plane, and the quad sits `plane_h` up from the mesh ground.
+  let d_top = tiles.v[TOP_TILE * 4u + 2u].w - info.carpet.y;
+  let depth = q * tiles.v[TOP_TILE * 4u + 3u].z - d_top;
+  // Textbook one-step parallax: slide along the view ray to that depth. Scale
+  // cancels (depth and footprint both scale), so this is a pure tile fraction.
+  let raw = -vec2f(vt.x, vt.z) * (depth / (max(vt.y, CARPET_MIN_COS) * stand_table[u32(info.ids.y)].footprint_m));
+  // Saturate the offset MAGNITUDE smoothly instead of letting it run: a single
+  // step is accurate while it is small and turns into a smear once it is large.
+  let duv = raw * inverseSqrt(1.0 + dot(raw, raw) * INV_CARPET_LIMIT2) * in.warp_k;
+  // The tile is PERIODIC, so an offset that leaves it wraps into the identical
+  // continuation rather than clamping against an edge.
+  let uv1 = carpet_uv(fract(in.uv + duv));
+
+  let alb = textureSampleGrad(atlas_albedo, albedo_sampler, uv1, gx, gy);
+  if (alb.a < in.erode) {
+    discard;
+  }
+  let g = textureSampleGrad(atlas_geom, geom_sampler, uv1, gx, gy);
+  return shade_n(alb, g, basis * oct_decode(g.rg * 2.0 - 1.0), in.world, CARPET_CANOPY, CARPET_FLOORS);
+}
+
+@fragment
+fn fs_carpet_far(in: CarpetOut) -> @location(0) vec4f {
+  let uv = carpet_uv(in.uv);
+  let alb = textureSample(atlas_albedo, albedo_sampler, uv);
+  if (alb.a < in.erode) {
+    discard;
+  }
+  let g = textureSample(atlas_geom, geom_sampler, uv);
+  let basis = carpet_basis(in.up_ws, in.yaw_cs);
+  return shade_n(alb, g, basis * oct_decode(g.rg * 2.0 - 1.0), in.world, CARPET_CANOPY, CARPET_FLOORS);
+}
+
+// ---------------------------------------------------------------------------
 // Shared shading — the shared lighting model with baked visibility folded in.
 // ---------------------------------------------------------------------------
 
@@ -323,27 +503,30 @@ fn oct_decode(e: vec2f) -> vec3f {
 }
 
 fn shade(alb: vec4f, g: vec4f, yaw_cs: vec2f, world: vec3f) -> vec4f {
-  let n_local = oct_decode(g.rg * 2.0 - 1.0);
-  let n = rot_y(n_local, yaw_cs.x, yaw_cs.y);
+  return shade_n(alb, g, rot_y(oct_decode(g.rg * 2.0 - 1.0), yaw_cs.x, yaw_cs.y), world, info.shade.z, CANOPY_FLOORS);
+}
 
+/// `floors` = the residual (sun, sky) a fully occluded texel still receives.
+fn shade_n(alb: vec4f, g: vec4f, n: vec3f, world: vec3f, canopy: f32, floors: vec2f) -> vec4f {
   // The bake occludes each plant with ONE ring of same-species neighbours at
   // the mesh's own tile spacing (and already folds in a height ramp for the
-  // canopy layers overhead). A real stand is several times denser and mixes
-  // species, and occlusion compounds multiplicatively with canopy layers — so
-  // the baked openness is raised to a canopy-depth exponent here.
-  let ao = pow(g.b, info.shade.z);
+  // canopy layers overhead). A scattered stand is several times denser and
+  // mixes species, and occlusion compounds multiplicatively with canopy layers
+  // — so the baked openness is raised to a canopy-depth exponent here. For a
+  // CARPET that ring IS the real neighbourhood, so it barely needs one.
+  let ao = pow(g.b, canopy);
 
   let occl = info.shade.x;
   // Floors stand in for the light that reaches a shaded blade after bouncing
   // around inside the canopy. Without them fully-occluded texels go black,
   // which reads as holes rather than depth.
-  let sky_vis = mix(1.0, 0.10 + 0.90 * ao, occl);
+  let sky_vis = mix(1.0, floors.y + (1.0 - floors.y) * ao, occl);
   // Ambient-aperture visibility: the open set around a texel is a cone about
   // the stored (bent) normal whose half-angle follows from the openness,
   // cos(aperture) = 1 - ao. The sun is visible when it lies inside that cone,
   // with a soft rim — so self-shadowing MOVES when the sun moves.
   let cone = smoothstep(-0.25, 0.15, dot(n, frame.sun_dir) + ao - 1.0);
-  let sun_vis = mix(1.0, 0.07 + 0.93 * cone, occl);
+  let sun_vis = mix(1.0, floors.x + (1.0 - floors.x) * cone, occl);
 
   // The shared lighting model with per-texel visibility folded into its two
   // terms — identical to light_surface() when both visibilities are 1.

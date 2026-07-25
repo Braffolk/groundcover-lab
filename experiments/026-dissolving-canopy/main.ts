@@ -1,5 +1,6 @@
 import cullSrc from './shaders/cull.wgsl'
 import tuftsSrc from './shaders/tufts.wgsl'
+import carpetSrc from './shaders/carpet.wgsl'
 import shellSrc from './shaders/shell.wgsl'
 import mipgenSrc from './shaders/mipgen.wgsl'
 import {
@@ -9,16 +10,20 @@ import {
   COV_H,
   COV_MIPS,
   COV_W,
+  CT_MIPS,
+  CT_PX,
   NRM_H,
   NRM_MIPS,
   NRM_W,
+  loadCarpetTile,
   loadSpeciesBake,
   type CanopyBake,
+  type CarpetTileBake,
 } from './bake.ts'
 import { CANOPY_MIPS, CANOPY_TEX, CANOPY_TILE_M, compositeCanopy } from './canopy.ts'
 import {
   SCATTER_CELL_SIZE,
-  SCATTER_MAX_PER_CELL,
+  standEntrySlots,
   type Experiment,
   type ExperimentContext,
   type FrameInfo,
@@ -54,30 +59,59 @@ import type { PARAMS } from './manifest.ts'
 const CELL = SCATTER_CELL_SIZE
 const REGION_MAX = 112 // must stay >= the manifest's dissolveGrazing max
 const TUFT_MAX = 36 // must stay >= the manifest's tuftRadius max
-const INFO_FLOATS = 84
+const INFO_FLOATS = 88
 const SHELL_FLOATS = 68
 const SHELL_G = 96 // cells per side, per level
 const SHELL_SPACING: readonly [number, number] = [0.75, 3]
 const SHELL_EDGE_FADE = 14
 const NEAR_VERTS = 24 // 4 quadrant splats
 const FAR_VERTS = 6 // 1 whole-plant splat
+const CARPET_VERTS = 6 // 1 ground-parallel tile quad
+/**
+ * Alpha reference for a CARPET, instead of the params' grass reference. A mat
+ * is a closed surface, so its tiles must not dissolve with distance: a tile's
+ * coverage is ~80% up close, but the mip chain pulls it toward the tile mean
+ * and at a grass reference whole distant tiles fail the test, punching holes in
+ * ground that is fully covered. Low reference = the mat stays a depth-writing
+ * occluder while the genuine gaps down to the peat still open.
+ */
+const CARPET_ALPHA_REF = 0.06
+/**
+ * Parallax offset cap (m). Must stay below the lateral size of the cushion
+ * mounds the offset is read from (~15mm) or a grazing ray combs the tile into
+ * streaks instead of sliding it.
+ */
+const CARPET_PARALLAX_MAX = 0.008
 
 interface SpeciesGpu {
   bake: CanopyBake
-  cov: GPUTexture
-  albedo: GPUTexture
-  normal: GPUTexture
+  /** Node atlas — absent for a species that only ever appears as a carpet. */
+  cov?: GPUTexture
+  albedo?: GPUTexture
+  normal?: GPUTexture
+  /** Carpet tile capture — present only for carpet species. */
+  tile?: CarpetTileBake
+  tileAlbedo?: GPUTexture
+  tileAux?: GPUTexture
 }
 
 interface EntryGpu {
   gpu: SpeciesGpu
+  carpet: boolean
+  /** Constant tile scale of a carpet entry (the stand's own, recomputed). */
+  carpetScale: number
   cap0: number
   cap1: number
   infoBuffer: GPUBuffer
   argsBuffer: GPUBuffer
+  argsReset: Uint32Array<ArrayBuffer>
   cullBindGroup: GPUBindGroup
-  nearBindGroup: GPUBindGroup
-  farBindGroup: GPUBindGroup
+  /** Splat entries: near / far band views of the instance buffer. */
+  nearBindGroup?: GPUBindGroup
+  farBindGroup?: GPUBindGroup
+  /** Carpet entries: the tile textures over segment 0. */
+  carpetBindGroup?: GPUBindGroup
+  slots: number
   slotsPerFrame: number
 }
 
@@ -103,22 +137,57 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
     addressModeV: 'repeat',
   })
 
+  const carpetSampler = device.createSampler({
+    label: `${ctx.id}/carpet-sampler`,
+    magFilter: 'linear',
+    minFilter: 'linear',
+    mipmapFilter: 'linear',
+    maxAnisotropy: 8,
+    // The tile capture is genuinely periodic (baked with the mesh's 3x3 wrap),
+    // so repeat is the correct wrap for both filtering and parallax overshoot.
+    addressModeU: 'repeat',
+    addressModeV: 'repeat',
+  })
+
+  // A species that appears ONLY as a carpet in this stand never draws a splat,
+  // so its 14.8 MiB node atlas (5 nodes x 8 azimuths of SIDE views) is pure
+  // dead VRAM: it is a 0.09m cushion, and the side view is the one thing a mat
+  // does not show. Those species get the carpet tile capture instead, and the
+  // node atlas stays on the CPU only — compositeCanopy still needs its top view
+  // for the shell.
+  const carpetOnly = new Set<string>()
+  for (const entry of ctx.stand.species) {
+    if ((entry.carpetDiv ?? 0) > 0) carpetOnly.add(entry.species)
+  }
+  for (const entry of ctx.stand.species) {
+    if (!((entry.carpetDiv ?? 0) > 0)) carpetOnly.delete(entry.species)
+  }
+
   // --- baked node atlases (sequential: poa transiently needs a few hundred MB)
   const bakes = new Map<string, CanopyBake>()
+  const tiles = new Map<string, CarpetTileBake>()
   for (const entry of ctx.stand.species) {
-    if (bakes.has(entry.species)) continue
-    bakes.set(entry.species, await loadSpeciesBake(ctx, entry.species))
+    if (!bakes.has(entry.species)) bakes.set(entry.species, await loadSpeciesBake(ctx, entry.species))
+    if (carpetOnly.has(entry.species) && !tiles.has(entry.species)) {
+      tiles.set(entry.species, await loadCarpetTile(ctx, entry.species))
+    }
   }
 
   const mip = new MipGen(ctx)
   const speciesGpu = new Map<string, SpeciesGpu>()
   const uploadEnc = device.createCommandEncoder({ label: `${ctx.id}/upload` })
   for (const [speciesId, bake] of bakes) {
-    speciesGpu.set(speciesId, uploadNodeAtlas(ctx, mip, uploadEnc, speciesId, bake))
+    const tile = tiles.get(speciesId)
+    speciesGpu.set(
+      speciesId,
+      tile
+        ? uploadCarpetTile(ctx, mip, uploadEnc, speciesId, bake, tile)
+        : uploadNodeAtlas(ctx, mip, uploadEnc, speciesId, bake),
+    )
   }
 
   // --- the stand's single tileable canopy texture ---------------------------
-  const tile = compositeCanopy(ctx.stand, bakes, ctx.seed)
+  const tile = compositeCanopy(ctx.stand, bakes, ctx.seed, tiles)
   console.info(
     `[${ctx.id}] canopy tile ${CANOPY_TEX}px/${CANOPY_TILE_M}m: surface=${tile.baseHeight.toFixed(2)}m ` +
       `top=${tile.heightMax.toFixed(2)}m coverage=${(tile.meanCoverage * 100).toFixed(0)}% (top-down)`,
@@ -164,6 +233,16 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       { binding: 5, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
     ],
   })
+  const carpetBgl = device.createBindGroupLayout({
+    label: `${ctx.id}/carpet-bgl`,
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+      { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
+      { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+      { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+      { binding: 4, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+    ],
+  })
   const shellBgl = device.createBindGroupLayout({
     label: `${ctx.id}/shell-bgl`,
     entries: [
@@ -191,9 +270,25 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
 
   const entries: EntryGpu[] = ctx.stand.species.map((standEntry, entryIndex) => {
     const gpu = speciesGpu.get(standEntry.species)!
+    const carpet = (standEntry.carpetDiv ?? 0) > 0
     const density = Math.min(standEntry.density, 8)
-    const cap0 = align16(Math.ceil(Math.PI * TUFT_MAX * TUFT_MAX * density * 1.08) + 1024)
-    const cap1 = align16(Math.ceil(Math.PI * REGION_MAX * REGION_MAX * density * 1.08) + 2048)
+    // TWO DIFFERENT NUMBERS, and conflating them silently drops plants:
+    //  * `slots` is how many candidate slots the cull must EVALUATE per cell —
+    //    carpet_div^2 (484) for a carpet, the scatter budget (128) otherwise.
+    //  * the capacities are how many are expected to SURVIVE. For a carpet the
+    //    three moss states PARTITION the wetness axis, so each entry claims
+    //    about `wetWidth` of the nodes; sizing for all 484 would waste 3x.
+    const slots = standEntrySlots(standEntry)
+    const band = Math.min(1, standEntry.wetWidth ?? 1)
+    // A carpet is one quad at every distance: everything lands in segment 0.
+    // Its region is the dissolve region, but never bigger than the stand — the
+    // cull's cell rect is clamped to the stand's cells, and outside them the
+    // scatter is empty.
+    const regionArea = Math.min(Math.PI * REGION_MAX * REGION_MAX, (2 * ctx.stand.radius) ** 2)
+    const cap0 = carpet
+      ? align16(Math.ceil((regionArea * slots * band * 1.25) / (CELL * CELL)) + 1024)
+      : align16(Math.ceil(Math.PI * TUFT_MAX * TUFT_MAX * density * 1.08) + 1024)
+    const cap1 = carpet ? 16 : align16(Math.ceil(Math.PI * REGION_MAX * REGION_MAX * density * 1.08) + 2048)
     const infoBuffer = ctx.res.createBuffer(
       {
         label: `${ctx.id}/info-${entryIndex}`,
@@ -232,27 +327,51 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         entries: [
           { binding: 0, resource: { buffer: infoBuffer } },
           { binding: 1, resource: { buffer: instBuffer, offset, size } },
-          { binding: 2, resource: gpu.cov.createView() },
-          { binding: 3, resource: gpu.albedo.createView() },
-          { binding: 4, resource: gpu.normal.createView() },
+          { binding: 2, resource: gpu.cov!.createView() },
+          { binding: 3, resource: gpu.albedo!.createView() },
+          { binding: 4, resource: gpu.normal!.createView() },
           { binding: 5, resource: tuftSampler },
         ],
       })
+    const argsReset = new Uint32Array(8)
+    argsReset[0] = carpet ? CARPET_VERTS : NEAR_VERTS
+    argsReset[4] = FAR_VERTS
     return {
       gpu,
+      carpet,
+      // Same rule the stand uses (carpetScale in src/scene/stands.ts): a tile
+      // exactly fills its grid step, which is what makes the mat seamless.
+      carpetScale: carpet && gpu.tile ? CELL / (standEntry.carpetDiv ?? 1) / gpu.tile.tileM : 1,
       cap0,
       cap1,
       infoBuffer,
       argsBuffer,
+      argsReset,
       cullBindGroup,
-      nearBindGroup: drawBindGroup(`${ctx.id}/near-bg-${entryIndex}`, 0, cap0 * 16),
-      farBindGroup: drawBindGroup(`${ctx.id}/far-bg-${entryIndex}`, cap0 * 16, cap1 * 16),
+      nearBindGroup: carpet ? undefined : drawBindGroup(`${ctx.id}/near-bg-${entryIndex}`, 0, cap0 * 16),
+      farBindGroup: carpet ? undefined : drawBindGroup(`${ctx.id}/far-bg-${entryIndex}`, cap0 * 16, cap1 * 16),
+      carpetBindGroup: carpet
+        ? device.createBindGroup({
+            label: `${ctx.id}/carpet-bg-${entryIndex}`,
+            layout: carpetBgl,
+            entries: [
+              { binding: 0, resource: { buffer: infoBuffer } },
+              { binding: 1, resource: { buffer: instBuffer, offset: 0, size: cap0 * 16 } },
+              { binding: 2, resource: gpu.tileAlbedo!.createView() },
+              { binding: 3, resource: gpu.tileAux!.createView() },
+              { binding: 4, resource: carpetSampler },
+            ],
+          })
+        : undefined,
+      slots,
       slotsPerFrame: 0,
     }
   })
 
+  const anyCarpet = entries.some((e) => e.carpet)
   let cullPipeline!: GPUComputePipeline
   let tuftPipeline!: GPURenderPipeline
+  let carpetPipeline: GPURenderPipeline | undefined
   let shellPipeline!: GPURenderPipeline
   const build = (): void => {
     cullPipeline = device.createComputePipeline({
@@ -273,6 +392,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         depthStencil: { format: ctx.depthFormat, depthCompare: 'less', depthWriteEnabled: true },
       })
     tuftPipeline = mkRender('tufts', tuftsSrc, tuftBgl)
+    carpetPipeline = anyCarpet ? mkRender('carpet', carpetSrc, carpetBgl) : undefined
     shellPipeline = mkRender('shell', shellSrc, shellBgl)
   }
   build()
@@ -284,9 +404,6 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
   const info = new Float32Array(INFO_FLOATS)
   const shellInfo = new Float32Array(SHELL_FLOATS)
   const planes = new Float32Array(24)
-  const argsReset = new Uint32Array(8)
-  argsReset[0] = NEAR_VERTS
-  argsReset[4] = FAR_VERTS
 
   return {
     update(frame: FrameInfo): void {
@@ -307,6 +424,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
 
       entries.forEach((entry, entryIndex) => {
         const b = entry.gpu.bake
+        const ct = entry.gpu.tile
         info.set(planes, 0)
         b.nodes.forEach((n, i) => {
           info.set([n.cx, n.cy, n.cz, n.halfW], 24 + i * 8)
@@ -314,12 +432,21 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         })
         info.set([x0, z0, sideX, sideZ], 64)
         info.set([ctx.seed, entryIndex, regionR, tuftR], 68)
-        info.set([entry.cap0, entry.cap1, p.alphaRef, p.groundShade], 72)
+        // A carpet uses its OWN alpha reference everywhere the grass one would
+        // appear (cull rejection, vertex-stage skip, fragment test).
+        info.set([entry.cap0, entry.cap1, entry.carpet ? CARPET_ALPHA_REF : p.alphaRef, p.groundShade], 72)
         info.set([p.dissolveGrazing, p.dissolveOverhead, b.plantH, b.rootHalfW], 76)
-        info.set([Math.max(b.rootHalfW, b.plantH * 0.5) * 1.05, 0, 0, 0], 80)
+        info.set([Math.max(b.rootHalfW, b.plantH * 0.5) * 1.05, entry.slots, 0, 0], 80)
+        if (ct) {
+          // Carpet geometry, pre-multiplied by the mat's constant scale so the
+          // shader never has to reconstruct it.
+          const s = entry.carpetScale
+          info.set([ct.tileM * s, CARPET_PARALLAX_MAX], 82)
+          info.set([ct.planeFrac, (ct.y1 - ct.y0) * s, ct.y0 * s, p.carpetRelief], 84)
+        }
         device.queue.writeBuffer(entry.infoBuffer, 0, info)
-        device.queue.writeBuffer(entry.argsBuffer, 0, argsReset)
-        entry.slotsPerFrame = sideX * sideZ * SCATTER_MAX_PER_CELL
+        device.queue.writeBuffer(entry.argsBuffer, 0, entry.argsReset)
+        entry.slotsPerFrame = sideX * sideZ * entry.slots
       })
 
       // Shell: two camera-snapped grid levels; the coarse one skips whatever the
@@ -369,12 +496,25 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       })
       pass.setBindGroup(0, ctx.frame.bindGroup)
       if (p.tufts) {
+        // Carpets first: a mat is a closed, depth-writing ground surface, so
+        // drawing it before the splats lets early-z reject the parts of the
+        // sparse grass that are below it.
+        if (carpetPipeline) {
+          pass.setPipeline(carpetPipeline)
+          for (const entry of entries) {
+            if (!entry.carpetBindGroup) continue
+            pass.setBindGroup(1, entry.carpetBindGroup)
+            pass.drawIndirect(entry.argsBuffer, 0)
+          }
+        }
         pass.setPipeline(tuftPipeline)
         for (const entry of entries) {
+          if (!entry.nearBindGroup) continue
           pass.setBindGroup(1, entry.nearBindGroup)
           pass.drawIndirect(entry.argsBuffer, 0)
         }
         for (const entry of entries) {
+          if (!entry.farBindGroup) continue
           pass.setBindGroup(1, entry.farBindGroup)
           pass.drawIndirect(entry.argsBuffer, 16)
         }
@@ -423,6 +563,48 @@ function uploadNodeAtlas(
   mip.run(enc, albedo, ALB_MIPS, 'fs_albedo', 'rgba8unorm')
   mip.run(enc, normal, NRM_MIPS, 'fs_oct', 'rg8unorm')
   return { bake, cov, albedo, normal }
+}
+
+/**
+ * Upload one carpet species: the seamless tile capture only. Its node atlas
+ * (5 nodes x 8 azimuths of SIDE views, 14.8 MiB) is deliberately NOT uploaded —
+ * a mat never draws a splat, and side views of a 0.09m cushion are the least
+ * useful bytes in the budget. The CPU-side node bake is still kept, because the
+ * shell's canopy composite reads its straight-down capture.
+ */
+function uploadCarpetTile(
+  ctx: ExperimentContext<typeof PARAMS>,
+  mip: MipGen,
+  enc: GPUCommandEncoder,
+  speciesId: string,
+  bake: CanopyBake,
+  tile: CarpetTileBake,
+): SpeciesGpu {
+  const mk = (label: string): GPUTexture =>
+    ctx.res.createTexture(
+      {
+        label: `${ctx.id}/${speciesId}/${label}`,
+        size: [CT_PX, CT_PX],
+        format: 'rgba8unorm',
+        mipLevelCount: CT_MIPS,
+        usage:
+          GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST,
+      },
+      { species: speciesId, tag: `carpet-${label}` },
+    )
+  const tileAlbedo = mk('tile-albedo')
+  const tileAux = mk('tile-aux')
+  const layout = { bytesPerRow: CT_PX * 4, rowsPerImage: CT_PX }
+  ctx.device.queue.writeTexture({ texture: tileAlbedo }, tile.albedo, layout, [CT_PX, CT_PX])
+  ctx.device.queue.writeTexture({ texture: tileAux }, tile.aux, layout, [CT_PX, CT_PX])
+  mip.run(enc, tileAlbedo, CT_MIPS, 'fs_albedo', 'rgba8unorm')
+  mip.run(enc, tileAux, CT_MIPS, 'fs_aux_ao', 'rgba8unorm')
+  console.info(
+    `[${ctx.id}] carpet tile ${speciesId}: ${CT_PX}px / ${tile.tileM}m ` +
+      `(${Math.round(CT_PX / tile.tileM)} texels/m), coverage ${(tile.meanCov * 100).toFixed(0)}%, ` +
+      `surface at ${(tile.planeFrac * 100).toFixed(0)}% of ${(tile.y1 - tile.y0).toFixed(3)}m`,
+  )
+  return { bake, tile, tileAlbedo, tileAux }
 }
 
 /** GPU mip generation, one full-screen pass per level (init only). */

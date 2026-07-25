@@ -8,10 +8,11 @@ import {
   MIPS,
   bakeCards,
   buildMips,
+  rebuildCarpetTopTile,
   unpackCards,
   type CardsBaked,
 } from './bake.ts'
-import { DEBUG_VIEW_MODES, assetUrl, asU32, commitBake, hash3, hashF32, speciesById } from '@harness'
+import { DEBUG_VIEW_MODES, assetUrl, asU32, commitBake, hash3, hashF32, speciesById, standEntrySlots } from '@harness'
 import type { DebugViewMode, Experiment, ExperimentContext, FrameInfo, ViewTargets } from '@harness'
 import type { PARAMS } from './manifest.ts'
 
@@ -46,11 +47,15 @@ const MAX_DIST = 1024
 const SLOT = 176
 const POOL = 224 // cache array layers (WebGPU guarantees >= 256)
 const MASK_SIDE = 16 // direct bitmask, in 8m clusters
-const NEAR_CAP = 65536
+const MAX_ENTRIES = 8 // stand entries rendered (bog has 5)
+const NEAR_CAP_MIN = 65536
+const NEAR_CAP_MAX = 262144
+const NOMINAL_DIRECT_R = 34 // the directRadius the near buffer is sized for
 const SCRATCH_CAP = 245760
 const MAX_REFRESH = 12
 const FAR_SINGLE_LEVEL = 3 // levels >= this use one clamped camera-facing card
 const RING_STRIDE = 256
+// Refresh work budget, in cells of the DEFAULT stand (3 entries x 128 slots).
 const CELL_BUDGET = 6144
 
 type V3 = [number, number, number]
@@ -163,14 +168,21 @@ interface RefreshJob {
 
 export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Experiment> {
   const { device } = ctx
-  if (ctx.stand.species.length > 4) {
-    console.warn(`${ctx.id}: stand has ${ctx.stand.species.length} entries; only the first 4 are rendered`)
+  if (ctx.stand.species.length > MAX_ENTRIES) {
+    console.warn(`${ctx.id}: stand has ${ctx.stand.species.length} entries; only the first ${MAX_ENTRIES} are rendered`)
   }
-  const entries = ctx.stand.species.slice(0, 4)
+  const entries = ctx.stand.species.slice(0, MAX_ENTRIES)
   const entryCount = entries.length
 
   // ---- baked per-species card proxies -------------------------------------
   const uniqueSpecies = [...new Set(entries.map((e) => e.species))]
+  // Species this stand lays out as a MAT: their top capture is rewritten at
+  // load into a bordered periodic tile (see rebuildCarpetTopTile).
+  const carpetTileM = new Map<string, number>()
+  for (const e of entries) {
+    const tileM = speciesById(e.species).tileM
+    if (e.carpetDiv && e.carpetDiv > 0 && tileM) carpetTileM.set(e.species, tileM)
+  }
   const baked = new Map<string, CardsBaked>()
   for (const speciesId of uniqueSpecies) {
     const key = `${speciesId}-cards-v${BAKE_VERSION}`
@@ -186,6 +198,8 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       if (!b) throw new Error(`${ctx.id}: fresh bake for ${speciesId} failed to unpack`)
       commitBake(ctx.id, key, packed).catch(() => undefined) // best effort
     }
+    const tileM = carpetTileM.get(speciesId)
+    if (tileM !== undefined) rebuildCarpetTopTile(b, tileM)
     baked.set(speciesId, b)
   }
 
@@ -222,29 +236,100 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
 
   // Per-entry plant table (mesh center/extents + species atlas layer).
   const plantTable = ctx.res.createBuffer(
-    { label: `${ctx.id}/plant-table`, size: 4 * 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST },
+    {
+      label: `${ctx.id}/plant-table`,
+      size: MAX_ENTRIES * 48,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    },
     { tag: 'plant-table' },
   )
   {
-    const data = new Float32Array(4 * 12)
+    const data = new Float32Array(MAX_ENTRIES * 12)
+    // Height of a carpet tile's plane above the ground, in metres — ONE value
+    // for every carpet entry of the stand, deliberately. The three Sphagnum
+    // states are 0.069-0.091m tall, and giving each its own plane leaves a
+    // 1.6cm STEP wherever two states meet: the tiles are flat quads with no
+    // side walls, so at any shallow angle you see bare peat through the step,
+    // and the zone boundaries read as scattered holes in the mat (the same
+    // artifact 001-billboard-smoke shows, from the same cause). One shared
+    // height keeps the mat a single continuous surface; the states then differ
+    // in colour, which is what the wetness zoning is actually about.
+    // The visible surface of a Sphagnum cushion is its capitulum apexes, not
+    // the middle of its bounding box: the mesh manifests put capitulumApexMeanH
+    // at 0.739-0.754 of the tile height for all three states.
+    const carpetTop = 0.74
+    const carpetPlaneY = Math.max(
+      0,
+      ...entries
+        .filter((e) => carpetTileM.has(e.species))
+        .map((e) => {
+          const m = baked.get(e.species)!.meta
+          const scale = CELL / (e.carpetDiv! * carpetTileM.get(e.species)!)
+          return (m.yMin + carpetTop * (m.yMax - m.yMin)) * scale
+        }),
+    )
     entries.forEach((e, i) => {
       const m = baked.get(e.species)!.meta
       const layer = uniqueSpecies.indexOf(e.species)
-      data.set([...m.center, layer, m.sideHalfW, m.sideHalfH, m.topHalfW, m.topHalfH, m.yMin, m.yMax, 0, 0], i * 12)
+      data.set(
+        [
+          ...m.center,
+          layer,
+          m.sideHalfW,
+          m.sideHalfH,
+          m.topHalfW,
+          m.topHalfH,
+          m.yMin,
+          m.yMax,
+          carpetPlaneY,
+          0,
+        ],
+        i * 12,
+      )
     })
     device.queue.writeBuffer(plantTable, 0, data)
   }
 
-  const totalDensity = entries.reduce((a, e) => a + Math.min(e.density, 8), 0)
+  /**
+   * Plants per m² an entry actually produces. A CARPET entry is not governed
+   * by `density` at all: it has carpet_div² slots per 4m cell (484 for the bog
+   * moss = 30.25 tiles/m², four times what the 128-slot scatter budget would
+   * suggest), of which its half-open wetness interval claims `wetWidth`. The
+   * carpet entries partition that axis, so summing the shares gives the mat's
+   * true per-m² count exactly — and sizing anything from `density` here would
+   * under-reserve the bog by ~4x and silently drop instances.
+   */
+  const entryDensity = (e: (typeof entries)[number]): number =>
+    e.carpetDiv && e.carpetDiv > 0
+      ? ((e.carpetDiv * e.carpetDiv) / (CELL * CELL)) * Math.min(e.wetWidth ?? 1, 1)
+      : Math.min(e.density, 8)
+  const totalDensity = entries.reduce((a, e) => a + entryDensity(e), 0)
   const maxPlantH = Math.max(...entries.map((e) => speciesById(e.species).heightScale * e.scaleMax)) * 1.1 + 0.6
-  const swayAvg = entries.reduce((a, e) => a + e.sway * Math.min(e.density, 8), 0) / Math.max(totalDensity, 1e-4)
+  const swayAvg = entries.reduce((a, e) => a + e.sway * entryDensity(e), 0) / Math.max(totalDensity, 1e-4)
   const levelCap = Array.from({ length: TOP_LEVEL + 1 }, (_, l) =>
     Math.min(Math.ceil((S0 << l) * (S0 << l) * totalDensity * 1.25) + 256, SCRATCH_CAP),
   )
+  // The near ring materializes every plant inside it EVERY frame, so its
+  // buffer is what bounds how far it can reach. Size it for the default
+  // directRadius at this stand's real density (identical to the historical
+  // 65536 on the ±128m grass stands, ~3x that on the carpet-heavy bog), then
+  // clamp the radius to what the buffer can actually hold rather than letting
+  // the fill drop instances on the floor.
+  const nearCap = Math.min(
+    NEAR_CAP_MAX,
+    Math.max(NEAR_CAP_MIN, Math.ceil(Math.PI * (NOMINAL_DIRECT_R + S0) ** 2 * totalDensity * 1.15)),
+  )
+  const nearReach = Math.max(S0, Math.sqrt(nearCap / (totalDensity * 1.15) / Math.PI) - S0)
+  // Refresh work per frame is bounded in CELLS, but a cell costs one scatter
+  // evaluation per SLOT — 1708 on the bog against 384 on the default stand.
+  // Scale the budget by that ratio so a refresh burst costs the same wherever
+  // it runs.
+  const slotsPerCell = entries.reduce((a, e) => a + standEntrySlots(e), 0)
+  const cellBudget = Math.max(64, Math.round((CELL_BUDGET * 384) / Math.max(slotsPerCell, 1)))
 
   // ---- GPU resources ------------------------------------------------------
   const nearInstances = ctx.res.createBuffer(
-    { label: `${ctx.id}/near-instances`, size: NEAR_CAP * 32, usage: GPUBufferUsage.STORAGE },
+    { label: `${ctx.id}/near-instances`, size: nearCap * 32, usage: GPUBufferUsage.STORAGE },
     { tag: 'instances' },
   )
   const refreshInstances = ctx.res.createBuffer(
@@ -327,6 +412,21 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
     addressModeU: 'clamp-to-edge',
     addressModeV: 'clamp-to-edge',
   })
+  // Carpet tiles only. A ground-parallel mat quad is minified far harder along
+  // the view direction than across it; one trilinear lod has to pick a single
+  // compromise and it erased every texel of moss detail at eye level. Sampled
+  // by gradient (textureSampleGrad in cards.wgsl), so the hardware keeps the
+  // cross-axis sharpness. Separate sampler so the upright card path — and the
+  // whole `default` stand — is bit-for-bit unchanged.
+  const carpetSampler = device.createSampler({
+    label: `${ctx.id}/carpet-sampler`,
+    magFilter: 'linear',
+    minFilter: 'linear',
+    mipmapFilter: 'linear',
+    maxAnisotropy: 8,
+    addressModeU: 'clamp-to-edge',
+    addressModeV: 'clamp-to-edge',
+  })
   const cacheSampler = device.createSampler({
     label: `${ctx.id}/cache-sampler`,
     magFilter: 'linear',
@@ -374,6 +474,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d-array' } },
       { binding: 4, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d-array' } },
       { binding: 5, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+      { binding: 6, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
     ],
   })
   const mkCardsBg = (label: string, instances: GPUBuffer): GPUBindGroup =>
@@ -387,6 +488,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         { binding: 3, resource: cardAlbedo.createView({ dimension: '2d-array' }) },
         { binding: 4, resource: cardNormal.createView({ dimension: '2d-array' }) },
         { binding: 5, resource: cardSampler },
+        { binding: 6, resource: carpetSampler },
       ],
     })
   const nearCardsBg = mkCardsBg('near-cards-bg', nearInstances)
@@ -639,7 +741,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       const cam: V3 = [frame.camera.pose.x, frame.camera.pose.y, frame.camera.pose.z]
       const frameIdx = frame.frameIndex
       const tau = ctx.params.refreshTau
-      const directR = Math.min(ctx.params.directRadius, 48)
+      const directR = Math.min(ctx.params.directRadius, 48, nearReach)
       baseShade = ctx.params.baseShade
       // The cache holds SHADED imagery, so anything that changes how a fragment
       // is shaded has to re-reconstruct every slot: the debug view selector and
@@ -773,7 +875,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
           if (refreshJobs.length >= budget) break
           const leaf = cand.leaf
           const jobCells = (1 << (leaf.level + 1)) ** 2
-          if (refreshJobs.length > 0 && cells + jobCells > CELL_BUDGET) continue
+          if (refreshJobs.length > 0 && cells + jobCells > cellBudget) continue
           const cap = levelCap[leaf.level]!
           if (base + cap > SCRATCH_CAP) continue
 
@@ -866,7 +968,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         ringU[6] = MASK_SIDE
         ringU[7] = 1 // near mode
         ringF[8] = standR
-        ringU[9] = NEAR_CAP
+        ringU[9] = nearCap
         ringU[10] = 0
         cardsData[20] = screenPxAngle
         cardsData[23] = baseShade

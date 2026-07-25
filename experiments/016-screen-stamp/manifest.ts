@@ -15,10 +15,17 @@ export default defineExperiment({
   id: '016-screen-stamp',
   title: 'screen-stamp tile binning',
   description:
-    'Inverted loop: a compute pass per 16px screen tile finds the plants that project into it (depth-guided footprint, procedural scatter twin, frustum-tested, sorted front-to-back), then one fullscreen pass composites at most K precomputed hemi-octa impostor lookups per pixel with early termination. Per-frame cost is bounded by screen tiles, never by plant count.',
+    'Inverted loop: a compute pass per 16px screen tile finds the plants that project into it (depth-guided footprint, procedural scatter twin, frustum-tested, sorted front-to-back), then one fullscreen pass composites at most K precomputed hemi-octa impostor lookups per pixel with early termination. Carpet species skip the lists entirely: the mat is stamped per pixel straight from the depth buffer (ground point -> grid node -> wetness state -> that tile\'s high-res top-view bake, one parallax step for cushion relief). Per-frame cost is bounded by screen tiles, never by plant count.',
   status: 'working',
   harnessApi: HARNESS_API,
-  species: ['calamagrostis-canescens', 'elymus-repens', 'poa-pratensis'],
+  species: [
+    'calamagrostis-canescens',
+    'elymus-repens',
+    'poa-pratensis',
+    'spaghnum-palustre-wet-vigorous',
+    'spaghnum-palustre-late-season',
+    'spaghnum-palustre-sun-exposed',
+  ],
   params: PARAMS,
   load: () => import('./main.ts'),
 })

@@ -111,7 +111,7 @@ export function mipTexels(tile: number, levels: number): number {
 }
 
 /** Texel offset of a level inside a level-major mip chain. */
-function levelOffsetTexels(tile: number, level: number, layers: number): number {
+export function levelOffsetTexels(tile: number, level: number, layers: number): number {
   let off = 0
   let s = tile
   for (let i = 0; i < level; i++) {

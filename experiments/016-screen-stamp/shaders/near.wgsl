@@ -23,10 +23,14 @@ const ATLAS_F: f32 = 1280.0;
 const MAX_LOD: f32 = 3.0;
 
 struct StampParams {
-  dims: vec4u,                 // x,y unused, z = seed, w = entry_count
-  tuning: vec4f,               // x = max_dist, y = tint_strength, z = tile overlay, w unused
-  entry_meta: array<vec4f, 4>, // impostor local center.xyz, bounding radius
-  entry_info: array<vec4f, 4>, // species average albedo rgb, pad
+  dims: vec4u,                  // x = card slots, y = carpet slots, z = seed, w = stand entries
+  tuning: vec4f,                // x = max_dist, y = tint_strength, z = tile overlay, w = tint coverage
+  cards: vec4u,                 // stand entry index per card slot
+  carpets: vec4u,               // stand entry index per carpet slot
+  grid: vec4f,                  // carpet grid (see carpet.wgsl) — unused here
+  entry_meta: array<vec4f, 4>,  // per card slot: impostor local center.xyz, radius
+  entry_info: array<vec4f, 4>,  // per card slot: species average albedo rgb
+  carpet_zone: array<vec4f, 4>, // per carpet slot: wet_lo, wet_hi, h_mean, y_range
 }
 @group(1) @binding(0) var<uniform> sp: StampParams;
 @group(1) @binding(1) var alb0: texture_2d<f32>;
@@ -56,15 +60,15 @@ fn hemioct_decode(e: vec2f) -> vec3f {
   return normalize(vec3f(px, y, pz));
 }
 
-fn sample_albedo(entry_index: u32, uv: vec2f, lod: f32) -> vec4f {
-  if (entry_index == 0u) { return textureSampleLevel(alb0, atlas_samp, uv, lod); }
-  if (entry_index == 1u) { return textureSampleLevel(alb1, atlas_samp, uv, lod); }
+fn sample_albedo(card_slot: u32, uv: vec2f, lod: f32) -> vec4f {
+  if (card_slot == 0u) { return textureSampleLevel(alb0, atlas_samp, uv, lod); }
+  if (card_slot == 1u) { return textureSampleLevel(alb1, atlas_samp, uv, lod); }
   return textureSampleLevel(alb2, atlas_samp, uv, lod);
 }
 
-fn sample_normal(entry_index: u32, uv: vec2f, lod: f32) -> vec4f {
-  if (entry_index == 0u) { return textureSampleLevel(nrm0, atlas_samp, uv, lod); }
-  if (entry_index == 1u) { return textureSampleLevel(nrm1, atlas_samp, uv, lod); }
+fn sample_normal(card_slot: u32, uv: vec2f, lod: f32) -> vec4f {
+  if (card_slot == 0u) { return textureSampleLevel(nrm0, atlas_samp, uv, lod); }
+  if (card_slot == 1u) { return textureSampleLevel(nrm1, atlas_samp, uv, lod); }
   return textureSampleLevel(nrm2, atlas_samp, uv, lod);
 }
 
@@ -82,11 +86,13 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
   var out: VOut;
   out.pos = vec4f(0.0, 0.0, 2.0, 1.0); // degenerate unless a live plant
 
-  let ec = max(sp.dims.w, 1u);
+  // Card slots only — a carpet is not a card and never reaches this pass.
+  let ec = max(sp.dims.x, 1u);
   let per_cell = SCATTER_MAX_PER_CELL * ec;
   let cell_lin = ii / per_cell;
   let rem = ii % per_cell;
-  let entry_index = rem / SCATTER_MAX_PER_CELL;
+  let card_slot = rem / SCATTER_MAX_PER_CELL;
+  let entry_index = sp.cards[card_slot];
   let slot = rem % SCATTER_MAX_PER_CELL;
   let cam = frame.camera_pos;
   let origin = vec2i(floor((cam.xz - vec2f(10.0)) / SCATTER_CELL_SIZE));
@@ -96,7 +102,7 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
   if (!cand.exists) { return out; }
 
   let entry = stand_table[entry_index];
-  let im = sp.entry_meta[entry_index];
+  let im = sp.entry_meta[card_slot];
   let r_world = im.w * cand.scale;
   let swayv = wind_sway(cand.pos, frame.time, entry.sway, cand.phase);
   let center = cand.pos + rot_y_v(im.xyz * cand.scale, cand.yaw) + swayv * 0.6;
@@ -141,7 +147,7 @@ fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> 
   out.pos = frame.view_proj * vec4f(world, 1.0);
   out.world = world;
   out.center = center;
-  out.info = vec4f(r_world, cand.yaw, fade, f32(entry_index));
+  out.info = vec4f(r_world, cand.yaw, fade, f32(card_slot));
   out.node = vec4f(round(g.x), round(g.y), swayv.x, swayv.z);
   out.bh = vec4f(cand.pos.y, height, k_clip, 0.0);
   return out;
@@ -152,7 +158,7 @@ fn fs_main(in: VOut) -> @location(0) vec4f {
   let r_world = in.info.x;
   let yaw = in.info.y;
   let fade = in.info.z;
-  let entry_index = u32(in.info.w);
+  let card_slot = u32(in.info.w);
 
   // Undo the vertex shear to recover the rigid card point, then project into
   // the baked view's orthographic basis — identical math to resolve.wgsl.
@@ -182,7 +188,7 @@ fn fs_main(in: VOut) -> @location(0) vec4f {
   if (uvp.x < inset || uvp.x > 1.0 - inset || uvp.y < inset || uvp.y > 1.0 - inset) { discard; }
   let auv = (in.node.xy + uvp) * (ATLAS_TILE_F / ATLAS_F);
 
-  let alb = sample_albedo(entry_index, auv, lod);
+  let alb = sample_albedo(card_slot, auv, lod);
   // Coverage erosion: fading plants lose their thin parts first — no dither,
   // no blending, depth stays honest.
   let threshold = mix(1.01, 0.45, fade);
@@ -190,7 +196,7 @@ fn fs_main(in: VOut) -> @location(0) vec4f {
   // Atlas albedo is coverage-premultiplied (empty texels are black).
   let albedo = alb.rgb / max(alb.a, 0.05);
 
-  var n_local = sample_normal(entry_index, auv, lod).xyz * 2.0 - 1.0;
+  var n_local = sample_normal(card_slot, auv, lod).xyz * 2.0 - 1.0;
   if (dot(n_local, n_local) < 1e-4) { n_local = vec3f(0.0, 1.0, 0.0); }
   let n_ws = rot_y_v(normalize(n_local), yaw);
   var col = light_surface(albedo, n_ws, in.world);

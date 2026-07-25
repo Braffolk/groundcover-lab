@@ -8,10 +8,12 @@
 // from its projected pixel height, and appends it to that LOD's bucket. Cost is
 // O(region area), never O(total plants in the stand).
 //
-// A workgroup is 64 invocations and a cell holds SCATTER_MAX_PER_CELL = 128
-// candidate slots, so every workgroup covers exactly half of ONE cell: the
-// cell-level rejects below are workgroup-uniform and let whole workgroups exit
-// before a single terrain texel is fetched.
+// The dispatch is 2D: x walks this ENTRY'S OWN slot count (info.carpet_info.z
+// — carpet_div² = 484 for the bog moss, SCATTER_MAX_PER_CELL = 128 for a
+// scattered entry), y is one cell per workgroup row. So every workgroup lives
+// inside exactly one cell: the cell-level rejects below are workgroup-uniform
+// and let whole workgroups exit before a single terrain texel is fetched, and
+// no integer div/mod is needed to recover the cell.
 
 // 32 B. Per-plant work that the draw would otherwise redo in every one of the
 // plant's ~8192x4 vertex invocations is finished HERE, once: yaw sin/cos, the
@@ -34,15 +36,12 @@ const ARG_STRIDE: u32 = 8u;
 
 @compute @workgroup_size(64)
 fn cs_cull(@builtin(global_invocation_id) gid: vec3<u32>) {
-  let side_x = u32(info.side_xz.x);
-  let total = side_x * u32(info.side_xz.y) * SCATTER_MAX_PER_CELL;
-  let idx = gid.x;
-  if (idx >= total) {
+  let slot = gid.x;
+  if (slot >= u32(info.carpet_info.z)) {
     return;
   }
-
-  let slot = idx % SCATTER_MAX_PER_CELL;
-  let cell_lin = idx / SCATTER_MAX_PER_CELL;
+  let side_x = u32(info.side_xz.x);
+  let cell_lin = gid.y;
   let cx = i32(info.origin_cell.x) + i32(cell_lin % side_x);
   let cz = i32(info.origin_cell.y) + i32(cell_lin / side_x);
 
@@ -96,7 +95,11 @@ fn cs_cull(@builtin(global_invocation_id) gid: vec3<u32>) {
   // switch distance by sqrt(2)), so the level index is ONE log2 — no loop, no
   // threshold table walk.
   let dist = max(distance(center, frame.camera_pos), 0.05);
-  let px_h = (info.splat_y1 - info.splat_y0) * sp.scale * info.px_scale / dist;
+  // Projected size of the plant, measured along the axis that actually carries
+  // its extent: HEIGHT for an upright plant, FOOTPRINT for a carpet tile
+  // (0.18m wide vs 0.07m tall — measuring a mat by its height picks a level two
+  // steps too coarse and turns the tile into a handful of fat ellipses).
+  let px_h = info.carpet_info.y * sp.scale * info.px_scale / dist;
   // Per-plant jitter decorrelates LOD transitions spatially, so a switch reads
   // as scattered plants changing rather than a ring sweeping over the field.
   let jitter = 0.82 + 0.36 * hash_f32(hash3(u32(info.seed) ^ 0x9e37u, bitcast<u32>(sp.pos.x), bitcast<u32>(sp.pos.z)));
@@ -104,13 +107,18 @@ fn cs_cull(@builtin(global_invocation_id) gid: vec3<u32>) {
   let lod = min(u32(max(lod_f, 0.0)), u32(info.lod_count) - 1u);
 
   // --- coverage falloff (no dither) -----------------------------------------
-  // Camera-inside and region-rim plants shrink their splats toward nothing, so
-  // the canopy thins out honestly and every remaining edge stays hard and
-  // early-z friendly. A plant that has faded out is dropped here outright.
-  let seg_y = clamp(frame.camera_pos.y, sp.pos.y + info.splat_y0 * sp.scale, sp.pos.y + info.splat_y1 * sp.scale);
-  let d_core = length(vec3f(sp.pos.x, seg_y, sp.pos.z) - frame.camera_pos);
-  let r_p = max(info.splat_rxz * sp.scale, 1e-3);
-  let fade = smoothstep(r_p * 0.18, r_p * 0.8, d_core) * (1.0 - smoothstep(info.region_r * 0.86, info.region_r, d_xz));
+  // Region-rim plants shrink their splats toward nothing, so the canopy thins
+  // out honestly and every remaining edge stays hard and early-z friendly. A
+  // plant that has faded out is dropped here outright.
+  var fade = 1.0 - smoothstep(info.region_r * 0.86, info.region_r, d_xz);
+  // The camera-inside fade applies to plants the camera can stand INSIDE. A
+  // carpet is a mat you stand ON: fading it would open a hole under your feet.
+  if (info.carpet_info.x < 0.5) {
+    let seg_y = clamp(frame.camera_pos.y, sp.pos.y + info.splat_y0 * sp.scale, sp.pos.y + info.splat_y1 * sp.scale);
+    let d_core = length(vec3f(sp.pos.x, seg_y, sp.pos.z) - frame.camera_pos);
+    let r_p = max(info.splat_rxz * sp.scale, 1e-3);
+    fade = fade * smoothstep(r_p * 0.18, r_p * 0.8, d_core);
+  }
   if (fade < 0.02) {
     return;
   }

@@ -27,7 +27,17 @@ struct CardInfo {
   lod_cap: vec4f,          // capacity of each LOD ring
   lod_dist: vec4f,         // x,y: scale-normalized ring radii (m)
   grid: vec4f,             // side grid (x,y) and top grid (z,w) of THIS LOD
-  shape: vec4f,            // x: lod index, y: occlusion normalization gain,
+  shape: vec4f,            // x: carpet height-field decode SPAN,
+                           // y: occlusion normalization gain,
                            // z: depth shading, w: card curvature scale
-  self_ring: vec4f,        // x: this LOD's instance base, y: its capacity
+  ring: vec4f,             // x: this LOD's instance base, y: its capacity,
+                           // z: scatter slots per cell to ENUMERATE (128 for a
+                           //    scattered entry, carpet_div^2 for a mat — the
+                           //    two are not the same number, and the mat's is
+                           //    deliberately over the scatter budget),
+                           // w: carpet height-field decode BASE. A mat's DISP
+                           //    texture is its own tile-square field rescaled
+                           //    to the full 8-bit range, so a height fraction
+                           //    is ring.w + texel * shape.x. top_frac carries
+                           //    its mean, i.e. where a flat tile sits.
 }

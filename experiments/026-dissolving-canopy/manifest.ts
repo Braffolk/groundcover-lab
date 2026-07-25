@@ -16,6 +16,13 @@ export const PARAMS = {
   shellRelief: p.num(1.3, { min: 0.4, max: 2, step: 0.05 }),
   /** Fake occlusion: darken tuft bottoms, back tufts and canopy troughs. */
   groundShade: p.num(0.3, { min: 0, max: 0.8, step: 0.05 }),
+  /**
+   * Carpet species only (Sphagnum): gain on the parallax offset that expresses
+   * the cushion's capitulum relief. 0 = a flat printed tile, 1 = the baked
+   * height taken at face value. The offset is clamped in metres regardless, so
+   * this trades depth against how far a grazing ray may slide the texture.
+   */
+  carpetRelief: p.num(1, { min: 0, max: 2, step: 0.1 }),
   /** Draw the per-plant tuft splats. */
   tufts: p.bool(true),
   /** Draw the continuous canopy shell. */
@@ -29,7 +36,14 @@ export default defineExperiment({
     'A near plant is a cloud of 4 baked sub-tuft splats at four real depths — parallax, self-occlusion and a view-dependent silhouette inside ONE plant; receding, it collapses to one splat and then dissolves, coverage threshold by coverage threshold, into a continuous displaced canopy shell composited from tileable top-views of the same meshes. The dissolve radius follows viewing elevation, so from above the canopy closes into one surface within 16 m while at grazing it stays individual plants past 100 m; the shell then closes up via 1-(1-c)^(1/sin) path-length coverage and re-hues itself from the baked side views.',
   status: 'working',
   harnessApi: HARNESS_API,
-  species: ['calamagrostis-canescens', 'elymus-repens', 'poa-pratensis'],
+  species: [
+    'calamagrostis-canescens',
+    'elymus-repens',
+    'poa-pratensis',
+    'spaghnum-palustre-wet-vigorous',
+    'spaghnum-palustre-late-season',
+    'spaghnum-palustre-sun-exposed',
+  ],
   params: PARAMS,
   bakeVersion: 2,
   load: () => import('./main.ts'),

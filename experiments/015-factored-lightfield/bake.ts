@@ -1,19 +1,19 @@
 import bakeShaderSrc from './shaders/bake.wgsl'
-import type { ExperimentContext, GcMesh } from '@harness'
+import { bakedArtifact, commitBake, type ExperimentContext, type GcMesh } from '@harness'
 import type { PARAMS } from './manifest.ts'
 
 /**
  * Bake one species into the factored light-field representation:
  *
- *  1. GPU: a 24x24 hemi-octahedral grid of orthographic DEPTH+COVERAGE
- *     captures. Each view is rasterized 2x2 supersampled (256px) into a
- *     one-row strip, then downsampled to its final 128px tile storing
- *     min-depth (8-bit, 1.0 = miss sentinel) and fractional coverage in one
- *     rg8unorm 3072x3072 atlas (18.9MB). Fractional coverage is what keeps
- *     sub-texel fluff (calamagrostis seed heads) wispy instead of ballooning
- *     to its convex hull. Work is chunked into several submits so huge
- *     meshes (poa is 6.5M tris) never risk a device timeout.
- *  2. CPU: view-INDEPENDENT appearance volumes — every source vertex (2M-6.5M
+ *  1. GPU: a GRIDxGRID hemi-octahedral grid of orthographic DEPTH+COVERAGE
+ *     captures. Each view is rasterized 2x2 supersampled into a one-row strip,
+ *     then downsampled to its final TILE px tile storing min-depth (8-bit,
+ *     1.0 = miss sentinel) and fractional coverage in one rg8unorm 3072x3072
+ *     atlas (18.9MB). Fractional coverage is what keeps sub-texel fluff
+ *     (calamagrostis seed heads) wispy instead of ballooning to its convex
+ *     hull. Work is chunked into several submits so huge meshes (the 19.8M-tri
+ *     Sphagnum tiles) never risk a device timeout.
+ *  2. CPU: view-INDEPENDENT appearance volumes — every source vertex (2M-11.5M
  *     of them; denser than the voxel grid) is splatted into a <=96^3
  *     aspect-fit voxel grid, averaged, then dilated so any quantized hit
  *     point reconstructed at runtime lands on valid albedo/normal data.
@@ -22,24 +22,71 @@ import type { PARAMS } from './manifest.ts'
  *
  * Naive 4D storage at the same angular/spatial resolution (albedo+normal+
  * depth+coverage, ~10B/ray) would be ~94MB; the factorization stores ~21MB.
+ *
+ * The result is packed into ONE gzipped artifact per species and cached /
+ * committed through the harness bake flow: the Sphagnum meshes are 19.8M tris
+ * / 479MB each, so a fresh bake costs minutes and nobody should pay it twice.
  */
 
-export const GRID = 24
-export const TILE = 128
-export const ATLAS = GRID * TILE // 3072
+/** Atlas is always this square, whatever (grid, tile) split a profile picks. */
+export const ATLAS = 3072
+
+/**
+ * How a species' light field is split between angular and spatial resolution.
+ * grid*tile == ATLAS, so every profile costs the same 18.9MB.
+ */
+export interface QlfProfile {
+  /** Hemi-oct views per axis (grid^2 views). */
+  grid: number
+  /** Pixels per view tile. */
+  tile: number
+  /** Cache-key fragment — bump when the bake maths changes. */
+  key: string
+  /**
+   * Commit a fresh bake into mesh/baked/<exp>/. True for the Sphagnum tiles:
+   * fetching and parsing 479MB of source mesh per species dwarfs the bake
+   * itself, and nobody should pay it on a page load.
+   */
+  commit: boolean
+}
+
+/** Upright plants: fine angular sampling for thin stems seen edge-on. */
+export const PROFILE_PLANT: QlfProfile = { grid: 24, tile: 128, key: 'v2-g24t128', commit: false }
+/**
+ * Carpet tiles (Sphagnum): trade angular for SPATIAL resolution. A cushion is
+ * nearly a height field — 3.3cm of relief, no thin stems standing off it — so
+ * the parallax between neighbouring views is ~2mm and 144 views are plenty,
+ * while 256px tiles put 0.9mm on a texel and finally resolve single capitula.
+ * Same 3072 atlas, same 18.9MB.
+ */
+export const PROFILE_CARPET: QlfProfile = { grid: 12, tile: 256, key: 'v2-g12t256', commit: true }
+
 const SS = 2 // supersampling factor of the bake rasterization
-const TILE_SS = TILE * SS
-const STRIP_W = GRID * TILE_SS // 6144
+/**
+ * Every ortho view is framed on the BOX SUPPORT along its own axes rather than
+ * on the bounding sphere, times this margin. The margin buys a few empty texels
+ * around the silhouette, so a runtime query that projects outside the frame
+ * clamps onto a miss texel instead of smearing the edge outward. The win is
+ * large for anything non-cubic: a Sphagnum slab (0.21 x 0.09 x 0.23 m) inside
+ * its 0.33 m bounding sphere used to spend 70% of every tile on empty space.
+ */
+const FRAME_PAD = 1.03
 const VOL_MAX = 96
 const DILATE_PASSES = 4
 /** Cap triangles per GPU submit during the bake (watchdog safety). */
-const TRIS_PER_SUBMIT = 1.6e8
+const TRIS_PER_SUBMIT = 6e7
+const MAGIC = 0x314c5147 // 'QLF1'
+const HEADER_F32 = 24 // 96B header
 
 export interface QlfBaked {
   depthAtlas: GPUTexture
   albedoVol: GPUTexture
   normalVol: GPUTexture
+  grid: number
+  tile: number
   center: [number, number, number]
+  /** Padded bbox half-extents in unit-sphere space — the per-view frame sizes. */
+  halfU: [number, number, number]
   radius: number
   bmin: [number, number, number]
   bmax: [number, number, number]
@@ -212,60 +259,210 @@ function bakeVolumes(mesh: GcMesh): Volumes {
 }
 
 // ---------------------------------------------------------------------------
-// GPU half: the 576-view supersampled ortho depth+coverage light field.
+// Artifact container: header + rg8 atlas + rgba8 albedo/normal volumes, gzipped.
 // ---------------------------------------------------------------------------
 
-export async function bakeSpecies(
+async function gzip(data: ArrayBuffer): Promise<ArrayBuffer> {
+  const s = new Blob([data]).stream().pipeThrough(new CompressionStream('gzip'))
+  return await new Response(s).arrayBuffer()
+}
+
+async function gunzipIfNeeded(data: ArrayBuffer): Promise<ArrayBuffer> {
+  const head = new Uint8Array(data, 0, Math.min(2, data.byteLength))
+  if (head[0] !== 0x1f || head[1] !== 0x8b) return data
+  const s = new Blob([data]).stream().pipeThrough(new DecompressionStream('gzip'))
+  return await new Response(s).arrayBuffer()
+}
+
+interface Artifact {
+  grid: number
+  tile: number
+  dims: [number, number, number]
+  center: V3
+  halfU: V3
+  radius: number
+  bmin: V3
+  bmax: V3
+  heightM: number
+  atlas: Uint8Array<ArrayBuffer>
+  albedo: Uint8Array<ArrayBuffer>
+  normal: Uint8Array<ArrayBuffer>
+}
+
+function packArtifact(a: Artifact): ArrayBuffer {
+  const atlasBytes = ATLAS * ATLAS * 2
+  const volBytes = a.dims[0] * a.dims[1] * a.dims[2] * 4
+  const total = HEADER_F32 * 4 + atlasBytes + volBytes * 2
+  const buf = new ArrayBuffer(total)
+  const u32 = new Uint32Array(buf, 0, HEADER_F32)
+  const f32 = new Float32Array(buf, 0, HEADER_F32)
+  u32[0] = MAGIC
+  u32[1] = a.grid
+  u32[2] = a.tile
+  u32[3] = a.dims[0]
+  u32[4] = a.dims[1]
+  u32[5] = a.dims[2]
+  f32[6] = a.radius
+  f32[7] = a.heightM
+  f32.set(a.center, 8)
+  f32.set(a.bmin, 12)
+  f32.set(a.bmax, 16)
+  f32.set(a.halfU, 20)
+  const bytes = new Uint8Array(buf)
+  let o = HEADER_F32 * 4
+  bytes.set(a.atlas, o)
+  o += atlasBytes
+  bytes.set(a.albedo, o)
+  o += volBytes
+  bytes.set(a.normal, o)
+  return buf
+}
+
+function unpackArtifact(buf: ArrayBuffer): Artifact {
+  const u32 = new Uint32Array(buf, 0, HEADER_F32)
+  const f32 = new Float32Array(buf, 0, HEADER_F32)
+  if (u32[0] !== MAGIC) throw new Error('015: baked artifact has bad magic (stale or HTML fallback)')
+  const dims: [number, number, number] = [u32[3]!, u32[4]!, u32[5]!]
+  const atlasBytes = ATLAS * ATLAS * 2
+  const volBytes = dims[0] * dims[1] * dims[2] * 4
+  let o = HEADER_F32 * 4
+  const atlas = new Uint8Array(buf, o, atlasBytes)
+  o += atlasBytes
+  const albedo = new Uint8Array(buf, o, volBytes)
+  o += volBytes
+  const normal = new Uint8Array(buf, o, volBytes)
+  return {
+    grid: u32[1]!,
+    tile: u32[2]!,
+    dims,
+    center: [f32[8]!, f32[9]!, f32[10]!],
+    halfU: [f32[20]!, f32[21]!, f32[22]!],
+    radius: f32[6]!,
+    bmin: [f32[12]!, f32[13]!, f32[14]!],
+    bmax: [f32[16]!, f32[17]!, f32[18]!],
+    heightM: f32[7]!,
+    atlas,
+    albedo,
+    normal,
+  }
+}
+
+/**
+ * Load (cache -> committed file -> fresh bake) and upload one species' light
+ * field. A fresh bake that cost real time is committed back into
+ * mesh/baked/<exp>/ so neither the owner nor a later run pays it again.
+ */
+export async function loadOrBakeSpecies(
   ctx: ExperimentContext<typeof PARAMS>,
   speciesId: string,
-  mesh: GcMesh,
+  profile: QlfProfile,
+  loadMesh: () => Promise<GcMesh>,
 ): Promise<QlfBaked> {
+  const key = `qlf-${profile.key}-${speciesId}`
+  let bakeMs = 0
+  const raw = await bakedArtifact({ expId: ctx.id, key }, async () => {
+    const t0 = performance.now()
+    const mesh = await loadMesh()
+    const packed = packArtifact(await bakeArtifact(ctx, speciesId, mesh, profile))
+    bakeMs = performance.now() - t0
+    return await gzip(packed)
+  })
+  const artifact = unpackArtifact(await gunzipIfNeeded(raw))
+  // Only the profiles that ask for it (see QlfProfile.commit); the grasses bake
+  // in ~1s from a 64MB mesh and stay in the OPFS cache.
+  if (bakeMs > 0 && profile.commit) {
+    void commitBake(ctx.id, key, raw)
+      .then((saved) => console.log(`[${ctx.id}] committed ${saved} (${(bakeMs / 1000).toFixed(0)}s bake)`))
+      .catch((e: unknown) => console.warn(`[${ctx.id}] commit failed`, e))
+  }
+  return uploadBaked(ctx, speciesId, artifact)
+}
+
+function uploadBaked(ctx: ExperimentContext<typeof PARAMS>, speciesId: string, a: Artifact): QlfBaked {
   const { device } = ctx
-  const bmin = mesh.header.boundsMin
-  const bmax = mesh.header.boundsMax
-  const center: V3 = [(bmin[0] + bmax[0]) / 2, (bmin[1] + bmax[1]) / 2, (bmin[2] + bmax[2]) / 2]
-  const radius = 0.5 * Math.hypot(bmax[0] - bmin[0], bmax[1] - bmin[1], bmax[2] - bmin[2])
-  const invR = 1 / radius
-
-  const t0 = performance.now()
-
-  // Persistent runtime textures (counted against the species budget).
   const depthAtlas = ctx.res.createTexture(
     {
       label: `${ctx.id}/${speciesId}/depth-lf`,
       size: [ATLAS, ATLAS],
       format: 'rg8unorm', // r = min depth (1 = miss), g = fractional coverage
-      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.TEXTURE_BINDING,
+      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
     },
     { species: speciesId, tag: 'depth-lightfield' },
   )
+  device.queue.writeTexture({ texture: depthAtlas }, a.atlas, { bytesPerRow: ATLAS * 2 }, [ATLAS, ATLAS])
 
+  const [dx, dy, dz] = a.dims
+  const volTex = (label: string, data: Uint8Array<ArrayBuffer>, tag: string): GPUTexture => {
+    const tex = ctx.res.createTexture(
+      {
+        label: `${ctx.id}/${speciesId}/${label}`,
+        size: [dx, dy, dz],
+        dimension: '3d',
+        format: 'rgba8unorm',
+        usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
+      },
+      { species: speciesId, tag },
+    )
+    device.queue.writeTexture({ texture: tex }, data, { bytesPerRow: dx * 4, rowsPerImage: dy }, [dx, dy, dz])
+    return tex
+  }
+  return {
+    depthAtlas,
+    albedoVol: volTex('albedo-vol', a.albedo, 'albedo-volume'),
+    normalVol: volTex('normal-vol', a.normal, 'normal-volume'),
+    grid: a.grid,
+    tile: a.tile,
+    center: a.center,
+    halfU: a.halfU,
+    radius: a.radius,
+    bmin: a.bmin,
+    bmax: a.bmax,
+    heightM: a.heightM,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// GPU half: the supersampled ortho depth+coverage light field.
+// ---------------------------------------------------------------------------
+
+async function bakeArtifact(
+  ctx: ExperimentContext<typeof PARAMS>,
+  speciesId: string,
+  mesh: GcMesh,
+  profile: QlfProfile,
+): Promise<Artifact> {
+  const { device } = ctx
+  const { grid: GRID, tile: TILE } = profile
+  const TILE_SS = TILE * SS
+  const STRIP_W = GRID * TILE_SS
+  const bmin = mesh.header.boundsMin
+  const bmax = mesh.header.boundsMax
+  const center: V3 = [(bmin[0] + bmax[0]) / 2, (bmin[1] + bmax[1]) / 2, (bmin[2] + bmax[2]) / 2]
+  const radius = 0.5 * Math.hypot(bmax[0] - bmin[0], bmax[1] - bmin[1], bmax[2] - bmin[2])
+  // Padded half-extents (metres) — every view's ortho frame is the support of
+  // this box along its own axes, which is what stops an oblate cushion or a
+  // thin grass stem from paying for the empty corners of a sphere.
+  const halfM: V3 = [
+    ((bmax[0] - bmin[0]) / 2) * FRAME_PAD,
+    ((bmax[1] - bmin[1]) / 2) * FRAME_PAD,
+    ((bmax[2] - bmin[2]) / 2) * FRAME_PAD,
+  ]
+  const halfU: V3 = [halfM[0] / radius, halfM[1] / radius, halfM[2] / radius]
+  const support = (a: V3): number => Math.abs(a[0]) * halfM[0] + Math.abs(a[1]) * halfM[1] + Math.abs(a[2]) * halfM[2]
+
+  const t0 = performance.now()
   const vols = bakeVolumes(mesh)
-  const [dx, dy, dz] = vols.dims
-  const albedoVol = ctx.res.createTexture(
-    {
-      label: `${ctx.id}/${speciesId}/albedo-vol`,
-      size: [dx, dy, dz],
-      dimension: '3d',
-      format: 'rgba8unorm',
-      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
-    },
-    { species: speciesId, tag: 'albedo-volume' },
-  )
-  const normalVol = ctx.res.createTexture(
-    {
-      label: `${ctx.id}/${speciesId}/normal-vol`,
-      size: [dx, dy, dz],
-      dimension: '3d',
-      format: 'rgba8unorm',
-      usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
-    },
-    { species: speciesId, tag: 'normal-volume' },
-  )
-  device.queue.writeTexture({ texture: albedoVol }, vols.albedo, { bytesPerRow: dx * 4, rowsPerImage: dy }, [dx, dy, dz])
-  device.queue.writeTexture({ texture: normalVol }, vols.normal, { bytesPerRow: dx * 4, rowsPerImage: dy }, [dx, dy, dz])
 
   // Transient bake resources (destroyed below; destroy() un-counts them).
+  const atlas = ctx.res.createTexture(
+    {
+      label: `${ctx.id}/${speciesId}/bake-atlas`,
+      size: [ATLAS, ATLAS],
+      format: 'rg8unorm',
+      usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+    },
+    { species: speciesId, tag: 'bake-transient' },
+  )
   const vbuf = ctx.res.createBuffer(
     { label: `${ctx.id}/bake-verts`, size: mesh.vertices.byteLength, usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST },
     { species: speciesId, tag: 'bake-transient' },
@@ -310,10 +507,10 @@ export async function bakeSpecies(
       const right = norm(cross(upRef, fwd))
       const up = norm(cross(fwd, right))
       const o = ((j * GRID + i) * STRIDE) / 4
-      fv[o] = center[0]; fv[o + 1] = center[1]; fv[o + 2] = center[2]; fv[o + 3] = invR
-      fv[o + 4] = right[0]; fv[o + 5] = right[1]; fv[o + 6] = right[2]
-      fv[o + 8] = up[0]; fv[o + 9] = up[1]; fv[o + 10] = up[2]
-      fv[o + 12] = fwd[0]; fv[o + 13] = fwd[1]; fv[o + 14] = fwd[2]
+      fv[o] = center[0]; fv[o + 1] = center[1]; fv[o + 2] = center[2]; fv[o + 3] = 0
+      fv[o + 4] = right[0]; fv[o + 5] = right[1]; fv[o + 6] = right[2]; fv[o + 7] = 1 / support(right)
+      fv[o + 8] = up[0]; fv[o + 9] = up[1]; fv[o + 10] = up[2]; fv[o + 11] = 1 / support(up)
+      fv[o + 12] = fwd[0]; fv[o + 13] = fwd[1]; fv[o + 14] = fwd[2]; fv[o + 15] = 1 / support(fwd)
       fv[o + 16] = bmin[0]; fv[o + 17] = bmin[1]; fv[o + 18] = bmin[2]
       fv[o + 20] = bmax[0]; fv[o + 21] = bmax[1]; fv[o + 22] = bmax[2]
     }
@@ -364,16 +561,23 @@ export async function bakeSpecies(
     label: `${ctx.id}/down-pipe`,
     layout: device.createPipelineLayout({ label: `${ctx.id}/down-pl`, bindGroupLayouts: [downBgl] }),
     vertex: { module, entryPoint: 'vs_down' },
-    fragment: { module, entryPoint: 'fs_down', targets: [{ format: 'rg8unorm' }] },
+    fragment: {
+      module,
+      entryPoint: 'fs_down',
+      targets: [{ format: 'rg8unorm' }],
+      // The strip holds ONE row of views, so the shader has to fold the atlas
+      // row offset out of @builtin(position) — it needs the tile height.
+      constants: { tile_px: TILE },
+    },
     primitive: { topology: 'triangle-list' },
   })
 
-  const tilesPerSubmit = Math.max(2, Math.min(GRID, Math.floor(TRIS_PER_SUBMIT / mesh.header.triangleCount)))
+  const tilesPerSubmit = Math.max(1, Math.min(GRID, Math.floor(TRIS_PER_SUBMIT / mesh.header.triangleCount)))
   const stripColorView = stripColor.createView()
   const stripDepthView = stripDepth.createView()
-  const atlasView = depthAtlas.createView()
+  const atlasView = atlas.createView()
   for (let j = 0; j < GRID; j++) {
-    // 1. Rasterize row j's 24 views into the supersampled strip (chunked).
+    // 1. Rasterize row j's views into the supersampled strip (chunked).
     for (let start = 0; start < GRID; start += tilesPerSubmit) {
       const end = Math.min(GRID, start + tilesPerSubmit)
       const enc = device.createCommandEncoder({ label: `${ctx.id}/bake-enc` })
@@ -432,19 +636,48 @@ export async function bakeSpecies(
     await device.queue.onSubmittedWorkDone()
   }
 
-  for (const r of [vbuf, ibuf, stripColor, stripDepth, uni]) r.destroy()
+  // Read the atlas back so it can be cached and committed.
+  const rowBytes = ATLAS * 2
+  const readback = ctx.res.createBuffer(
+    {
+      label: `${ctx.id}/bake-readback`,
+      size: rowBytes * ATLAS,
+      usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
+    },
+    { species: speciesId, tag: 'bake-transient' },
+  )
+  {
+    const enc = device.createCommandEncoder({ label: `${ctx.id}/readback-enc` })
+    enc.copyTextureToBuffer({ texture: atlas }, { buffer: readback, bytesPerRow: rowBytes, rowsPerImage: ATLAS }, [
+      ATLAS,
+      ATLAS,
+    ])
+    device.queue.submit([enc.finish()])
+  }
+  await readback.mapAsync(GPUMapMode.READ)
+  const atlasBytes = new Uint8Array(readback.getMappedRange().slice(0))
+  readback.unmap()
+
+  for (const r of [vbuf, ibuf, stripColor, stripDepth, uni, atlas, readback]) r.destroy()
   console.log(
-    `[${ctx.id}] baked ${speciesId}: ${nTiles} views (${SS}x${SS} ss) + ${dx}x${dy}x${dz} volumes in ${(performance.now() - t0).toFixed(0)}ms`,
+    `[${ctx.id}] baked ${speciesId}: ${nTiles} views @${TILE}px (${SS}x${SS} ss) + ${vols.dims.join('x')} volumes in ${(
+      (performance.now() - t0) /
+      1000
+    ).toFixed(1)}s`,
   )
 
   return {
-    depthAtlas,
-    albedoVol,
-    normalVol,
+    grid: GRID,
+    tile: TILE,
+    dims: vols.dims,
     center,
+    halfU,
     radius,
     bmin: [bmin[0], bmin[1], bmin[2]],
     bmax: [bmax[0], bmax[1], bmax[2]],
     heightM: bmax[1] - bmin[1],
+    atlas: atlasBytes,
+    albedo: vols.albedo,
+    normal: vols.normal,
   }
 }

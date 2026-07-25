@@ -1,4 +1,5 @@
 #include "src/wgsl/wind.wgsl"
+#include "src/wgsl/terrain.wgsl"
 #include "src/wgsl/lighting.wgsl"
 #include "src/wgsl/debug.wgsl"
 #include "src/wgsl/hash.wgsl"
@@ -16,6 +17,17 @@
 //
 // vs_far / fs_far (far): one camera-facing card from the 8-azimuth impostor
 //   sheet plus the top card — i.e. exactly a billboard, at billboard cost.
+//
+// vs_carpet / vs_carpet_far / fs_carpet (mat species, carpet_div > 0): a
+//   Sphagnum tile is a 0.18m periodic cushion 0.09m tall that LIES on the
+//   ground; azimuth cards through it would slice the terrain and each other
+//   and show nothing edge-on. It is drawn instead as a stack of
+//   ground-parallel SHELLS over the tile's own square, cut from one top-down
+//   capture that carries a height channel: shell k keeps only the texels whose
+//   surface reaches its plane, so the stack is a terraced reconstruction of
+//   the real 3.3cm of capitulum relief. Far away the stack collapses to the
+//   single quad a flat card would draw. Same grid, same 90-degree yaw, same
+//   constant scale as the stand gave — the lattice is never touched.
 //
 // Both: hard alpha test with depth write (no blending, no dithering, no
 // frag_depth), 2 texture taps per fragment, card bottoms sunk into the ground
@@ -277,4 +289,138 @@ fn fs_far(in: VOut) -> @location(0) vec4f {
     discard;
   }
   return shade_card(in, alb, enc);
+}
+
+// --- carpet: ground-parallel relief shells -----------------------------------
+// Own vertex/fragment pair (and own interpolants) rather than a branch in the
+// card path: a mat needs a ground basis per vertex and a height gate, the card
+// path needs neither, and the card path's fragment cost is dominated by
+// per-fragment attribute traffic.
+
+struct COut {
+  @builtin(position) pos: vec4f,
+  @location(0) uv: vec2f,
+  @location(1) world: vec3f,
+  @location(2) up_ws: vec3f,                    // ground normal, per vertex
+  @location(3) @interpolate(flat) tile: vec4f,  // cos yaw, sin yaw, erode, height gate
+  @location(4) @interpolate(flat) shade: f32,
+}
+
+/**
+ * One shell of a mat tile (or the single far quad). `shell_y` is the plane's
+ * height in the mesh frame at scale 1; `gate` is the normalized surface height
+ * a texel must reach to exist on this shell.
+ */
+fn carpet_vertex(ii: u32, ci: u32, shell_y: f32, gate: f32, shade: f32) -> COut {
+  let inst = insts[ii];
+  let bits = inst.packed_bits;
+  let entry = stand_table[u32(info.entry_index)];
+  // The stand's exact carpet scale, NOT the 12-bit instance value: every tile
+  // of a mat has the same scale by construction, and the 0.08% quantization
+  // error would leave the tiles not quite abutting.
+  let scale = entry.scale_min;
+
+  // Exact quarter turn from the quantized yaw: a mat only ever rotates in
+  // 90-degree steps (that is what keeps a square periodic tile matching its
+  // neighbours), and rounding to the nearest quarter avoids the ~0.35-degree
+  // error the 10-bit yaw quantization would otherwise leave in it.
+  let qt = (((bits & 1023u) + 128u) / 256u) & 3u;
+  var cs = array<vec2f, 4>(vec2f(1.0, 0.0), vec2f(0.0, 1.0), vec2f(-1.0, 0.0), vec2f(0.0, -1.0));
+  let yc = cs[qt].x;
+  let ys = cs[qt].y;
+
+  // Footprint from the species' periodic tile size — NEVER from its height,
+  // which would make a 0.24m-wide 0.07m-tall cushion ~3.5x too small.
+  let t = quad_corner(ci, vec4f(0.0, 0.0, 1.0, 1.0));
+  let local = (t * 2.0 - 1.0) * (entry.footprint_m * 0.5 * scale);
+  let off = vec2f(yc * local.x + ys * local.y, -ys * local.x + yc * local.y);
+  let xz = inst.pos.xz + off;
+
+  // Ladder rung 3 — the ground under EVERY vertex. Neighbouring tiles share
+  // their corner positions exactly (the grid step IS the tile size), so
+  // per-vertex conforming is the only rung that keeps the whole mat
+  // C0-continuous; any per-tile plane fit cracks along every tile boundary.
+  // terrain_sample gives height and the ground normal's (nx, nz) in one
+  // bilinear fetch, so the shading basis costs nothing extra.
+  let g = terrain_sample(xz);
+  let up = vec3f(g.y, sqrt(max(1.0 - g.y * g.y - g.z * g.z, 0.0)), g.z);
+  let world = vec3f(xz.x, g.x + shell_y * scale, xz.y);
+
+  // Region edge only: NO camera-inside fade — a mat you are standing on must
+  // not open a hole under you. Measured from the tile centre, never per
+  // vertex: the fade decides whether the quad is emitted at all, so vertices
+  // that disagreed would stretch it into a sliver metres long.
+  let fade = 1.0 - smoothstep(info.region_r * 0.82, info.region_r, length(frame.camera_pos.xz - inst.pos.xz));
+  let a_ref = info.shell_more.y;
+
+  var out: COut;
+  if (fade < a_ref) {
+    out.pos = vec4f(0.0, 0.0, -1.0, 1.0);
+  } else {
+    out.pos = frame.view_proj * vec4f(world, 1.0);
+  }
+  out.uv = t;
+  out.world = world;
+  out.up_ws = up;
+  out.tile = vec4f(yc, ys, a_ref / max(fade, 1e-3), gate);
+  out.shade = shade;
+  return out;
+}
+
+@vertex
+fn vs_carpet(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> COut {
+  let n = max(u32(info.shell_span.w), 2u);
+  // Top shell first: shell coverage is nested, so from above the higher (and
+  // nearer) shells give early-z something to reject the base shell against.
+  let k = (n - 1u) - min(vi / 6u, n - 1u);
+  let f = f32(k) / f32(n - 1u);
+  let shell_y = mix(info.shell_span.x, info.shell_span.z, f);
+  // Shell 0 carries no height gate at all: it is the closed base of the mat,
+  // and a mat that dissolves with distance is worse than one with no relief.
+  let gate = select(0.0, (shell_y - info.card_y0) / max(info.card_y1 - info.card_y0, 1e-6), k > 0u);
+  // Cushion occlusion — the deeper a shell sits between the capitula, the less
+  // sky reaches it. This is what makes the terraces read as depth.
+  let shade = mix(1.0 - info.shell_more.z, 1.0, f);
+  return carpet_vertex(ii, vi % 6u, shell_y, gate, shade);
+}
+
+@vertex
+fn vs_carpet_far(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> COut {
+  // Past the shell radius: one quad at the surface's mean height with full
+  // coverage — exactly what a flat card draws, which is all a tile of ~17px
+  // can show anyway. Same texture, same box, so nothing moves at the handover.
+  // Its shade is the AREA-WEIGHTED MEAN of the shells it replaces (measured
+  // from the tile's own height histogram at load), so the two LODs match in
+  // brightness and no dark ring sweeps the field at the handover radius.
+  let shade = 1.0 - info.shell_more.z * (1.0 - info.shell_more.w);
+  return carpet_vertex(ii, vi % 6u, info.shell_span.y, 0.0, shade);
+}
+
+@fragment
+fn fs_carpet(in: COut) -> @location(0) vec4f {
+  let alb = textureSample(near_albedo, card_sampler, in.uv, 0u);
+  let nh = textureSample(near_normal, card_sampler, in.uv, 0u);
+  // Two hard tests, no dithering: the baked coverage, and this shell's height
+  // gate (the surface at this texel must reach the shell's own plane).
+  if (alb.a < in.tile.z || nh.a < in.tile.w) {
+    discard;
+  }
+  // The tile was captured over flat ground, so the baked normal must be lifted
+  // into the local GROUND frame or a mat on a slope lights as if it were
+  // level. plant_basis_from_up(up, yaw), inlined — the vertex already carries
+  // cos/sin(yaw) rather than the angle. Normals are stored as plain unit
+  // vectors (not octahedral) precisely so this stays valid through the mips.
+  let n_mesh = normalize(nh.xyz * 2.0 - 1.0);
+  let up = normalize(in.up_ws);
+  var tang = vec3f(in.tile.x, 0.0, -in.tile.y);
+  let proj = tang - up * dot(up, tang);
+  tang = select(normalize(vec3f(up.y, -up.x, 0.0)), normalize(proj), dot(proj, proj) > 1.0e-6);
+  let n = tang * n_mesh.x + up * n_mesh.y + cross(tang, up) * n_mesh.z;
+
+  let albedo = clamp(alb.rgb * in.shade, vec3f(0.0), vec3f(1.0));
+  var color = light_surface(albedo, n, in.world);
+  if (debug_mode() == DEBUG_OFF) {
+    color = apply_fog(color, in.world);
+  }
+  return vec4f(debug_shade(color, albedo, n, alb.a, in.world), 1.0);
 }

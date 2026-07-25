@@ -34,10 +34,14 @@ const MAX_LOD: f32 = 3.0;
 const TWO_PI_S: f32 = 6.2831853;
 
 struct StampParams {
-  dims: vec4u,                 // x,y unused, z = seed, w = entry_count
-  tuning: vec4f,               // x = max_dist, y = tint_strength, z = tile overlay, w unused
-  entry_meta: array<vec4f, 4>,
-  entry_info: array<vec4f, 4>, // species average albedo rgb, pad
+  dims: vec4u,                  // x = card slots, y = carpet slots, z = seed, w = stand entries
+  tuning: vec4f,                // x = max_dist, y = tint_strength, z = tile overlay, w = tint coverage
+  cards: vec4u,                 // stand entry index per card slot
+  carpets: vec4u,               // stand entry index per carpet slot
+  grid: vec4f,                  // carpet grid (see carpet.wgsl) — unused here
+  entry_meta: array<vec4f, 4>,  // per card slot: impostor local center.xyz, radius
+  entry_info: array<vec4f, 4>,  // per card slot: species average albedo rgb
+  carpet_zone: array<vec4f, 4>, // per carpet slot: wet_lo, wet_hi, h_mean, y_range
 }
 @group(1) @binding(0) var<uniform> sp: StampParams;
 @group(1) @binding(1) var<storage, read> tile_lists: array<u32>;
@@ -63,15 +67,15 @@ fn hemioct_decode(e: vec2f) -> vec3f {
   return normalize(vec3f(px, y, pz));
 }
 
-fn sample_albedo(entry_index: u32, uv: vec2f, lod: f32) -> vec4f {
-  if (entry_index == 0u) { return textureSampleLevel(alb0, atlas_samp, uv, lod); }
-  if (entry_index == 1u) { return textureSampleLevel(alb1, atlas_samp, uv, lod); }
+fn sample_albedo(card_slot: u32, uv: vec2f, lod: f32) -> vec4f {
+  if (card_slot == 0u) { return textureSampleLevel(alb0, atlas_samp, uv, lod); }
+  if (card_slot == 1u) { return textureSampleLevel(alb1, atlas_samp, uv, lod); }
   return textureSampleLevel(alb2, atlas_samp, uv, lod);
 }
 
-fn sample_normal(entry_index: u32, uv: vec2f, lod: f32) -> vec4f {
-  if (entry_index == 0u) { return textureSampleLevel(nrm0, atlas_samp, uv, lod); }
-  if (entry_index == 1u) { return textureSampleLevel(nrm1, atlas_samp, uv, lod); }
+fn sample_normal(card_slot: u32, uv: vec2f, lod: f32) -> vec4f {
+  if (card_slot == 0u) { return textureSampleLevel(nrm0, atlas_samp, uv, lod); }
+  if (card_slot == 1u) { return textureSampleLevel(nrm1, atlas_samp, uv, lod); }
   return textureSampleLevel(nrm2, atlas_samp, uv, lod);
 }
 
@@ -203,7 +207,8 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4f {
     if (uvp.x < inset || uvp.x > 1.0 - inset || uvp.y < inset || uvp.y > 1.0 - inset) { continue; }
     let auv = (vec2f(ni, nj) + uvp) * (ATLAS_TILE_F / ATLAS_F);
 
-    let entry_index = packed & 7u;
+    // Low 3 bits are the card slot (bin.wgsl packs the slot, not the entry).
+    let card_slot = packed & 7u;
     var fade = f32((packed >> 21u) & 255u) / 255.0;
     // Overflow tiles stop their lists short of max_dist; fade stamps out
     // toward the (bilinearly blended) horizon so the handoff to the tint
@@ -211,13 +216,13 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4f {
     if (bin_limit < sp.tuning.x * 0.99) {
       fade *= 1.0 - smoothstep(bin_limit * 0.7, bin_limit * 0.98, dc_len);
     }
-    let alb = sample_albedo(entry_index, auv, lod);
+    let alb = sample_albedo(card_slot, auv, lod);
     let a = alb.a * fade;
     if (a < 0.02) { continue; }
     // Atlas albedo is coverage-premultiplied (empty texels are black).
     let albedo = alb.rgb / max(alb.a, 0.05);
 
-    var n_local = sample_normal(entry_index, auv, lod).xyz * 2.0 - 1.0;
+    var n_local = sample_normal(card_slot, auv, lod).xyz * 2.0 - 1.0;
     if (dot(n_local, n_local) < 1e-4) { n_local = vec3f(0.0, 1.0, 0.0); }
     let n_ws = rot_y_v(normalize(n_local), yaw);
     var col = light_surface(albedo, n_ws, hit);
@@ -249,10 +254,14 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4f {
       tstart = sp.tuning.x * 0.72;
       tend = sp.tuning.x * 0.95;
     }
-    let tf = smoothstep(tstart, tend, scene_dist) * sp.tuning.y;
-    if (tf > 0.002) {
+    // tuning.w is how much of the ground the CARD species actually cover: the
+    // tint stands in for a full cover of them, so on a stand where a carpet
+    // already paints the ground (bog) a trace of grass must not wash out the
+    // whole far field. It is exactly 1.0 on carpet-free stands.
+    let tf = smoothstep(tstart, tend, scene_dist) * sp.tuning.y * sp.tuning.w;
+    let ec = sp.dims.x;
+    if (tf > 0.002 && ec > 0u) {
       let wxz = scene_pos.xz;
-      let ec = sp.dims.w;
       let n1 = value_noise(wxz * 0.9);
       let n2 = value_noise(wxz * 0.17);
       var tint = sp.entry_info[0].rgb;
@@ -295,6 +304,10 @@ fn fs_main(in: FullscreenOut) -> @location(0) vec4f {
       // (its surface sits well above the terrain), and overwriting it with the
       // stamp pass's ~0 coverage would hide real coverage.
       if (d < 0.99999 && scene_pos.y - terrain_height(scene_pos.xz) > 0.15) { discard; }
+      // Same for the deferred carpet layer (carpet.wgsl wrote its coverage
+      // opaquely before this pass): leave its pixels alone rather than
+      // replacing a covered mat with this pass's ~0.
+      if (sp.dims.y > 0u && d < 0.99999 && cov < 0.5) { discard; }
       return vec4f(dcol, 1.0);
     }
     if (cov < 0.003) { discard; }

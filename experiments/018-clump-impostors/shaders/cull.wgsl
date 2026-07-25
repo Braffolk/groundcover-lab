@@ -10,10 +10,14 @@
 // so the expensive representation exists only where its parallax is visible.
 // Cost is O(region area), never O(total plants in the stand).
 //
-// A workgroup is 64 invocations and a cell holds SCATTER_MAX_PER_CELL = 128
-// candidate slots, so every workgroup covers exactly half of ONE cell: the
-// cell-level region/frustum rejects below are workgroup-uniform and let whole
-// workgroups exit before a single terrain texel is fetched.
+// A workgroup is 64 invocations. A scattered entry holds SCATTER_MAX_PER_CELL =
+// 128 candidate slots per cell, so a workgroup covers half of ONE cell; a
+// CARPET entry has carpet_div^2 slots instead (484 at life size) and simply
+// takes more workgroups per cell. The count always comes from
+// info.slots_per_cell — taking it from the global budget renders a quarter of
+// the mat. Either way the cell-level region/frustum rejects below are
+// workgroup-uniform and let whole workgroups exit before a terrain texel is
+// fetched.
 
 struct PlantInst {
   pos: vec3f,
@@ -35,14 +39,15 @@ const TERRAIN_BOUND_SLACK: f32 = 1.05;
 @compute @workgroup_size(64)
 fn cs_cull(@builtin(global_invocation_id) gid: vec3<u32>) {
   let side_x = u32(info.side_x);
-  let total = side_x * u32(info.side_z) * SCATTER_MAX_PER_CELL;
+  let slots = u32(info.slots_per_cell);
+  let total = side_x * u32(info.side_z) * slots;
   let idx = gid.x;
   if (idx >= total) {
     return;
   }
 
-  let slot = idx % SCATTER_MAX_PER_CELL;
-  let cell_lin = idx / SCATTER_MAX_PER_CELL;
+  let slot = idx % slots;
+  let cell_lin = idx / slots;
   let cx = i32(info.origin_cell.x) + i32(cell_lin % side_x);
   let cz = i32(info.origin_cell.y) + i32(cell_lin / side_x);
 

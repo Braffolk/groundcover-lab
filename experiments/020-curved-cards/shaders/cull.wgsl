@@ -8,10 +8,13 @@
 // each ring feeding its own drawIndexedIndirect. Cost is O(region area), never
 // O(total plants in the stand).
 //
-// A workgroup is 64 invocations and a cell holds SCATTER_MAX_PER_CELL = 128
-// candidate slots, so every workgroup covers exactly half of ONE cell: the
-// cell-level region/frustum rejects below are workgroup-uniform and let whole
-// workgroups exit before a single terrain texel is fetched.
+// A workgroup is 64 invocations. A scattered entry holds SCATTER_MAX_PER_CELL
+// = 128 candidate slots per cell, but a CARPET entry holds carpet_div^2 (484
+// at life size) — deliberately over the scatter budget — so the slot count
+// comes from info.ring.z, never from the global constant. Hardcoding 128 would
+// enumerate the first ~6 of 22 tile rows in every cell and render the mat as
+// bands. The cell-level region/frustum rejects below stay workgroup-uniform
+// and let whole workgroups exit before a single terrain texel is fetched.
 //
 // The ring index is the LOD: ring 0 draws a 5x7 curved patch + 4x4 canopy
 // patch, ring 1 a 3x5 + 3x3, ring 2 a single flat quad + flat top card. The
@@ -34,14 +37,15 @@ const TERRAIN_BOUND_SLACK: f32 = 1.05;
 @compute @workgroup_size(64)
 fn cs_cull(@builtin(global_invocation_id) gid: vec3<u32>) {
   let side_x = u32(info.side_x);
-  let total = side_x * u32(info.side_z) * SCATTER_MAX_PER_CELL;
+  let slots = u32(info.ring.z);
+  let total = side_x * u32(info.side_z) * slots;
   let idx = gid.x;
   if (idx >= total) {
     return;
   }
 
-  let slot = idx % SCATTER_MAX_PER_CELL;
-  let cell_lin = idx / SCATTER_MAX_PER_CELL;
+  let slot = idx % slots;
+  let cell_lin = idx / slots;
   let cx = i32(info.origin_cell.x) + i32(cell_lin % side_x);
   let cz = i32(info.origin_cell.y) + i32(cell_lin / side_x);
 

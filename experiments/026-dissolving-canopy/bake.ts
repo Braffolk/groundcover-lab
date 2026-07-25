@@ -902,6 +902,382 @@ function finishNormals(nrmAcc: Float32Array, filled0: Uint8Array): Uint8Array<Ar
   return out as Uint8Array<ArrayBuffer>
 }
 
+// ---------------------------------------------------------------------------
+// Carpet tile bake — a SECOND, separate artifact, loaded only for stand entries
+// that are carpets (stand carpet_div > 0, i.e. the periodic Sphagnum tiles).
+//
+// Why not more of the node atlas: the node atlas is 5 nodes x 8 azimuths of
+// SIDE views at 256x512 per tile. For a 0.24m wide, 0.09m tall cushion that
+// spends 512 texels of vertical resolution on 9cm (~5700 texels/m up, ~850
+// across) and 40 tiles on a silhouette a mat never shows — the budget lands
+// almost entirely where a low carpet has nothing to say. A mat's whole
+// appearance is its surface from above, so a carpet species trades the entire
+// 14.8 MiB node atlas (never uploaded — see main.ts) for ONE top-down capture
+// of the tile square at 512px, i.e. 2844 texels/m across the 0.18m tile: 6x the
+// density of the same tile inside the 160px whole-mesh top capture, and ~1.9x
+// the billboard baseline's cropped top view.
+//
+// The capture is genuinely SEAMLESS: the source mesh is a periodic community
+// tile whose geometry overflows its 0.18m period (0.21 x 0.23m of bounds), so
+// the bake draws the mesh 9 times at the 3x3 wrap offsets and keeps only the
+// tile square. What leaves one edge comes back on the other, exactly as it does
+// in the real mat.
+//
+// Channels: rgb albedo + coverage, oct normal, and the HEIGHT of the topmost
+// surface — the last one is what lets the renderer express the cushion's 3.3cm
+// of capitulum relief (parallax, cavity occlusion, self-shadowing) instead of
+// drawing a flat picture of moss.
+// ---------------------------------------------------------------------------
+
+export const CT_PX = 512
+export const CT_MIPS = 7 // 512 -> 8 px
+const CT_SS = 2
+const CT_MAGIC = 0x31544344 // 'DCT1'
+const CT_VERSION = 2
+const CT_HEADER = 64
+const CT_PLANE_BYTES = CT_PX * CT_PX * 4
+const CT_TOTAL = CT_HEADER + 2 * CT_PLANE_BYTES
+const CT_DILATE = 4
+
+export interface CarpetTileBake {
+  /** Periodic tile size (m at scale 1) — matches stand_table.footprint_m. */
+  tileM: number
+  /** Vertical range of the capture, mesh frame (m at scale 1). */
+  y0: number
+  y1: number
+  /** Coverage-weighted mean of the height channel: the mat's mean surface. */
+  planeFrac: number
+  /** Mean coverage of the tile (diagnostics — a closed mat is ~0.8+). */
+  meanCov: number
+  /** rgba8: rgb = albedo, a = coverage. */
+  albedo: Uint8Array<ArrayBuffer>
+  /**
+   * rgba8: rg = oct normal, b = height fraction of [y0,y1] of the top surface,
+   * a = cavity occlusion of that surface (1 = open sky, 0 = fully enclosed).
+   *
+   * The occlusion is BAKED rather than derived from `b` in the shader for one
+   * specific reason: a term computed from the height is a non-linear function
+   * of it, so it does NOT survive mip filtering — as the chain flattens the
+   * height toward its mean, the derived occlusion collapses to "open" and the
+   * mat gets brighter the further away it is. That is the classic
+   * distance-dependent drift CLAUDE.md warns about. Occlusion stored per texel
+   * mip-averages linearly, so the far field keeps the mat's real mean darkness.
+   */
+  aux: Uint8Array<ArrayBuffer>
+}
+
+function unpackCarpet(buf: ArrayBuffer): CarpetTileBake | null {
+  if (buf.byteLength !== CT_TOTAL) return null
+  const u = new Uint32Array(buf, 0, 4)
+  if (u[0] !== CT_MAGIC || u[1] !== CT_VERSION || u[2] !== CT_PX) return null
+  const f = new Float32Array(buf, 16, 5)
+  return {
+    tileM: f[0]!,
+    y0: f[1]!,
+    y1: f[2]!,
+    planeFrac: f[3]!,
+    meanCov: f[4]!,
+    albedo: new Uint8Array(buf, CT_HEADER, CT_PLANE_BYTES) as Uint8Array<ArrayBuffer>,
+    aux: new Uint8Array(buf, CT_HEADER + CT_PLANE_BYTES, CT_PLANE_BYTES) as Uint8Array<ArrayBuffer>,
+  }
+}
+
+function packCarpet(t: CarpetTileBake): ArrayBuffer {
+  const buf = new ArrayBuffer(CT_TOTAL)
+  const u = new Uint32Array(buf, 0, 4)
+  u[0] = CT_MAGIC
+  u[1] = CT_VERSION
+  u[2] = CT_PX
+  const f = new Float32Array(buf, 16, 5)
+  f[0] = t.tileM
+  f[1] = t.y0
+  f[2] = t.y1
+  f[3] = t.planeFrac
+  f[4] = t.meanCov
+  new Uint8Array(buf, CT_HEADER, CT_PLANE_BYTES).set(t.albedo)
+  new Uint8Array(buf, CT_HEADER + CT_PLANE_BYTES, CT_PLANE_BYTES).set(t.aux)
+  return buf
+}
+
+/** Load (OPFS / committed) or bake the carpet tile artifact for one species. */
+export async function loadCarpetTile(ctx: BakeCtx, speciesId: string): Promise<CarpetTileBake> {
+  const key = `carpettile-v${CT_VERSION}-${speciesId}`
+  let bakedFresh = false
+  const runBake = async (): Promise<ArrayBuffer> => {
+    bakedFresh = true
+    const mesh = await ctx.meshes.load(speciesById(speciesId).meshId)
+    return bakeCarpetTile(ctx, mesh)
+  }
+  let buf = await bakedArtifact({ expId: ctx.id, key }, runBake)
+  let data = unpackCarpet(buf)
+  if (!data) {
+    buf = await runBake()
+    data = unpackCarpet(buf)
+    if (!data) throw new Error(`[${ctx.id}] carpet tile bake for ${speciesId} produced an invalid artifact`)
+    await opfsRepair(`${ctx.id}__${key}`, buf)
+  }
+  if (bakedFresh) {
+    try {
+      await commitBake(ctx.id, key, buf)
+    } catch (err) {
+      console.warn(`[${ctx.id}] commitBake failed (static build?):`, err)
+    }
+  }
+  return data
+}
+
+async function bakeCarpetTile(ctx: BakeCtx, mesh: GcMesh): Promise<ArrayBuffer> {
+  const { device } = ctx
+  const hdr = mesh.header
+  const tileM = hdr.tileSize[0]
+  if (!(tileM > 0) || hdr.tileSize[1] !== tileM) {
+    throw new Error(`[${ctx.id}] carpet tile bake needs a square periodic mesh (tileSize=${hdr.tileSize})`)
+  }
+  const [bx0, by0, bz0] = hdr.boundsMin
+  const [bx1, by1, bz1] = hdr.boundsMax
+  const cx = hdr.tileOrigin[0] + tileM / 2
+  const cz = hdr.tileOrigin[1] + tileM / 2
+  const y0 = Math.min(0, by0)
+  const y1 = by1
+
+  const indices = mesh.indices()
+  const vbuf = ctx.res.createBuffer(
+    {
+      label: `${ctx.id}/ct-verts`,
+      size: mesh.vertices.byteLength,
+      usage: GPUBufferUsage.VERTEX | GPUBufferUsage.COPY_DST,
+    },
+    { tag: 'bake-scratch' },
+  )
+  device.queue.writeBuffer(vbuf, 0, mesh.vertices)
+  const ibuf = ctx.res.createBuffer(
+    { label: `${ctx.id}/ct-idx`, size: indices.byteLength, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST },
+    { tag: 'bake-scratch' },
+  )
+  device.queue.writeBuffer(ibuf, 0, indices)
+
+  // One view: straight down over exactly the tile square. b_min.w carries the
+  // wrap period, which the bake shader turns into the 3x3 instance offsets.
+  const uni = ctx.res.createBuffer(
+    { label: `${ctx.id}/ct-uni`, size: 256, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST },
+    { tag: 'bake-scratch' },
+  )
+  const view = new Float32Array(64)
+  view.set([1, 0, 0, 1], 0) // right axis (mesh +x), w = 1 -> top view
+  view.set([0, 0, -1, 0], 4) // up axis: framebuffer row 0 is the tile's min z
+  view.set([0, 1, 0, 0], 8) // toward the bake camera
+  view.set([cx, (y0 + y1) / 2, cz, tileM / 2], 12)
+  view.set([y0, y1, 0, 0], 16)
+  view.set([bx0, by0, bz0, tileM], 20)
+  view.set([bx1 - bx0, by1 - by0, bz1 - bz0, 0], 24)
+  device.queue.writeBuffer(uni, 0, view)
+
+  const S = CT_PX * CT_SS
+  const mkTarget = (label: string): GPUTexture =>
+    ctx.res.createTexture(
+      {
+        label: `${ctx.id}/${label}`,
+        size: [S, S],
+        format: 'rgba8unorm',
+        usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC,
+      },
+      { tag: 'bake-scratch' },
+    )
+  const albTex = mkTarget('ct-albedo')
+  const auxTex = mkTarget('ct-aux')
+  const depthTex = ctx.res.createTexture(
+    { label: `${ctx.id}/ct-depth`, size: [S, S], format: 'depth32float', usage: GPUTextureUsage.RENDER_ATTACHMENT },
+    { tag: 'bake-scratch' },
+  )
+
+  const bgl = device.createBindGroupLayout({
+    label: `${ctx.id}/ct-bgl`,
+    entries: [{ binding: 0, visibility: GPUShaderStage.VERTEX, buffer: { type: 'uniform', minBindingSize: 112 } }],
+  })
+  const bg = device.createBindGroup({
+    label: `${ctx.id}/ct-bg`,
+    layout: bgl,
+    entries: [{ binding: 0, resource: { buffer: uni, size: 112 } }],
+  })
+  const module = ctx.shaders.module(bakeShaderSrc)
+  const pipeline = device.createRenderPipeline({
+    label: `${ctx.id}/ct-pipe`,
+    layout: device.createPipelineLayout({ label: `${ctx.id}/ct-pl`, bindGroupLayouts: [bgl] }),
+    vertex: {
+      module,
+      entryPoint: 'vs',
+      buffers: [
+        {
+          arrayStride: 16,
+          attributes: [
+            { shaderLocation: 0, offset: 0, format: 'uint16x4' },
+            { shaderLocation: 1, offset: 8, format: 'uint16x4' },
+          ],
+        },
+      ],
+    },
+    fragment: { module, entryPoint: 'fs', targets: [{ format: 'rgba8unorm' }, { format: 'rgba8unorm' }] },
+    primitive: { topology: 'triangle-list', cullMode: 'none' },
+    depthStencil: { format: 'depth32float', depthCompare: 'less', depthWriteEnabled: true },
+  })
+
+  const bpr = S * 4
+  const mkReadback = (label: string): GPUBuffer =>
+    ctx.res.createBuffer(
+      { label: `${ctx.id}/${label}`, size: bpr * S, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ },
+      { tag: 'bake-scratch' },
+    )
+  const rbAlb = mkReadback('ct-rb-albedo')
+  const rbAux = mkReadback('ct-rb-aux')
+
+  const enc = device.createCommandEncoder({ label: `${ctx.id}/ct-enc` })
+  const pass = enc.beginRenderPass({
+    label: `${ctx.id}/ct-pass`,
+    colorAttachments: [
+      { view: albTex.createView(), clearValue: { r: 0, g: 0, b: 0, a: 0 }, loadOp: 'clear', storeOp: 'store' },
+      { view: auxTex.createView(), clearValue: { r: 0.5, g: 0.5, b: 0.5, a: 0 }, loadOp: 'clear', storeOp: 'store' },
+    ],
+    depthStencilAttachment: {
+      view: depthTex.createView(),
+      depthClearValue: 1,
+      depthLoadOp: 'clear',
+      depthStoreOp: 'store',
+    },
+  })
+  pass.setPipeline(pipeline)
+  pass.setVertexBuffer(0, vbuf)
+  pass.setIndexBuffer(ibuf, 'uint32')
+  pass.setBindGroup(0, bg)
+  // 9 wrapped copies -> the tile square receives its neighbours' overflow, so
+  // the capture tiles exactly (0.24m of geometry inside a 0.18m period).
+  pass.drawIndexed(indices.length, 9)
+  pass.end()
+  enc.copyTextureToBuffer({ texture: albTex }, { buffer: rbAlb, bytesPerRow: bpr, rowsPerImage: S }, [S, S])
+  enc.copyTextureToBuffer({ texture: auxTex }, { buffer: rbAux, bytesPerRow: bpr, rowsPerImage: S }, [S, S])
+  device.queue.submit([enc.finish()])
+  await rbAlb.mapAsync(GPUMapMode.READ)
+  await rbAux.mapAsync(GPUMapMode.READ)
+  const reduced = reduceCarpet(new Uint8Array(rbAlb.getMappedRange()), new Uint8Array(rbAux.getMappedRange()))
+  rbAlb.unmap()
+  rbAux.unmap()
+  for (const r of [vbuf, ibuf, uni, albTex, auxTex, depthTex, rbAlb, rbAux]) r.destroy()
+  bakeCavityAo(reduced.aux, tileM, y1 - y0)
+
+  return packCarpet({ tileM, y0, y1, ...reduced })
+}
+
+/** Supersample reduce of the tile capture, then dilate colour/normal/height. */
+function reduceCarpet(
+  src: Uint8Array,
+  aux: Uint8Array,
+): Pick<CarpetTileBake, 'albedo' | 'aux' | 'planeFrac' | 'meanCov'> {
+  const N = CT_PX
+  const S = CT_PX * CT_SS
+  const albedo = new Uint8Array(N * N * 4)
+  const out = new Uint8Array(N * N * 4)
+  const nrm = new Float32Array(N * N * 3)
+  const filled = new Uint8Array(N * N)
+  let covSum = 0
+  let hSum = 0
+  let hDen = 0
+  for (let y = 0; y < N; y++) {
+    for (let x = 0; x < N; x++) {
+      let as = 0
+      let r = 0
+      let g = 0
+      let b = 0
+      let nx = 0
+      let ny = 0
+      let nz = 0
+      let h = 0
+      for (let j = 0; j < CT_SS; j++) {
+        for (let i = 0; i < CT_SS; i++) {
+          const s = ((y * CT_SS + j) * S + x * CT_SS + i) * 4
+          const a = src[s + 3]!
+          if (a === 0) continue
+          as += a
+          r += src[s]! * a
+          g += src[s + 1]! * a
+          b += src[s + 2]! * a
+          nx += (aux[s]! / 127.5 - 1) * a
+          ny += (aux[s + 1]! / 127.5 - 1) * a
+          nz += (aux[s + 2]! / 127.5 - 1) * a
+          h += aux[s + 3]! * a
+        }
+      }
+      const i2 = y * N + x
+      covSum += as / (CT_SS * CT_SS * 255)
+      if (as === 0) continue
+      albedo[i2 * 4] = Math.round(r / as)
+      albedo[i2 * 4 + 1] = Math.round(g / as)
+      albedo[i2 * 4 + 2] = Math.round(b / as)
+      albedo[i2 * 4 + 3] = Math.round(as / (CT_SS * CT_SS))
+      out[i2 * 4 + 2] = Math.round(h / as)
+      hSum += (h / as / 255) * as
+      hDen += as
+      nrm[i2 * 3] = nx
+      nrm[i2 * 3 + 1] = ny
+      nrm[i2 * 3 + 2] = nz
+      filled[i2] = 1
+    }
+  }
+  dilateRgba(albedo, N, N, N, N, CT_DILATE)
+  dilateTopAux(out, nrm, filled, N, CT_DILATE)
+  for (let i = 0; i < N * N; i++) {
+    const [u, v] = octEncode(nrm[i * 3]!, nrm[i * 3 + 1]!, nrm[i * 3 + 2]!)
+    out[i * 4] = u
+    out[i * 4 + 1] = v
+  }
+  return {
+    albedo: albedo as Uint8Array<ArrayBuffer>,
+    aux: out as Uint8Array<ArrayBuffer>,
+    planeFrac: hDen > 0 ? hSum / hDen : 0.7,
+    meanCov: covSum / (N * N),
+  }
+}
+
+/**
+ * Cavity occlusion of the captured surface, written into aux.a in place.
+ *
+ * Horizon obscurance over the tile's own height channel: for each texel, how
+ * far the surface rises around it, sampled on 8 azimuths at three radii that
+ * bracket the capitulum scale (a capitulum is ~1cm, the relief 3.3cm). This is
+ * what makes a cushion read as a mass of separate heads rather than a printed
+ * texture — the crevices between capitula go dark because they genuinely see
+ * less sky. Torus-wrapped, because the tile is periodic.
+ */
+function bakeCavityAo(aux: Uint8Array, tileM: number, spanM: number): void {
+  const N = CT_PX
+  const mPerTexel = tileM / N
+  const radii = [8, 20, 44] // ~2.8mm, 7mm, 15mm at 512px / 0.18m
+  const dirs = 8
+  const cos: number[] = []
+  const sin: number[] = []
+  for (let k = 0; k < dirs; k++) {
+    const a = (k * 2 * Math.PI) / dirs
+    cos.push(Math.cos(a))
+    sin.push(Math.sin(a))
+  }
+  const out = new Uint8Array(N * N)
+  for (let y = 0; y < N; y++) {
+    for (let x = 0; x < N; x++) {
+      const hc = aux[(y * N + x) * 4 + 2]! / 255
+      let occ = 0
+      for (let k = 0; k < dirs; k++) {
+        for (const r of radii) {
+          const sx = (((x + Math.round(cos[k]! * r)) % N) + N) % N
+          const sy = (((y + Math.round(sin[k]! * r)) % N) + N) % N
+          const dh = (aux[(sy * N + sx) * 4 + 2]! / 255 - hc) * spanM
+          // tan(elevation) of the neighbour, clamped to a 45-degree horizon.
+          occ += Math.min(1, Math.max(0, dh / (r * mPerTexel)))
+        }
+      }
+      out[y * N + x] = Math.round(255 * Math.max(0, 1 - occ / (dirs * radii.length)))
+    }
+  }
+  for (let i = 0; i < N * N; i++) aux[i * 4 + 3] = out[i]!
+}
+
 /** Octahedral encode, y-primary — exact inverse of the decode in gcmesh.ts. */
 export function octEncode(x: number, y: number, z: number): [number, number] {
   const s = Math.abs(x) + Math.abs(y) + Math.abs(z)

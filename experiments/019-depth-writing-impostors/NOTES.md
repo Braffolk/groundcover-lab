@@ -115,6 +115,10 @@ Confirmed against the HUD budget bar: 22.9 MB (calamagrostis, poa), 22.7 MB
 (elymus — lower density, so smaller shells), 23.8 MB on the `dense-mixed` stand
 (density 5). **Within budget on every stand.**
 
+A **carpet** species spends its budget completely differently — one layer, not
+17, because a mat never samples an azimuth view — and lands at 6.9 MB. See
+"Moss carpet" at the end.
+
 Why 352 px and 17 layers, and not e.g. 256 px and 25: at 256 px the plants were
 visibly softer than the billboard baseline (which spends 512 px per side view),
 and with the depth warp fixing the *geometry* between views, the remaining cost of
@@ -154,6 +158,15 @@ one file per species, no stale variants left behind).
    shells stay solid (visible in the `far-horizon` A/B, where the baseline thins
    out and this does not).
 
+## Carpet species (the `bog` stand's Sphagnum) — see the section at the end
+
+A carpet entry (`stand_table[i].carpet_div > 0`) is a periodic 0.18 m community
+tile, not an upright plant, and it draws a completely different shape:
+`shaders/carpet.wgsl`, one ground-parallel terrain-conformed quad per tile, with
+the top view's depth channel driving a relief step and the near band's
+`frag_depth`. The card path above is untouched and still describes every
+scattered species.
+
 ## Status
 
 **working.** Verified by screenshot on the default stand at `grazing`, `topdown`,
@@ -161,6 +174,11 @@ one file per species, no stale variants left behind).
 `debug=depth`, `debug=albedo`, `debug=coverage`, plus the `scaling-100m` and
 `dense-mixed` stands. No console errors in any run.
 `npx tsc --noEmit | grep 019-depth-writing-impostors` is silent.
+
+Carpet path verified on the `bog` stand at `grazing`, `carpet-close`, `topdown`,
+`inside-plant`, an oblique eye-level view, two sloped views across the ridges,
+and `debug=albedo / normals / lighting / coverage`; no toasts, no console errors.
+`default` is unchanged — see "Do the grasses still look the same" below.
 
 ## Findings
 
@@ -284,3 +302,193 @@ range.** Evidence, all from
   card-centre sway value is folded into the reconstruction centre, so the
   reconstructed depth lags the shear by at most the sway amplitude (a few cm).
   Invisible in depth, and it keeps interstage components out of the fragment shader.
+
+## Moss carpet (`bog` stand)
+
+Sphagnum palustre is a 0.18 m periodic community tile, 0.07-0.09 m tall with
+~3.3 cm of capitulum relief, laid out by the `bog` stand as a grid-snapped mat:
+22x22 tiles per 4 m cell (**484 slots**, life size, constant scale 1.0101,
+90-degree-only yaw), zoned into three micro-habitat states across the wetness
+field. Rendered as an upright plant it was indefensible, and the before shots
+show exactly that: rows of tilted, screen-aligned "bricks" standing on edge in
+stripes, with three quarters of the mat missing entirely and bare peat between.
+
+### What changed, smallest first
+
+1. **Evaluate every slot.** `main.ts` sized the cull dispatch from
+   `SCATTER_MAX_PER_CELL` and `cull.wgsl` indexed slots with the same constant.
+   A carpet entry has `carpet_div^2 = 484` slots per cell, so **356 of 484 grid
+   nodes per cell were never visited — 74% of the mat did not exist.** Slot count
+   now comes from `standEntrySlots(entry)`, rounded up to the 64-wide workgroup
+   (484 -> 512) so the cell-level frustum/region rejects stay workgroup-uniform;
+   the 28 padding slots fall out of `scatter_candidate()` as `exists = false`.
+   This is the single biggest visual fix and it is two lines.
+2. **Instance capacity from the grid, not from `density`.** A carpet ignores
+   `density` entirely (the stand sets 8 as a placeholder); its cover is
+   `carpet_div^2 / 16 = 30.25` tiles/m^2, of which each state's wetness interval
+   claims about `wetWidth`. The near shells are sized for the FULL grid rate
+   because a 6 m shell can sit wholly inside one zone, the outer annuli for the
+   band rate x1.15 because they average over many 12 m zones. Non-carpet entries
+   take the identical old code path, so `default` capacities are unchanged.
+3. **Carpet render path** (`shaders/carpet.wgsl`, its own pipelines, used only
+   for entries with `carpet_div > 0`; `impostor.wgsl` is untouched):
+   - ONE ground-parallel quad per tile, **axis-aligned in xz and exactly one
+     grid step across** (`stand_table.footprint_m` x the carpet scale). The 90°
+     yaw rotates the TEXTURE inside the tile square, never the quad, so corners
+     land on the lattice and are shared with the four neighbours. No
+     billboarding, no per-tile scale, no distance shrink, no overscale.
+   - the tile's own square of the baked **top view only** — a mat has no
+     silhouette worth an azimuth view.
+   - **Terrain fitting: rung 3, per-vertex conforming.** Every corner gets its
+     own `terrain_sample(xz)` — height and (nx, nz) from one bilinear fetch, so
+     the shading basis is free. Rung 3 rather than 1 or 2 for a specific reason:
+     neighbouring tiles share corner positions, so per-vertex is the only rung
+     that keeps the mat C0-continuous. Any per-tile plane fit leaves a wedge
+     crack at every tile boundary, because two neighbours fit two different
+     planes — the cheap rungs are not cheaper here, they are wrong.
+   - baked normals lifted into the ground frame (`plant_basis_from_up(up, yaw)`,
+     inlined), so a mat on a slope lights as a slope.
+   - **carpet alpha reference 0.06** (param `carpetAlphaRef`) instead of the 0.4
+     grass one, so the mip chain cannot dissolve distant tiles into holes.
+   - **no camera-inside fade** — a mat you stand on must not open a hole — and
+     the region-rim fade is measured from the tile centre, never per vertex.
+   - mip level from `dpdx/dpdy` of the *unwarped* texcoord. A mat is a ground
+     plane: its minification is strongly anisotropic and the distance-derived
+     level the card path uses (correct for an upright plant) would either blur
+     it or alias it.
+4. **The relief — this is what the method has that a card does not.** The top
+   view's signed depth makes a texel a real 3D point `Q = P + N*(2*ew*s)*(d-0.5)`:
+   - **parallax.** The ray landing at `P` actually sees the surface at `P + W`,
+     `W = d*(V/(V.N) - N)` — the in-plane slide of a point lifted by `d`. One
+     dependent tap, one first-order step, no loop and no marching. Offset-limited
+     (`1/(V.N)` clamped at 0.30) and faded out below ~25 degrees, where a single
+     depth layer has no right to an answer. Because the tile image is periodic, a
+     step that leaves the tile square **wraps** instead of clamping, and the wrap
+     is the exact geometric continuation.
+   - **true per-pixel depth** in the near shell: `Q` is written as `frag_depth`,
+     so grass stems growing through the mat are occluded at the real moss surface
+     rather than at a plane 4.5 cm above the peat, and the mat meets the terrain
+     at its true height. Same shell rule as the cards (`depthDist`), so only the
+     nearest band pays for the lost early-z.
+   `warp` scales the relief step (0 = flat card, the built-in A/B); `depthDist`
+   owns the depth write.
+5. **Top layer only in VRAM for a mat species.** A carpet never samples an
+   azimuth view, so uploading 17 layers wasted 20 MiB per species. Moss went
+   **25.1/25 MB (over budget, HUD-striped) -> 6.9/25 MB**; the grasses are
+   untouched at 22.2-22.9.
+6. **The baked AO grid is wrong for a mat, and had to go.** This one was found by
+   screenshot, not by reasoning. With `aoStrength` at its 0.75 default the whole
+   carpet drew a hard **basketweave**: broad soft dark bands, 90 degrees apart
+   between neighbouring tiles, obvious at `carpet-close` and dominant across the
+   entire near field at `grazing`. `debug=albedo` and `debug=normals` were clean,
+   so it was the geometry-atlas alpha channel; `aoStrength=0` removed it
+   completely and `0.35` still showed it. The cause: the AO grid is 24x40x24 over
+   the mesh AABB, which for a 0.21 x 0.09 x 0.23 m mat is 9.2 mm voxels
+   horizontally and 2.4 mm vertically, and the trace steps in VOXELS — the
+   up-rays leave the canopy after 22 mm while the sideways rays run 83 mm, so the
+   result is dominated by horizontal transmittance and paints the source tile's
+   ramet rows as bands. For a 1.2 m grass the same grid is roughly isotropic,
+   which is why nobody noticed. Carpets now take their occlusion from the DEPTH
+   channel instead — `cavity = 0.55 + 0.45*depth`, per texel, already sampled,
+   full atlas resolution: capitulum tops stay lit, the gaps down toward the peat
+   go dark. The contrast is deliberately gentle, because the depth channel also
+   carries the tile's own low-frequency hummock and a steep ramp would repeat
+   THAT in every tile — the same basketweave by another route.
+
+### VRAM (bog stand, HUD-verified)
+
+| item | bytes |
+|---|---|
+| top-view albedo layer, mipped rgba8 (165 195 texels) | 0.63 MiB |
+| top-view geo layer (oct normal, depth, unused AO) | 0.63 MiB |
+| culled instances, 7 shells at the carpet's grid rate | 5.6 MiB |
+| view table + entry uniform + indirect args | ~1 KiB |
+| **total per moss species** | **6.9 / 25 MB** |
+
+Grasses on `bog`: calamagrostis 22.2, poa 21.8. `default` unchanged at
+22.9 / 22.7 / 22.9 MiB.
+
+### What improved, what is still bad
+
+From before/after screenshots at the same cameras (`grazing`, `carpet-close`,
+`topdown`, `inside-plant`, an oblique 35-degree eye-level view, two sloped views
+across the bog's ridges, and albedo/normals/lighting/coverage):
+
+- **Improved, decisively.** Before: stripes of tilted brick-like cards standing
+  on edge over mostly bare peat, ~26% of the mat present, moss VRAM over budget.
+  After: a closed, continuous, gapless mat at every distance from 1 m to the
+  horizon, conforming exactly to the ridged terrain with no buried or floating
+  edges and no cracks between tiles, the three states reading as coherent
+  interlocking zones, real per-fragment normals (`debug=normals` shows moss-scale
+  variation over a terrain-following gradient, not a flat up-normal), ~85%
+  coverage with the genuine peat gaps open (`debug=coverage`), and no hole under
+  the camera at `inside-plant`.
+- **The relief is real but modest.** At an oblique eye-level view, `warp=1` vs
+  `warp=0` differs by RMSE 3.1% and the difference is the right kind: without it
+  the surface shows sharp linear cracks and reads flat, with it the cushions
+  clump and slide against the hollows. At `carpet-close` (straight down) it is
+  nearly nothing, because `V ~ N` there and the correct parallax IS zero.
+- **Still bad #1, and inherent to a flat quad: no silhouette thickness at
+  grazing.** `frag_depth` re-orders what a pixel shows, but it cannot create
+  coverage: two abutting coplanar quads project to abutting screen regions, so a
+  raised capitulum on a near tile can never overlap the tile behind it. Getting
+  that would need the quad extruded into the view direction plus a real march
+  through the depth layer, and a march is out of scope for this project. So this
+  renders a **relief-shaded, parallaxed, depth-writing ground surface**, not a
+  cushion with an edge you could see against the sky.
+- **Still bad #2: the parallax fades out at grazing.** Below ~25 degrees a single
+  Newton step off one depth layer would displace by more than half a tile and
+  smear; it is faded to zero instead. So the most important camera gets the least
+  of the method's headline feature. Honest, and visible in the `warp` A/B.
+- **Still bad #3, minor: faint 1-texel dark lines along tile boundaries**,
+  visible in `debug=coverage`. Mechanism: at mip level L a sample near the tile
+  square's edge blends up to 2^L texels of the surrounding capture margin instead
+  of wrapping, so coverage dips slightly. 001-billboard-smoke sees the same lines
+  from the same cause. The fix is the carpet-only bake below, where the texture
+  IS the tile and hardware `repeat` addressing does the wrapping.
+- **Not done, and the obvious next win: a carpet-only bake.** For a mat, 16 of 17
+  baked layers are dead weight and only ~62% of the top layer's area is inside
+  the tile crop, so the species spends 6.9 of its 25 MB and could instead spend
+  ~12 MB on ONE 1024 px layer covering exactly `[0, tileM]^2` — 5.7x the linear
+  texel density (0.18 mm/texel vs 0.61 mm), correct `repeat` addressing (no seam
+  lines, exact parallax wrap) and an alpha rescale computed against the carpet's
+  own 0.06 reference instead of the grass 0.4. Skipped deliberately: at
+  `carpet-close` (1 m, 1.44 mm/px) the existing crop is already 2.4x finer than a
+  pixel, so it buys nothing above ~0.4 m viewing distance, and it costs a ~2
+  minute re-bake per species of a 479 MB source mesh.
+
+### Do the grasses still look the same?
+
+Yes, verified rather than reasoned. Masked scene-only crops (HUD and param panel
+excluded) of before vs after on the `default` stand:
+
+| camera | RMSE | pixels differing > 3% (of 258 000) |
+|---|---|---|
+| `grazing` | 6.3e-6 | **0** |
+| `inside-plant` | 0 (bit-identical) | **0** |
+| `topdown` | 1.2e-3 | 52 |
+
+The 52 are the usual `atomicAdd` compaction-order flips at tied depth, the same
+noise two identical runs produce. `default` VRAM is unchanged (22.9 / 22.7 /
+22.9 MiB) and its GPU Sigma-p50 stayed in the 3.8-5.4 ms band across the run,
+inside the 9 ms ceiling — no bench JSON is claimed, because a dozen sibling
+agents were sharing this GPU for the whole session.
+
+### Is this representation suited to a moss carpet?
+
+**Mostly, and better than a plain card — but not all the way.** The impostor's
+central claim ("a texel is a 3D point, not paint") survives the change of shape
+completely: on a mat the same equation gives per-texel cushion depth, a
+first-order parallax step and a true per-pixel depth write, all with the same 3
+taps and no loop, and it is a strictly better ground surface than a textured
+quad — sharper occlusion cues, parallax that responds to the camera, correct
+depth against the grass. What does NOT survive is the *impostor* part: a
+screen-aligned card is a proxy for a silhouette, and a 9 cm mat seen from a
+standing eye has none, so the entire azimuth view set had to be deleted for this
+species (and with it 73% of its VRAM). And the one thing the source geometry
+most wants — 3.3 cm of capitulum relief you can see *against* something — needs
+coverage that a single flat quad cannot produce at grazing, no matter what depth
+it writes. Verdict: an honest, cheap, closed, relief-shaded carpet with real
+parallax from above and no silhouette from the side. If the bar is "reads as a
+Sphagnum lawn you are walking on", this passes comfortably; if it is "reads as a
+springy cushion with an edge", a shell/volume method should own the mat.

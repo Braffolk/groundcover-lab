@@ -1,13 +1,17 @@
 import cullSrc from './shaders/cull.wgsl'
 import cardsSrc from './shaders/cards.wgsl'
+import carpetSrc from './shaders/carpet.wgsl'
 import mipgenSrc from './shaders/mipgen.wgsl'
 import { loadSpeciesSlabs, tileSide, N_AZIM, N_LAYER, N_TILES, TILE_TOP0, type SlabAtlas } from './bake.ts'
+import { loadSpeciesCarpet, CARPET_NRM, CARPET_TEX, N_BAND, N_CARPET_LAYER, type CarpetAtlas } from './carpet.ts'
 import {
   SCATTER_CELL_SIZE,
   SCATTER_MAX_PER_CELL,
+  standEntrySlots,
   type Experiment,
   type ExperimentContext,
   type FrameInfo,
+  type StandSpecies,
   type ViewTargets,
 } from '@harness'
 import type { PARAMS } from './manifest.ts'
@@ -15,15 +19,20 @@ import type { PARAMS } from './manifest.ts'
 /**
  * Layered parallax cards.
  *
- * Startup: each species' slab atlases are loaded from mesh/baked / OPFS or
- * baked in-browser from the raw mesh, uploaded and mipped; the per-tile rects
- * and slab plane depths become a small storage buffer.
+ * Startup: each species' atlases are loaded from mesh/baked / OPFS or baked
+ * in-browser from the raw mesh, uploaded and mipped. An UPRIGHT species gets
+ * the depth-slab atlas (bake.ts); a CARPET species — one whose stand entry
+ * lays it out as a periodic mat — gets the much smaller height-band atlas
+ * (carpet.ts) instead, because 96% of the slab atlas is side views a mat never
+ * shows.
  *
  * Per frame: one compute pass evaluates the shared scatter over a
- * camera-centered cell region, frustum-culls, and compacts survivors into TWO
- * indirect draws — a near ring that runs the layered eye-ray reprojection and
- * a far ring that samples one merged tile with a single tap (billboard cost).
- * Each plant is one proxy quad plus one horizontal top quad either way.
+ * camera-centered cell region (carpet_div^2 slots per cell for a mat, the 128
+ * scatter slots otherwise), frustum-culls, and compacts survivors into indirect
+ * draws — for upright plants a near ring running the layered eye-ray
+ * reprojection and a far ring sampling one merged tile, for carpets a single
+ * ground-parallel tile quad whose fragment shader walks the eye ray down
+ * through the cushion's height bands.
  *
  * Per-frame cost is O(visible region), independent of the stand's plant count.
  */
@@ -32,7 +41,9 @@ const CELL = SCATTER_CELL_SIZE
 const REGION_MAX = 128 // keep equal to the manifest's regionRadius max
 const LOD_DIST_MAX = 48 // keep equal to the manifest's lodDistance max
 const NEAR_MIPS = 5
-const INFO_FLOATS = 48
+const INFO_FLOATS = 64
+/** Mip levels the band -> merged dissolve takes (see shaders/carpet.wgsl). */
+const CARPET_MERGE_SPAN = 2.5
 
 interface SpeciesGpu {
   atlas: SlabAtlas
@@ -45,15 +56,26 @@ interface SpeciesGpu {
   topSpan: number
 }
 
+interface CarpetGpu {
+  atlas: CarpetAtlas
+  albedo: GPUTexture
+  normal: GPUTexture
+}
+
 interface EntryGpu {
-  gpu: SpeciesGpu
+  carpet: CarpetGpu | null
   capacity: number
   nearCapacity: number
+  /** Scatter slots per cell for THIS entry (carpet_div^2 for a mat). */
+  slots: number
   infoBuffer: GPUBuffer
   indirectBuffer: GPUBuffer
+  indirectReset: Uint32Array<ArrayBuffer>
   cullBindGroup: GPUBindGroup
   drawBindGroup: GPUBindGroup
   slotsPerFrame: number
+  /** Extra info floats that only depend on the atlas, written once. */
+  atlasInfo: (info: Float32Array) => void
 }
 
 export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Experiment> {
@@ -68,13 +90,32 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
     addressModeU: 'clamp-to-edge',
     addressModeV: 'clamp-to-edge',
   })
+  // A carpet tile is PERIODIC, and its bake is wrapped, so the image is
+  // exactly one period: `repeat` makes the hardware continue the mat for free
+  // when the parallax ray walks out of the tile, at every mip level.
+  const tileSampler = device.createSampler({
+    label: `${ctx.id}/tile-sampler`,
+    magFilter: 'linear',
+    minFilter: 'linear',
+    mipmapFilter: 'linear',
+    maxAnisotropy: 8,
+    addressModeU: 'repeat',
+    addressModeV: 'repeat',
+  })
 
-  // --- species atlases (sequential: the poa bake transiently needs ~400MB) --
+  const isCarpet = (entry: StandSpecies): boolean => (entry.carpetDiv ?? 0) > 0
+
+  // --- species atlases (sequential: a bake transiently needs ~400MB) --------
   const speciesGpu = new Map<string, SpeciesGpu>()
+  const carpetGpu = new Map<string, CarpetGpu>()
   for (const entry of ctx.stand.species) {
-    if (speciesGpu.has(entry.species)) continue
-    const atlas = await loadSpeciesSlabs(ctx, entry.species)
-    speciesGpu.set(entry.species, uploadAtlas(ctx, entry.species, atlas))
+    if (isCarpet(entry)) {
+      if (carpetGpu.has(entry.species)) continue
+      carpetGpu.set(entry.species, uploadCarpet(ctx, entry.species, await loadSpeciesCarpet(ctx, entry.species)))
+    } else {
+      if (speciesGpu.has(entry.species)) continue
+      speciesGpu.set(entry.species, uploadAtlas(ctx, entry.species, await loadSpeciesSlabs(ctx, entry.species)))
+    }
   }
 
   // --- bind group layouts / pipelines ---------------------------------------
@@ -105,18 +146,47 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       { binding: 8, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
     ],
   })
+  const carpetBgl = device.createBindGroupLayout({
+    label: `${ctx.id}/carpet-bgl`,
+    entries: [
+      { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
+      { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
+      {
+        binding: 2,
+        visibility: GPUShaderStage.FRAGMENT,
+        texture: { sampleType: 'float', viewDimension: '2d-array' },
+      },
+      {
+        binding: 3,
+        visibility: GPUShaderStage.FRAGMENT,
+        texture: { sampleType: 'float', viewDimension: '2d-array' },
+      },
+      { binding: 4, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+    ],
+  })
 
   const sideMax = Math.ceil((2 * REGION_MAX) / CELL) + 1
   const slotsMax = sideMax * sideMax * SCATTER_MAX_PER_CELL
 
   const entries: EntryGpu[] = ctx.stand.species.map((standEntry, entryIndex) => {
-    const gpu = speciesGpu.get(standEntry.species)!
+    const carpet = isCarpet(standEntry) ? carpetGpu.get(standEntry.species)! : null
+    const slots = standEntrySlots(standEntry)
     const density = Math.min(standEntry.density, 8)
-    const capacity = Math.ceil(slotsMax * (density / 8) * 1.06) + 1024
+    // Slots to EVALUATE and instances to STORE are different numbers. A carpet
+    // fills only the share of the grid its wetness band claims, and that share
+    // is far from uniform (the field is damped on slopes, so the dry band is
+    // much wider than a third) — measure it instead of guessing, or the buffer
+    // either overflows into holes or wastes 3x the memory.
+    const capacity = carpet
+      ? carpetCapacity(ctx, standEntry, slots)
+      : Math.ceil(slotsMax * (density / 8) * 1.06) + 1024
     // The near ring is a disc of radius lodDistance * scaleMax, so its worst
     // case is a small fraction of the region — sized for the param maximum.
+    // Carpets have no near ring at all.
     const nearR = Math.min(LOD_DIST_MAX * standEntry.scaleMax, REGION_MAX)
-    const nearCapacity = Math.min(capacity, Math.ceil(Math.PI * nearR * nearR * density * 1.25) + 2048)
+    const nearCapacity = carpet
+      ? 0
+      : Math.min(capacity, Math.ceil(Math.PI * nearR * nearR * density * 1.25) + 2048)
     const infoBuffer = ctx.res.createBuffer(
       {
         label: `${ctx.id}/info-${entryIndex}`,
@@ -127,7 +197,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
     )
     const mkInstances = (name: string, count: number): GPUBuffer =>
       ctx.res.createBuffer(
-        { label: `${ctx.id}/${name}-${entryIndex}`, size: count * 16, usage: GPUBufferUsage.STORAGE },
+        { label: `${ctx.id}/${name}-${entryIndex}`, size: Math.max(count, 16) * 16, usage: GPUBufferUsage.STORAGE },
         { species: standEntry.species, tag: `${name}-instances` },
       )
     const nearBuffer = mkInstances('near', nearCapacity)
@@ -150,36 +220,88 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         { binding: 3, resource: { buffer: indirectBuffer } },
       ],
     })
-    const drawBindGroup = device.createBindGroup({
-      label: `${ctx.id}/draw-bg-${entryIndex}`,
-      layout: drawBgl,
-      entries: [
-        { binding: 0, resource: { buffer: infoBuffer } },
-        { binding: 1, resource: { buffer: nearBuffer } },
-        { binding: 2, resource: { buffer: farBuffer } },
-        { binding: 3, resource: { buffer: gpu.tileBuffer } },
-        { binding: 4, resource: gpu.nearAlbedo.createView() },
-        { binding: 5, resource: gpu.nearNormal.createView() },
-        { binding: 6, resource: gpu.farAlbedo.createView() },
-        { binding: 7, resource: gpu.farNormal.createView() },
-        { binding: 8, resource: sampler },
-      ],
-    })
+    const drawBindGroup = carpet
+      ? device.createBindGroup({
+          label: `${ctx.id}/carpet-bg-${entryIndex}`,
+          layout: carpetBgl,
+          entries: [
+            { binding: 0, resource: { buffer: infoBuffer } },
+            { binding: 1, resource: { buffer: farBuffer } },
+            { binding: 2, resource: carpet.albedo.createView({ dimension: '2d-array' }) },
+            { binding: 3, resource: carpet.normal.createView({ dimension: '2d-array' }) },
+            { binding: 4, resource: tileSampler },
+          ],
+        })
+      : device.createBindGroup({
+          label: `${ctx.id}/draw-bg-${entryIndex}`,
+          layout: drawBgl,
+          entries: [
+            { binding: 0, resource: { buffer: infoBuffer } },
+            { binding: 1, resource: { buffer: nearBuffer } },
+            { binding: 2, resource: { buffer: farBuffer } },
+            { binding: 3, resource: { buffer: speciesGpu.get(standEntry.species)!.tileBuffer } },
+            { binding: 4, resource: speciesGpu.get(standEntry.species)!.nearAlbedo.createView() },
+            { binding: 5, resource: speciesGpu.get(standEntry.species)!.nearNormal.createView() },
+            { binding: 6, resource: speciesGpu.get(standEntry.species)!.farAlbedo.createView() },
+            { binding: 7, resource: speciesGpu.get(standEntry.species)!.farNormal.createView() },
+            { binding: 8, resource: sampler },
+          ],
+        })
+
+    const atlasInfo = carpet
+      ? (info: Float32Array): void => {
+          const a = carpet.atlas
+          const h0 = a.heights[0]!
+          info[32] = a.yMin
+          info[33] = a.yMax
+          info[37] = a.tileM * 0.75 // bounding radius of a tile at scale 1
+          info.set(
+            [h0 - a.heights[1]!, h0 - a.heights[2]!, h0 - a.heights[3]!, h0 - a.heights[N_BAND]!],
+            48,
+          )
+          info[52] = slots
+          info[53] = 1
+          info[54] = h0
+          info[59] = CARPET_TEX
+        }
+      : (info: Float32Array): void => {
+          const a = speciesGpu.get(standEntry.species)!.atlas
+          const g = speciesGpu.get(standEntry.species)!
+          info[32] = a.y0
+          info[33] = a.y1
+          info[34] = a.rXZ
+          info[35] = a.cx
+          info[36] = a.cz
+          info[37] = Math.hypot(a.rXZ, (a.y1 - a.y0) / 2) * 1.03
+          info[40] = g.sideSpan
+          info[41] = g.topSpan
+          info[52] = slots
+          info[53] = 0
+        }
+
+    const indirectReset = new Uint32Array(8)
     return {
-      gpu,
+      carpet,
       capacity,
       nearCapacity,
+      slots,
       infoBuffer,
       indirectBuffer,
+      indirectReset,
       cullBindGroup,
       drawBindGroup,
       slotsPerFrame: 0,
+      atlasInfo,
     }
   })
+
+  const cardEntries = entries.filter((e) => e.carpet === null)
+  const carpetEntries = entries.filter((e) => e.carpet !== null)
 
   let cullPipeline!: GPUComputePipeline
   let nearPipeline!: GPURenderPipeline
   let farPipeline!: GPURenderPipeline
+  let carpetPipeline!: GPURenderPipeline
   const build = (): void => {
     const module = ctx.shaders.module(cardsSrc)
     cullPipeline = device.createComputePipeline({
@@ -194,17 +316,32 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       label: `${ctx.id}/cards-pl`,
       bindGroupLayouts: [ctx.frame.layout, drawBgl],
     })
-    const mkCards = (name: string, vs: string, fs: string): GPURenderPipeline =>
+    const mkPipe = (
+      name: string,
+      mod: GPUShaderModule,
+      layout: GPUPipelineLayout,
+      vs: string,
+      fs: string,
+    ): GPURenderPipeline =>
       device.createRenderPipeline({
         label: `${ctx.id}/${name}`,
-        layout: cardsLayout,
-        vertex: { module, entryPoint: vs },
-        fragment: { module, entryPoint: fs, targets: [{ format: ctx.colorFormat }] },
+        layout,
+        vertex: { module: mod, entryPoint: vs },
+        fragment: { module: mod, entryPoint: fs, targets: [{ format: ctx.colorFormat }] },
         primitive: { topology: 'triangle-list', cullMode: 'none' },
         depthStencil: { format: ctx.depthFormat, depthCompare: 'less', depthWriteEnabled: true },
       })
-    nearPipeline = mkCards('near-cards', 'vs_near', 'fs_near')
-    farPipeline = mkCards('far-cards', 'vs_far', 'fs_far')
+    nearPipeline = mkPipe('near-cards', module, cardsLayout, 'vs_near', 'fs_near')
+    farPipeline = mkPipe('far-cards', module, cardsLayout, 'vs_far', 'fs_far')
+    if (carpetEntries.length > 0) {
+      carpetPipeline = mkPipe(
+        'carpet-tiles',
+        ctx.shaders.module(carpetSrc),
+        device.createPipelineLayout({ label: `${ctx.id}/carpet-pl`, bindGroupLayouts: [ctx.frame.layout, carpetBgl] }),
+        'vs_carpet',
+        'fs_carpet',
+      )
+    }
   }
   build()
   const unsubscribe = ctx.shaders.onReload(build)
@@ -213,7 +350,6 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
   const cellMax = Math.floor(ctx.stand.radius / CELL)
   const info = new Float32Array(INFO_FLOATS)
   const planes = new Float32Array(24)
-  const indirectReset = new Uint32Array(8)
 
   return {
     update(frame: FrameInfo): void {
@@ -230,10 +366,8 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       frustumPlanes(frame.camera.viewProj, planes)
 
       const verts = ctx.params.topCard ? 12 : 6
-      indirectReset[0] = verts
-      indirectReset[4] = verts
       entries.forEach((entry, entryIndex) => {
-        const a = entry.gpu.atlas
+        info.fill(0)
         info.set(planes, 0)
         info[24] = x0
         info[25] = z0
@@ -243,22 +377,24 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         info[29] = entryIndex
         info[30] = R
         info[31] = entry.capacity
-        info[32] = a.y0
-        info[33] = a.y1
-        info[34] = a.rXZ
-        info[35] = a.cx
-        info[36] = a.cz
-        info[37] = Math.hypot(a.rXZ, (a.y1 - a.y0) / 2) * 1.03
         info[38] = ctx.params.alphaRef
         info[39] = ctx.params.lodDistance
-        info[40] = entry.gpu.sideSpan
-        info[41] = entry.gpu.topSpan
         info[42] = ctx.params.layerShade
         info[43] = ctx.params.bottomShade
         info[44] = entry.nearCapacity
+        info[55] = ctx.params.carpetAlphaRef
+        info[56] = ctx.params.carpetMaxSlope
+        info[57] = ctx.params.carpetMergeLod
+        info[58] = CARPET_MERGE_SPAN
+        info[60] = ctx.params.carpetBandRef
+        info[61] = ctx.params.carpetDepthShade
+        entry.atlasInfo(info)
         device.queue.writeBuffer(entry.infoBuffer, 0, info)
-        device.queue.writeBuffer(entry.indirectBuffer, 0, indirectReset)
-        entry.slotsPerFrame = sideX * sideZ * SCATTER_MAX_PER_CELL
+        // A carpet draws one 6-vertex ground quad and never uses the near ring.
+        entry.indirectReset[0] = entry.carpet ? 0 : verts
+        entry.indirectReset[4] = entry.carpet ? 6 : verts
+        device.queue.writeBuffer(entry.indirectBuffer, 0, entry.indirectReset)
+        entry.slotsPerFrame = sideX * sideZ * entry.slots
       })
     },
 
@@ -277,16 +413,24 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         colorAttachments: [{ view: targets.colorView, loadOp: 'load', storeOp: 'store' }],
         depthStencilAttachment: { view: targets.depthView, depthLoadOp: 'load', depthStoreOp: 'store' },
       })
-      // Near ring first: it owns the closest pixels, so the depth it writes
-      // lets early-z reject the far ring's fragments behind it.
-      pass.setPipeline(nearPipeline)
       pass.setBindGroup(0, ctx.frame.bindGroup)
-      for (const entry of entries) {
+      // Near ring first: it owns the closest pixels, so the depth it writes
+      // lets early-z reject the far ring's fragments behind it. The carpet is
+      // an opaque ground surface, so it goes next and shields the far ring.
+      pass.setPipeline(nearPipeline)
+      for (const entry of cardEntries) {
         pass.setBindGroup(1, entry.drawBindGroup)
         pass.drawIndirect(entry.indirectBuffer, 0)
       }
+      if (carpetEntries.length > 0) {
+        pass.setPipeline(carpetPipeline)
+        for (const entry of carpetEntries) {
+          pass.setBindGroup(1, entry.drawBindGroup)
+          pass.drawIndirect(entry.indirectBuffer, 16)
+        }
+      }
       pass.setPipeline(farPipeline)
-      for (const entry of entries) {
+      for (const entry of cardEntries) {
         pass.setBindGroup(1, entry.drawBindGroup)
         pass.drawIndirect(entry.indirectBuffer, 16)
       }
@@ -302,6 +446,128 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
 
 const mipLevels = (w: number, h: number, cap = 32): number =>
   Math.min(cap, Math.floor(Math.log2(Math.max(w, h))) + 1)
+
+/**
+ * Instance capacity for a carpet entry.
+ *
+ * A carpet has carpet_div^2 slots per cell and the entries sharing the grid
+ * PARTITION the wetness axis, so each one gets whatever share of the nodes its
+ * band happens to claim. The wetness field is damped on slopes, which pushes
+ * the distribution well away from uniform: on the bog the dry band takes
+ * roughly half the nodes and the wet band a tenth. Sizing all three for a third
+ * would punch holes in one and waste megabytes on another, so this samples the
+ * actual field over the stand and takes the worst camera position.
+ */
+function carpetCapacity(ctx: ExperimentContext<typeof PARAMS>, entry: StandSpecies, slots: number): number {
+  const slotsPerM2 = slots / (CELL * CELL)
+  const half = ctx.stand.radius
+  const R = REGION_MAX
+  const N = 96
+  const step = (2 * half) / N
+  const lo = (entry.wetCenter ?? 0.5) - (entry.wetWidth ?? 1) * 0.5
+  const hi = lo + (entry.wetWidth ?? 1)
+  const xs = new Float32Array(N)
+  for (let i = 0; i < N; i++) xs[i] = -half + (i + 0.5) * step
+  const inBand = new Uint8Array(N * N)
+  for (let iz = 0; iz < N; iz++) {
+    for (let ix = 0; ix < N; ix++) {
+      const w = ctx.scene.scatter.wetness(xs[ix]!, xs[iz]!)
+      inBand[iz * N + ix] = w >= lo && w < hi ? 1 : 0
+    }
+  }
+  // Worst camera position: a species concentrated in one corner of the stand
+  // peaks when the region disc sits on top of it.
+  let best = 0
+  const C = 13
+  for (let cz = 0; cz < C; cz++) {
+    for (let cx = 0; cx < C; cx++) {
+      const px = -half + ((cx + 0.5) * (2 * half)) / C
+      const pz = -half + ((cz + 0.5) * (2 * half)) / C
+      let count = 0
+      for (let iz = 0; iz < N; iz++) {
+        const dz = xs[iz]! - pz
+        for (let ix = 0; ix < N; ix++) {
+          if (inBand[iz * N + ix] === 0) continue
+          const dx = xs[ix]! - px
+          if (dx * dx + dz * dz <= R * R) count++
+        }
+      }
+      best = Math.max(best, count)
+    }
+  }
+  return Math.ceil(best * step * step * slotsPerM2 * 1.2) + 4096
+}
+
+/** Upload the carpet band array textures and generate their mip chains. */
+function uploadCarpet(ctx: ExperimentContext<typeof PARAMS>, speciesId: string, atlas: CarpetAtlas): CarpetGpu {
+  const { device } = ctx
+  const usage = GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST
+  const mk = (name: string, side: number, data: Uint8Array<ArrayBuffer>): GPUTexture => {
+    const tex = ctx.res.createTexture(
+      {
+        label: `${ctx.id}/${speciesId}/${name}`,
+        size: [side, side, N_CARPET_LAYER],
+        format: 'rgba8unorm',
+        mipLevelCount: mipLevels(side, side),
+        usage,
+      },
+      { species: speciesId, tag: `carpet-${name}` },
+    )
+    device.queue.writeTexture({ texture: tex }, data, { bytesPerRow: side * 4, rowsPerImage: side }, [
+      side,
+      side,
+      N_CARPET_LAYER,
+    ])
+    return tex
+  }
+  const albedo = mk('band-albedo', CARPET_TEX, atlas.albedo)
+  const normal = mk('band-normal', CARPET_NRM, atlas.normal)
+
+  const module = ctx.shaders.module(mipgenSrc)
+  const bgl = device.createBindGroupLayout({
+    label: `${ctx.id}/carpet-mipgen-bgl`,
+    entries: [{ binding: 0, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'unfilterable-float' } }],
+  })
+  const layout = device.createPipelineLayout({ label: `${ctx.id}/carpet-mipgen-pl`, bindGroupLayouts: [bgl] })
+  const mkPipeline = (entryPoint: string): GPURenderPipeline =>
+    device.createRenderPipeline({
+      label: `${ctx.id}/carpet-mipgen-${entryPoint}`,
+      layout,
+      vertex: { module, entryPoint: 'vs' },
+      fragment: { module, entryPoint, targets: [{ format: 'rgba8unorm' }] },
+      primitive: { topology: 'triangle-list' },
+    })
+  const albedoPipe = mkPipeline('fs_albedo')
+  const normalPipe = mkPipeline('fs_normal_cov')
+
+  const enc = device.createCommandEncoder({ label: `${ctx.id}/carpet-mipgen` })
+  const genMips = (tex: GPUTexture, pipeline: GPURenderPipeline): void => {
+    for (let layer = 0; layer < N_CARPET_LAYER; layer++) {
+      for (let level = 1; level < tex.mipLevelCount; level++) {
+        const viewOf = (m: number): GPUTextureView =>
+          tex.createView({ dimension: '2d', baseArrayLayer: layer, arrayLayerCount: 1, baseMipLevel: m, mipLevelCount: 1 })
+        const bg = device.createBindGroup({
+          label: `${ctx.id}/carpet-mipgen-bg-${layer}-${level}`,
+          layout: bgl,
+          entries: [{ binding: 0, resource: viewOf(level - 1) }],
+        })
+        const pass = enc.beginRenderPass({
+          label: `${ctx.id}/carpet-mipgen-${layer}-${level}`,
+          colorAttachments: [{ view: viewOf(level), loadOp: 'clear', storeOp: 'store' }],
+        })
+        pass.setPipeline(pipeline)
+        pass.setBindGroup(0, bg)
+        pass.draw(3)
+        pass.end()
+      }
+    }
+  }
+  genMips(albedo, albedoPipe)
+  genMips(normal, normalPipe)
+  device.queue.submit([enc.finish()])
+
+  return { atlas, albedo, normal }
+}
 
 /** Upload atlas mip 0, generate the mip chains, build the tile table buffer. */
 function uploadAtlas(ctx: ExperimentContext<typeof PARAMS>, speciesId: string, atlas: SlabAtlas): SpeciesGpu {

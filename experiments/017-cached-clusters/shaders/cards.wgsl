@@ -1,6 +1,7 @@
 #include "src/wgsl/lighting.wgsl"
 #include "src/wgsl/wind.wgsl"
 #include "src/wgsl/debug.wgsl"
+#include "src/wgsl/terrain.wgsl"
 
 // Crossed-card plant proxies, drawn from a fill.wgsl instance list, in two
 // modes sharing all geometry math:
@@ -18,6 +19,15 @@
 // CARD's yaw -> flipped toward the viewer -> light_surface() ONCE, with a
 // grounding occlusion factor folded into the light term. The composite pass
 // never lights again; it only re-projects and fogs what the cache holds.
+//
+// CARPET entries (stand_table[i].carpet_div > 0, i.e. the bog Sphagnum) take a
+// third shape in both paths: ONE ground-parallel quad covering exactly the
+// species' periodic tile, conformed to the terrain per vertex, textured with
+// the tile's own sub-rectangle of the TOP capture. A 7cm-tall, 18cm-wide mat
+// has no silhouette for a camera-facing card to show, and upright cards for it
+// slice through the ground and through each other; ground-parallel geometry is
+// the only honest shape. The crossed side cards and the far single card are
+// skipped entirely for those entries.
 
 struct CardsU {
   vp: mat4x4f,      // refresh frustum view-proj (identity/unused in near mode)
@@ -35,13 +45,35 @@ struct PlantEntry {
 
 @group(1) @binding(0) var<uniform> cards: CardsU;
 @group(1) @binding(1) var<storage, read> instances: array<vec4f>;
-@group(1) @binding(2) var<uniform> plant_table: array<PlantEntry, 4>;
+@group(1) @binding(2) var<uniform> plant_table: array<PlantEntry, 8>;
 @group(1) @binding(3) var card_albedo: texture_2d_array<f32>;
 @group(1) @binding(4) var card_normal: texture_2d_array<f32>;
 @group(1) @binding(5) var card_sampler: sampler;
+/// Anisotropic, for carpet tiles only. A ground-parallel quad at a grazing
+/// angle is minified far harder along the view direction than across it, and a
+/// single trilinear lod has to pick one: the sharp one aliases, the safe one
+/// erased ALL texel detail — a 0.18m tile 2m from the camera landed on mip 2.5,
+/// which averages the mat's per-facet normals into a flat up-vector and its
+/// albedo into flat olive. Sampling with real gradients lets the hardware keep
+/// the cross-axis sharpness, which is where the moss's intricacy lives.
+@group(1) @binding(6) var carpet_sampler: sampler;
 
 const QUAD_U = array<f32, 6>(0.0, 1.0, 0.0, 1.0, 1.0, 0.0);
 const QUAD_V = array<f32, 6>(1.0, 1.0, 0.0, 1.0, 0.0, 0.0);
+
+/// Alpha reference for carpet tiles, INSTEAD of the grass ramp. A mat is a
+/// closed surface and must stay a solid depth-writing occluder: the top tile
+/// is 92-97% covered at mip 0 (alpha is essentially binary there, so this
+/// threshold changes nothing up close), but the mip chain pulls partly-covered
+/// texels down and at the grass reference whole distant tiles fail the test
+/// and punch tile-shaped holes in the carpet.
+const CARPET_ALPHA_REF: f32 = 0.06;
+
+/// Where the periodic tile sits inside a carpet species' rebuilt top capture
+/// tile — must match CARPET_BORDER / CARPET_UV_SPAN in bake.ts (32 texels of
+/// wrapped border on each side of a 256px tile).
+const CARPET_UV0: f32 = 0.125;
+const CARPET_UV_SPAN: f32 = 0.75;
 
 fn rot_yaw(v: vec3f, a: f32) -> vec3f {
   let c = cos(a);
@@ -98,6 +130,35 @@ fn shading_normal(packed_n: vec3f, card_yaw: f32, world_pos: vec3f, view_pos: ve
   return n;
 }
 
+/// World normal for a CARPET fragment. The top capture flipped every mesh
+/// normal into the +Y hemisphere over flat ground, so the baked vector has to
+/// be lifted into the local GROUND frame — a mat on a slope must light as a
+/// slope, and yawing alone would light it as if it were level. This is
+/// plant_basis_from_up(up, yaw) from terrain.wgsl, inlined. No two-sided flip:
+/// a mat is a one-sided surface and a capitulum flank turned away from the
+/// viewer is genuinely in shade.
+/// Grounding occlusion for a carpet fragment. The upright cards fake
+/// self-shadowing with a root-to-tip gradient, which a mat has no room for —
+/// but a Sphagnum cushion occludes itself the same way, sideways: a capitulum
+/// apex sees the whole sky, the crevice wall between two of them barely sees
+/// any. The baked normal's tilt away from the tile's up axis is a free proxy
+/// for that (mean n.y over the tile is 0.48, so this is real signal, not a
+/// constant), and it goes into the LIGHT term so debug=albedo stays the baked
+/// colour. Scaled by the same baseShade knob as the upright path.
+fn carpet_shade(packed_n: vec3f) -> f32 {
+  let ny = clamp(decode_normal(packed_n).y, 0.0, 1.0);
+  return mix(1.0 - cards.proj_info.w, 1.0, ny);
+}
+
+fn carpet_normal(packed_n: vec3f, yaw: f32, up_in: vec3f) -> vec3f {
+  let nm = decode_normal(packed_n);
+  let up = normalize(up_in);
+  var t = vec3f(cos(yaw), 0.0, -sin(yaw));
+  let proj = t - up * dot(up, t);
+  t = select(normalize(vec3f(up.y, -up.x, 0.0)), normalize(proj), dot(proj, proj) > 1.0e-6);
+  return normalize(t * nm.x + up * nm.y + cross(t, up) * nm.z);
+}
+
 struct VOut {
   @builtin(position) pos: vec4f,
   @location(0) uv: vec2f,           // atlas uv (tile-mapped)
@@ -116,6 +177,10 @@ struct VOut {
   @location(5) @interpolate(flat) thr_bias: f32,
   // Grounding occlusion: dark at the plant root, 1 at the tip.
   @location(6) shade: f32,
+  // Carpet tiles only: the ground normal under this vertex, so the baked
+  // normal can be lifted into the local GROUND frame instead of a flat one.
+  @location(7) up_ws: vec3f,
+  @location(8) @interpolate(flat) carpet: u32,
 }
 
 fn crown_fade(vi: u32, crown_pos: vec3f, cam: vec3f) -> f32 {
@@ -133,6 +198,8 @@ struct CardVertex {
   hf: f32,       // normalized height up the plant (0 root, 1 tip) for wind
   card_yaw: f32, // capture frame -> card frame rotation (see VOut.card_yaw)
   shade: f32,    // grounding occlusion at this vertex
+  up_ws: vec3f,  // ground normal under this vertex (carpet tiles)
+  carpet: bool,
 }
 
 fn card_vertex(vi: u32, ii: u32, mode: u32) -> CardVertex {
@@ -157,6 +224,49 @@ fn card_vertex(vi: u32, ii: u32, mode: u32) -> CardVertex {
   out.hf = 0.0;
   out.card_yaw = yaw;
   out.shade = 1.0;
+  out.up_ws = vec3f(0.0, 1.0, 0.0);
+  out.carpet = false;
+
+  let tile_m = stand_table[entry].footprint_m;
+  if (stand_table[entry].carpet_div > 0.0) {
+    // --- carpet tile: one ground-parallel quad, conformed per vertex --------
+    out.carpet = true;
+    out.degenerate = quad > 0u; // no side cards, no crown card, no far card
+    if (out.degenerate) { return out; }
+
+    // Width from the species' periodic FOOTPRINT, never from its height:
+    // footprint_m * scale is exactly the carpet's grid step, so tiles abut
+    // instead of overlapping (this mesh is 0.245m of geometry inside a 0.18m
+    // period, and drawing the whole capture would overscale every tile 1.36x).
+    // The scatter's 90-degree yaw and constant scale are used as given — the
+    // two things that keep a mat a mat rather than confetti.
+    let corner_m = vec2f(2.0 * u - 1.0, 2.0 * v - 1.0) * (tile_m * 0.5);
+    let off_w = rot_yaw(vec3f(corner_m.x, 0.0, corner_m.y), yaw) * scale;
+    let xz = base.xz + off_w.xz;
+
+    // Ladder rung 3: the ground under EVERY vertex. Neighbouring tiles share
+    // corner positions, so this is the only rung that keeps the mat C0
+    // continuous — a per-tile plane fit cracks at every tile edge. One
+    // terrain_sample gives the height and (nx, nz) in the same four taps, so
+    // the shading basis costs nothing extra.
+    let g = terrain_sample(xz);
+    out.up_ws = vec3f(g.y, sqrt(max(1.0 - g.y * g.y - g.z * g.z, 0.0)), g.z);
+    // yrange.z is the carpet plane height in metres, SHARED by every carpet
+    // entry of the stand (main.ts): a per-species height would step 1.6cm at
+    // every zone boundary and show bare peat through the step.
+    out.world = vec3f(xz.x, g.x + pe.yrange.z, xz.y);
+
+    // A carpet species' TOP tile was rewritten at load time to be the periodic
+    // tile square itself, inset by a wrapped border (rebuildCarpetTopTile in
+    // bake.ts), so the quad maps straight onto that inset. Compared with
+    // sampling the raw capture this both raises texel density (192 texels over
+    // 0.18m instead of 256 over 0.245m) and keeps every mip level honest.
+    out.uv = vec2f(
+      0.5 + (CARPET_UV0 + (u * CARPET_UV_SPAN)) * 0.5,
+      CARPET_UV0 + v * CARPET_UV_SPAN,
+    );
+    return out;
+  }
 
   let center_w = base + rot_yaw(pe.center.xyz, yaw) * scale;
 
@@ -209,6 +319,28 @@ fn card_lod(world: vec3f, cam: vec3f, hh: f32, scale: f32) -> f32 {
   return clamp(log2(256.0 / max(px, 0.5)), 0.0, 5.0);
 }
 
+/// Albedo + normal tap for a fragment. Upright cards keep the explicit,
+/// distance-derived lod (their card is camera-facing, so screen-space
+/// derivatives buy nothing and the far refresh path renders sub-pixel cards
+/// where derivatives are meaningless). Carpet tiles sample with real
+/// gradients through the anisotropic sampler instead — see carpet_sampler.
+struct CardTap {
+  albedo: vec4f,
+  normal: vec4f,
+}
+
+fn card_tap(uv: vec2f, layer: i32, lod: f32, carpet: bool, ddx: vec2f, ddy: vec2f) -> CardTap {
+  var t: CardTap;
+  if (carpet) {
+    t.albedo = textureSampleGrad(card_albedo, carpet_sampler, uv, layer, ddx, ddy);
+    t.normal = textureSampleGrad(card_normal, carpet_sampler, uv, layer, ddx, ddy);
+  } else {
+    t.albedo = textureSampleLevel(card_albedo, card_sampler, uv, layer, lod);
+    t.normal = textureSampleLevel(card_normal, card_sampler, uv, layer, lod);
+  }
+  return t;
+}
+
 // ---------------------------------------------------------------------------
 
 @vertex
@@ -222,35 +354,57 @@ fn vs_near(@builtin(vertex_index) vi: u32, @builtin(instance_index) raw_ii: u32)
   let world = cv.world + wind_sway(i0.xyz, frame.time, sway * cv.hf, i1.y);
 
   var o: VOut;
-  o.pos = frame.view_proj * vec4f(world, 1.0);
+  if (cv.degenerate) {
+    o.pos = vec4f(0.0, 0.0, 2.0, 1.0); // clipped away (carpet: quads 1 and 2)
+  } else {
+    o.pos = frame.view_proj * vec4f(world, 1.0);
+  }
   o.uv = cv.uv;
   o.world_pos = world;
   o.card_yaw = cv.card_yaw;
+  // Carpet tiles ignore this: they sample by gradient (see card_tap).
   o.lod = card_lod(i0.xyz, frame.camera_pos, plant_table[entry].dims.y, i1.x);
   o.layer = i32(plant_table[entry].center.w);
   o.thr_bias = crown_fade(vi, i0.xyz + vec3f(0.0, plant_table[entry].center.y * i1.x, 0.0), frame.camera_pos);
   o.shade = cv.shade;
+  o.up_ws = cv.up_ws;
+  o.carpet = select(0u, 1u, cv.carpet);
   return o;
 }
 
 @fragment
 fn fs_near(i: VOut) -> @location(0) vec4f {
-  let tex = textureSampleLevel(card_albedo, card_sampler, i.uv, i.layer, i.lod);
+  // Derivatives must be taken in uniform control flow, so they are computed
+  // for every fragment and only USED by the carpet branch inside card_tap.
+  let ddx = dpdx(i.uv);
+  let ddy = dpdy(i.uv);
+  let tap = card_tap(i.uv, i.layer, i.lod, i.carpet == 1u, ddx, ddy);
+  let tex = tap.albedo;
   let dcam = distance(i.world_pos, frame.camera_pos);
   // Base threshold relaxes with lod (mips dilute coverage), rises to 1 as the
-  // camera enters the plant so it fades away instead of clipping.
-  var thr = mix(0.5, 0.28, i.lod / 5.0) + smoothstep(0.9, 0.25, dcam) + i.thr_bias;
+  // camera enters the plant so it fades away instead of clipping. A carpet
+  // gets neither: a mat must not dissolve with distance, and eroding the mat
+  // you are standing on would open a hole under your feet.
+  var thr = CARPET_ALPHA_REF;
+  if (i.carpet == 0u) {
+    thr = mix(0.5, 0.28, i.lod / 5.0) + smoothstep(0.9, 0.25, dcam) + i.thr_bias;
+  }
   if (tex.a < thr) { discard; }
   // Per-fragment normal: baked plant-local unit normal, rotated into the world
   // by THIS card's yaw and flipped toward the viewer (thin foliage is
   // two-sided). See shading_normal().
-  let ne = textureSampleLevel(card_normal, card_sampler, i.uv, i.layer, i.lod);
+  let ne = tap.normal;
   let albedo = card_albedo_of(tex);
-  let n = shading_normal(ne.rgb, i.card_yaw, i.world_pos, frame.camera_pos);
+  var n = shading_normal(ne.rgb, i.card_yaw, i.world_pos, frame.camera_pos);
+  var shade = i.shade;
+  if (i.carpet == 1u) {
+    n = carpet_normal(ne.rgb, i.card_yaw, i.up_ws);
+    shade = carpet_shade(ne.rgb);
+  }
   // The grounding gradient is occlusion, so it multiplies into the LIGHT term,
   // not the albedo: debug=albedo stays the baked atlas colour exactly as
   // captured, and debug=lighting shows sun + ambient x grounding.
-  var color = light_surface(albedo * i.shade, n, i.world_pos);
+  var color = light_surface(albedo * shade, n, i.world_pos);
   // Fog only in the normal view — debug views stay unfogged and honest.
   if (debug_mode() == DEBUG_OFF) {
     color = apply_fog(color, i.world_pos);
@@ -282,6 +436,8 @@ fn vs_refresh(@builtin(vertex_index) vi: u32, @builtin(instance_index) raw_ii: u
   o.layer = i32(plant_table[entry].center.w);
   o.thr_bias = crown_fade(vi, i0.xyz + vec3f(0.0, plant_table[entry].center.y * i1.x, 0.0), cards.cam_pos.xyz);
   o.shade = cv.shade;
+  o.up_ws = cv.up_ws;
+  o.carpet = select(0u, 1u, cv.carpet);
   return o;
 }
 
@@ -292,16 +448,28 @@ struct RefreshOut {
 
 @fragment
 fn fs_refresh(i: VOut) -> RefreshOut {
-  let tex = textureSampleLevel(card_albedo, card_sampler, i.uv, i.layer, i.lod);
-  let thr = mix(0.5, 0.22, i.lod / 5.0) + i.thr_bias;
+  let ddx = dpdx(i.uv);
+  let ddy = dpdy(i.uv);
+  let tap = card_tap(i.uv, i.layer, i.lod, i.carpet == 1u, ddx, ddy);
+  let tex = tap.albedo;
+  var thr = CARPET_ALPHA_REF;
+  if (i.carpet == 0u) {
+    thr = mix(0.5, 0.22, i.lod / 5.0) + i.thr_bias;
+  }
   if (tex.a < thr) { discard; }
-  let ne = textureSampleLevel(card_normal, card_sampler, i.uv, i.layer, i.lod);
+  let ne = tap.normal;
   let albedo = card_albedo_of(tex);
   // Lit for the SLOT's camera — the only view-dependent term is the two-sided
   // flip, which the parallax invalidation already bounds (a slot is refreshed
-  // long before the viewer crosses a card's plane).
-  let n = shading_normal(ne.rgb, i.card_yaw, i.world_pos, cards.cam_pos.xyz);
-  let lit = light_surface(albedo * i.shade, n, i.world_pos);
+  // long before the viewer crosses a card's plane). A carpet has no flip at
+  // all, so its cached shading is view-independent and never goes stale.
+  var n = shading_normal(ne.rgb, i.card_yaw, i.world_pos, cards.cam_pos.xyz);
+  var shade = i.shade;
+  if (i.carpet == 1u) {
+    n = carpet_normal(ne.rgb, i.card_yaw, i.up_ws);
+    shade = carpet_shade(ne.rgb);
+  }
+  let lit = light_surface(albedo * shade, n, i.world_pos);
 
   let d16 = floor(clamp(i.pos.z, 0.0, 1.0) * 65535.0 + 0.5);
   let hi = floor(d16 / 256.0);

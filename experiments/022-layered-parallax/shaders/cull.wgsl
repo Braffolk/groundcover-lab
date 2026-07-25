@@ -7,10 +7,17 @@
 // into an instance buffer + indirect draw args. Cost is O(region area), never
 // O(total plants in the stand).
 //
-// A workgroup is 64 invocations and a cell holds SCATTER_MAX_PER_CELL = 128
-// candidate slots, so every workgroup covers exactly half of ONE cell: the
-// cell-level region/frustum rejects below are workgroup-uniform and let whole
-// workgroups exit before a single terrain texel is fetched.
+// Slots per cell come from the ENTRY, not from SCATTER_MAX_PER_CELL: a carpet
+// entry has carpet_div^2 slots (484 for the bog moss, deliberately over the
+// 128 scatter budget, because div 22 is what puts a 0.18m tile at life size).
+// Driving this loop from the constant would render about a quarter of the mat
+// and leave holes that look exactly like a placement bug.
+//
+// A workgroup is 64 invocations, so with the 128-slot default every workgroup
+// covers exactly half of ONE cell and the cell-level region/frustum rejects
+// below are workgroup-uniform — whole workgroups exit before a single terrain
+// texel is fetched. With a carpet's 484 slots a workgroup can straddle two
+// cells; the rejects stay correct, they just stop being free.
 
 struct PlantInst {
   pos: vec3f,
@@ -30,14 +37,15 @@ const TERRAIN_BOUND_SLACK: f32 = 1.05;
 @compute @workgroup_size(64)
 fn cs_cull(@builtin(global_invocation_id) gid: vec3<u32>) {
   let side_x = u32(info.side_x);
-  let total = side_x * u32(info.side_z) * SCATTER_MAX_PER_CELL;
+  let slots = u32(info.slots_per_cell);
+  let total = side_x * u32(info.side_z) * slots;
   let idx = gid.x;
   if (idx >= total) {
     return;
   }
 
-  let slot = idx % SCATTER_MAX_PER_CELL;
-  let cell_lin = idx / SCATTER_MAX_PER_CELL;
+  let slot = idx % slots;
+  let cell_lin = idx / slots;
   let cx = i32(info.origin_cell.x) + i32(cell_lin % side_x);
   let cz = i32(info.origin_cell.y) + i32(cell_lin / side_x);
 
@@ -87,8 +95,10 @@ fn cs_cull(@builtin(global_invocation_id) gid: vec3<u32>) {
 
   // Distance ring: near plants get the layered reprojection, everything past
   // lod_dist (scaled with the plant, so big and small plants switch at the
-  // same apparent size) collapses to the merged single-tap tile.
-  let near = distance(center, frame.camera_pos) < info.lod_dist * sp.scale;
+  // same apparent size) collapses to the merged single-tap tile. A carpet has
+  // no rings — one pipeline dissolves its height bands into the merged tile
+  // per texel by mip level — so all its tiles go into the one list.
+  let near = info.carpet < 0.5 && distance(center, frame.camera_pos) < info.lod_dist * sp.scale;
   let yaw_q = u32(sp.yaw * (1024.0 / 6.2831853)) & 1023u;
   let scale_q = u32(clamp(sp.scale * 0.25, 0.0, 1.0) * 4095.0) & 4095u;
   let phase_q = u32(sp.phase * (1024.0 / 6.2831853)) & 1023u;

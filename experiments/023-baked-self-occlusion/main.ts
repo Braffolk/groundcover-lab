@@ -1,10 +1,11 @@
 import cullSrc from './shaders/cull.wgsl'
 import cardsSrc from './shaders/cards.wgsl'
 import mipgenSrc from './shaders/mipgen.wgsl'
-import { ATLAS_A, ATLAS_B, loadSpeciesAtlas, type SelfOccAtlas } from './bake.ts'
+import { ATLAS_A, ATLAS_B, GRID, TILE_A, TILE_B, TOP_TILE, loadSpeciesAtlas, type SelfOccAtlas } from './bake.ts'
 import {
   SCATTER_CELL_SIZE,
   SCATTER_MAX_PER_CELL,
+  speciesById,
   type Experiment,
   type ExperimentContext,
   type FrameInfo,
@@ -25,6 +26,16 @@ import type { PARAMS } from './manifest.ts'
  * indirect draws — near plants get the depth-warped card (3 taps), far plants
  * get the same card flat (2 taps). One view-aligned quad per plant either way.
  * Per-frame cost is O(visible region), independent of the stand's plant count.
+ *
+ * CARPET SPECIES (stand `carpetDiv > 0`, e.g. the bog Sphagnum) take a
+ * different shape, because a camera-facing card cannot be a mat: one
+ * GROUND-PARALLEL, tile-sized quad per tile, conformed to the terrain per
+ * vertex, textured from the straight-down baked view only, and given its
+ * cushion relief by the same per-texel depth field — used here as a classic
+ * one-step parallax offset in the tile's tangent plane rather than as a warp
+ * along the eye ray. Only 1 of the 25 baked views is ever sampled, so a carpet
+ * species uploads that single tile instead of the whole atlas: 0.9MB instead of
+ * 20.8MB, which is where the budget belongs for a plant that has no silhouette.
  */
 
 const CELL = SCATTER_CELL_SIZE
@@ -32,17 +43,30 @@ const REGION_MAX = 112 // keep equal to the manifest's regionRadius max
 const NEAR_SPLIT_MAX = 44 // keep equal to the manifest's nearSplit max
 const MIPS_A = Math.floor(Math.log2(ATLAS_A)) + 1
 const MIPS_B = Math.floor(Math.log2(ATLAS_B)) + 1
-const INFO_FLOATS = 48
+const INFO_FLOATS = 56
+/**
+ * Height of a carpet tile's quad, as a fraction of the baked capture height —
+ * where the source mesh puts its mean capitulum apex, i.e. the surface the
+ * straight-down view actually shows. The parallax offset is measured from this
+ * plane, so it moves the imagery both ways (capitula above it, hollows below)
+ * instead of only sinking.
+ */
+const CARPET_PLANE = 0.74
 
 interface SpeciesGpu {
   atlas: SelfOccAtlas
   albedoTex: GPUTexture
   geomTex: GPUTexture
   tileBuffer: GPUBuffer
+  /** Only the straight-down tile was uploaded (mat species). */
+  carpet: boolean
+  /** (scale.xy, bias.xy) mapping tile-local [0,1]² into that tile. */
+  carpetUv: [number, number, number, number]
 }
 
 interface EntryGpu {
   gpu: SpeciesGpu
+  isCarpet: boolean
   capNear: number
   capFar: number
   infoBuffer: GPUBuffer
@@ -51,8 +75,13 @@ interface EntryGpu {
   cullBindGroup: GPUBindGroup
   drawNear: GPUBindGroup
   drawFar: GPUBindGroup
+  /** Candidate slots per cell the cull must EVALUATE (carpetDiv², or 128). */
+  enumSlots: number
+  /** (scale.xy, bias.xy) mapping tile-local [0,1]² into the top view's box. */
+  carpetUv: [number, number, number, number]
   slotsPerFrame: number
 }
+
 
 export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Experiment> {
   const { device } = ctx
@@ -73,11 +102,17 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
   const geomSampler = mkSampler('geom-sampler', 1)
 
   // --- species atlases (sequential: the poa bake is transiently heavy) -------
+  // A species laid out as a carpet only ever samples the straight-down view, so
+  // it uploads that one tile rather than all 25.
+  const carpetSpecies = new Set(
+    ctx.stand.species.filter((e) => (e.carpetDiv ?? 0) > 0).map((e) => e.species),
+  )
   const speciesGpu = new Map<string, SpeciesGpu>()
   for (const entry of ctx.stand.species) {
     if (speciesGpu.has(entry.species)) continue
     const atlas = await loadSpeciesAtlas(ctx, entry.species)
-    speciesGpu.set(entry.species, uploadAtlas(ctx, entry.species, atlas))
+    const tileM = speciesById(entry.species).tileM ?? 0
+    speciesGpu.set(entry.species, uploadAtlas(ctx, entry.species, atlas, carpetSpecies.has(entry.species), tileM))
   }
 
   const cullBgl = device.createBindGroupLayout({
@@ -105,11 +140,25 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
 
   const entries: EntryGpu[] = ctx.stand.species.map((standEntry, entryIndex) => {
     const gpu = speciesGpu.get(standEntry.species)!
-    const density = Math.min(standEntry.density, 8)
+    const carpetDiv = standEntry.carpetDiv ?? 0
+    const isCarpet = carpetDiv > 0
+    // TWO DIFFERENT NUMBERS, and conflating them silently drops plants:
+    //  * enumSlots — candidate slots per cell the cull must EVALUATE. A carpet
+    //    has carpetDiv² of them (484 at life size), deliberately over the
+    //    128-slot scatter budget; clamping to 128 renders ~26% of the mat as
+    //    horizontal bands with bare peat between them.
+    //  * perM2 — how many are expected to SURVIVE, which is all the instance
+    //    buffers need to hold. For a zone-partitioned carpet that is roughly
+    //    the entry's `wetWidth` share of the grid, not the whole grid.
+    const enumSlots = isCarpet ? carpetDiv * carpetDiv : SCATTER_MAX_PER_CELL
+    const band = Math.min(1, standEntry.wetWidth ?? 1)
+    const perM2 = isCarpet
+      ? ((carpetDiv * carpetDiv) / (CELL * CELL)) * Math.min(1, band * 1.25)
+      : Math.min(standEntry.density, 8)
     // Region area x density plus slack. The scatter's count over a region this
     // size has a relative spread well under 1%, so 6% + a flat 2k is ample.
-    const capNear = Math.ceil(Math.PI * NEAR_SPLIT_MAX ** 2 * density * 1.2) + 1024
-    const capFar = Math.ceil(Math.PI * REGION_MAX ** 2 * density * 1.06) + 2048
+    const capNear = Math.ceil(Math.PI * NEAR_SPLIT_MAX ** 2 * perM2 * 1.2) + 1024
+    const capFar = Math.ceil(Math.PI * REGION_MAX ** 2 * perM2 * 1.06) + 2048
     const infoBuffer = ctx.res.createBuffer(
       {
         label: `${ctx.id}/info-${entryIndex}`,
@@ -152,6 +201,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       })
     return {
       gpu,
+      isCarpet,
       capNear,
       capFar,
       infoBuffer,
@@ -170,6 +220,8 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       }),
       drawNear: mkDraw('draw-near', instNear),
       drawFar: mkDraw('draw-far', instFar),
+      enumSlots,
+      carpetUv: gpu.carpetUv,
       slotsPerFrame: 0,
     }
   })
@@ -177,6 +229,8 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
   let cullPipeline!: GPUComputePipeline
   let nearPipeline!: GPURenderPipeline
   let farPipeline!: GPURenderPipeline
+  let carpetNearPipeline!: GPURenderPipeline
+  let carpetFarPipeline!: GPURenderPipeline
   const build = (): void => {
     cullPipeline = device.createComputePipeline({
       label: `${ctx.id}/cull`,
@@ -202,6 +256,8 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       })
     nearPipeline = mkCards('cards-near', 'vs_near', 'fs_near')
     farPipeline = mkCards('cards-far', 'vs_far', 'fs_far')
+    carpetNearPipeline = mkCards('carpet-near', 'vs_carpet', 'fs_carpet_near')
+    carpetFarPipeline = mkCards('carpet-far', 'vs_carpet', 'fs_carpet_far')
   }
   build()
   const unsubscribe = ctx.shaders.onReload(build)
@@ -236,10 +292,12 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         info.set([a.aabbC[0], a.aabbC[1], a.aabbC[2], a.aabbC[1] + a.aabbH[1]], 36)
         info.set([a.aabbH[0], a.aabbH[1], a.aabbH[2], 0], 40)
         info.set([ctx.params.occlusion, ctx.params.transmission, ctx.params.canopyDepth, ctx.params.parallax], 44)
+        info.set([entry.enumSlots, CARPET_PLANE * (a.aabbC[1] + a.aabbH[1]), entry.isCarpet ? 1 : 0, 0], 48)
+        info.set(entry.carpetUv, 52)
         device.queue.writeBuffer(entry.infoBuffer, 0, info)
         device.queue.writeBuffer(entry.argsNear, 0, argsReset)
         device.queue.writeBuffer(entry.argsFar, 0, argsReset)
-        entry.slotsPerFrame = sideX * sideZ * SCATTER_MAX_PER_CELL
+        entry.slotsPerFrame = sideX * sideZ * entry.enumSlots
       })
     },
 
@@ -260,16 +318,24 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       })
       pass.setBindGroup(0, ctx.frame.bindGroup)
       // Near first: coarse front-to-back so early-z rejects the far tier.
-      pass.setPipeline(nearPipeline)
-      for (const entry of entries) {
-        pass.setBindGroup(1, entry.drawNear)
-        pass.drawIndirect(entry.argsNear, 0)
+      // Carpets take their own pipelines (ground-parallel quad, tangent-space
+      // parallax) but the same near/far split and the same instance lists.
+      const drawGroup = (pipeline: GPURenderPipeline, carpet: boolean, near: boolean): void => {
+        let bound = false
+        for (const entry of entries) {
+          if (entry.isCarpet !== carpet) continue
+          if (!bound) {
+            pass.setPipeline(pipeline)
+            bound = true
+          }
+          pass.setBindGroup(1, near ? entry.drawNear : entry.drawFar)
+          pass.drawIndirect(near ? entry.argsNear : entry.argsFar, 0)
+        }
       }
-      pass.setPipeline(farPipeline)
-      for (const entry of entries) {
-        pass.setBindGroup(1, entry.drawFar)
-        pass.drawIndirect(entry.argsFar, 0)
-      }
+      drawGroup(nearPipeline, false, true)
+      drawGroup(carpetNearPipeline, true, true)
+      drawGroup(farPipeline, false, false)
+      drawGroup(carpetFarPipeline, true, false)
       pass.end()
     },
 
@@ -280,16 +346,199 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
   }
 }
 
-/** Upload both atlases plus the tile table, and build the mip chains. */
-function uploadAtlas(ctx: ExperimentContext<typeof PARAMS>, speciesId: string, atlas: SelfOccAtlas): SpeciesGpu {
+/** Copy one tile out of a square atlas of GRID x GRID tiles. */
+function cropTile(
+  src: Uint8Array,
+  atlasSize: number,
+  tileSize: number,
+  tileIndex: number,
+): Uint8Array<ArrayBuffer> {
+  const col = tileIndex % GRID
+  const row = Math.floor(tileIndex / GRID)
+  const out = new Uint8Array(tileSize * tileSize * 4)
+  for (let y = 0; y < tileSize; y++) {
+    const from = ((row * tileSize + y) * atlasSize + col * tileSize) * 4
+    out.set(src.subarray(from, from + tileSize * 4), y * tileSize * 4)
+  }
+  return out
+}
+
+/**
+ * Make a carpet species' straight-down view PERIODIC, at load time.
+ *
+ * The bake renders one mesh instance, and a community tile overflows its own
+ * period (0.24m of Sphagnum inside a 0.18m step). So the captured square is a
+ * tile plus its own overhang, and the overhang of the *neighbouring* tiles —
+ * which in the real mat grows back into this square — was never drawn. Show
+ * such a square as one quad and every tile edge is short of coverage: the mat
+ * gets a visible lattice of thin seams, which is exactly what it did.
+ *
+ * The fix needs no rebake, because everything missing is present elsewhere in
+ * the same image: the mesh is periodic, so the neighbour's overhang at p is the
+ * mesh's own overhang at p ± period. Compositing each texel with its lattice
+ * partners (the more-covered sample wins — a top-down view of a mat sees the
+ * fuller surface) both fills the deficit and makes the result exactly periodic,
+ * so the sampling window can then be ANY window one period wide and its edges
+ * match by construction. Coverage on the bog tile goes 0.71 -> ~0.79 and the
+ * seams disappear.
+ *
+ * The normal channel is smoothed in the same pass. Sphagnum leaflets are far
+ * below one geometry texel (1.6mm), so the bake's point-picked normal — right
+ * for a grass blade, which spans many texels — is per-texel noise here, and it
+ * turns the sun-visibility cone into salt and pepper. Averaging the decoded
+ * vectors over 5x5 is safe in this one case because a straight-down capture of
+ * a mat has every normal in the upper hemisphere (the usual "octahedral normals
+ * are not mip-averageable" trap needs opposing front/back faces to bite), and
+ * capitula are ~15 texels across, so their shape survives.
+ */
+function periodicCarpetTile(atlas: SelfOccAtlas, tileM: number): {
+  albedo: Uint8Array<ArrayBuffer>
+  geom: Uint8Array<ArrayBuffer>
+  uv: [number, number, number, number]
+} {
+  const o = TOP_TILE * 16
+  const boxCx = atlas.tileTable[o + 3]!
+  const boxCy = atlas.tileTable[o + 7]!
+  const hx = atlas.tileTable[o + 12]!
+  const hy = atlas.tileTable[o + 13]!
+  const albedo = cropTile(atlas.albedo, ATLAS_A, TILE_A, TOP_TILE)
+  const geom = cropTile(atlas.geom, ATLAS_B, TILE_B, TOP_TILE)
+  const ratio = TILE_A / TILE_B // exactly 3
+  // Period in texels, rounded on the COARSE grid so both atlases share a
+  // lattice and stay aligned.
+  const px = Math.round((tileM / (2 * hx)) * TILE_B)
+  const py = Math.round((tileM / (2 * hy)) * TILE_B)
+
+  // Coverage key at geometry resolution: the mean albedo alpha of the block.
+  const cover = new Float32Array(TILE_B * TILE_B)
+  for (let y = 0; y < TILE_B; y++) {
+    for (let x = 0; x < TILE_B; x++) {
+      let s = 0
+      for (let j = 0; j < ratio; j++) {
+        for (let i = 0; i < ratio; i++) s += albedo[((y * ratio + j) * TILE_A + x * ratio + i) * 4 + 3]!
+      }
+      cover[y * TILE_B + x] = s / (ratio * ratio)
+    }
+  }
+
+  /** Pick the lattice partner with the most coverage, per texel. */
+  const composite = (
+    src: Uint8Array,
+    size: number,
+    perX: number,
+    perY: number,
+    key: (x: number, y: number) => number,
+  ): Uint8Array<ArrayBuffer> => {
+    const out = new Uint8Array(size * size * 4)
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        let bx = x
+        let by = y
+        let best = key(x, y)
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            if (dx === 0 && dy === 0) continue
+            const sx = x + dx * perX
+            const sy = y + dy * perY
+            if (sx < 0 || sy < 0 || sx >= size || sy >= size) continue
+            const k = key(sx, sy)
+            if (k > best) {
+              best = k
+              bx = sx
+              by = sy
+            }
+          }
+        }
+        const from = (by * size + bx) * 4
+        out.set(src.subarray(from, from + 4), (y * size + x) * 4)
+      }
+    }
+    return out
+  }
+
+  const albedoOut = composite(albedo, TILE_A, px * ratio, py * ratio, (x, y) => albedo[(y * TILE_A + x) * 4 + 3]!)
+  const geomOut = composite(geom, TILE_B, px, py, (x, y) => cover[y * TILE_B + x]!)
+
+  // 5x5 vector average of the shading normals (channels r,g = octahedral).
+  // Mirrors oct_decode/oct_encode in cards.wgsl / bake_resolve.wgsl exactly.
+  const dec = (e0: number, e1: number): [number, number, number] => {
+    const eu = e0 / 127.5 - 1
+    const ev = e1 / 127.5 - 1
+    const y = 1 - Math.abs(eu) - Math.abs(ev)
+    const x = y < 0 ? (1 - Math.abs(ev)) * (eu >= 0 ? 1 : -1) : eu
+    const z = y < 0 ? (1 - Math.abs(eu)) * (ev >= 0 ? 1 : -1) : ev
+    const l = Math.hypot(x, y, z) || 1
+    return [x / l, y / l, z / l]
+  }
+  const smoothed = geomOut.slice()
+  const R = 2
+  for (let y = 0; y < TILE_B; y++) {
+    for (let x = 0; x < TILE_B; x++) {
+      let sx = 0
+      let sy = 0
+      let sz = 0
+      for (let j = -R; j <= R; j++) {
+        for (let i = -R; i <= R; i++) {
+          const cx = Math.min(TILE_B - 1, Math.max(0, x + i))
+          const cy = Math.min(TILE_B - 1, Math.max(0, y + j))
+          const t = (cy * TILE_B + cx) * 4
+          const n = dec(geomOut[t]!, geomOut[t + 1]!)
+          sx += n[0]
+          sy += n[1]
+          sz += n[2]
+        }
+      }
+      const s = Math.abs(sx) + Math.abs(sy) + Math.abs(sz) || 1
+      // Upper hemisphere only (a straight-down capture of a mat), so no fold.
+      const u = sy >= 0 ? sx / s : (1 - Math.abs(sz / s)) * (sx >= 0 ? 1 : -1)
+      const v = sy >= 0 ? sz / s : (1 - Math.abs(sx / s)) * (sz >= 0 ? 1 : -1)
+      const t = (y * TILE_B + x) * 4
+      smoothed[t] = Math.round(Math.min(255, Math.max(0, (u * 0.5 + 0.5) * 255)))
+      smoothed[t + 1] = Math.round(Math.min(255, Math.max(0, (v * 0.5 + 0.5) * 255)))
+    }
+  }
+
+  return {
+    albedo: albedoOut,
+    geom: smoothed,
+    // Sampling window = exactly one composited period, centred on the box.
+    uv: [
+      (px * ratio) / TILE_A,
+      (py * ratio) / TILE_A,
+      0.5 - boxCx / (2 * hx),
+      0.5 + boxCy / (2 * hy),
+    ],
+  }
+}
+
+/**
+ * Upload both atlases plus the tile table, and build the mip chains.
+ *
+ * A CARPET species uploads only the straight-down tile. It is the only view a
+ * ground-parallel mat can ever sample, so the other 24 would be 20MB of dead
+ * VRAM — and cropping also gives the mip chain a tile of its own instead of one
+ * shared across the 5x5 grid, so distant tiles never blend in a neighbouring
+ * view's imagery.
+ */
+function uploadAtlas(
+  ctx: ExperimentContext<typeof PARAMS>,
+  speciesId: string,
+  atlas: SelfOccAtlas,
+  carpet: boolean,
+  tileM: number,
+): SpeciesGpu {
   const { device } = ctx
   const usage = GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST
+  const sizeA = carpet ? TILE_A : ATLAS_A
+  const sizeB = carpet ? TILE_B : ATLAS_B
+  const mipsA = carpet ? Math.floor(Math.log2(TILE_A)) + 1 : MIPS_A
+  const mipsB = carpet ? Math.floor(Math.log2(TILE_B)) + 1 : MIPS_B
   const albedoTex = ctx.res.createTexture(
     {
       label: `${ctx.id}/${speciesId}/albedo`,
-      size: [ATLAS_A, ATLAS_A],
+      size: [sizeA, sizeA],
       format: 'rgba8unorm',
-      mipLevelCount: MIPS_A,
+      mipLevelCount: mipsA,
       usage,
     },
     { species: speciesId, tag: 'view-albedo' },
@@ -297,24 +546,25 @@ function uploadAtlas(ctx: ExperimentContext<typeof PARAMS>, speciesId: string, a
   const geomTex = ctx.res.createTexture(
     {
       label: `${ctx.id}/${speciesId}/geom`,
-      size: [ATLAS_B, ATLAS_B],
+      size: [sizeB, sizeB],
       format: 'rgba8unorm',
-      mipLevelCount: MIPS_B,
+      mipLevelCount: mipsB,
       usage,
     },
     { species: speciesId, tag: 'view-geometry' },
   )
+  const tile = carpet ? periodicCarpetTile(atlas, tileM) : null
   device.queue.writeTexture(
     { texture: albedoTex },
-    atlas.albedo,
-    { bytesPerRow: ATLAS_A * 4, rowsPerImage: ATLAS_A },
-    [ATLAS_A, ATLAS_A],
+    tile ? tile.albedo : atlas.albedo,
+    { bytesPerRow: sizeA * 4, rowsPerImage: sizeA },
+    [sizeA, sizeA],
   )
   device.queue.writeTexture(
     { texture: geomTex },
-    atlas.geom,
-    { bytesPerRow: ATLAS_B * 4, rowsPerImage: ATLAS_B },
-    [ATLAS_B, ATLAS_B],
+    tile ? tile.geom : atlas.geom,
+    { bytesPerRow: sizeB * 4, rowsPerImage: sizeB },
+    [sizeB, sizeB],
   )
   const tileBuffer = ctx.res.createBuffer(
     {
@@ -363,11 +613,11 @@ function uploadAtlas(ctx: ExperimentContext<typeof PARAMS>, speciesId: string, a
       pass.end()
     }
   }
-  genMips(albedoTex, MIPS_A, albedoPipe)
-  genMips(geomTex, MIPS_B, geomPipe)
+  genMips(albedoTex, mipsA, albedoPipe)
+  genMips(geomTex, mipsB, geomPipe)
   device.queue.submit([enc.finish()])
 
-  return { atlas, albedoTex, geomTex, tileBuffer }
+  return { atlas, albedoTex, geomTex, tileBuffer, carpet, carpetUv: tile?.uv ?? [1, 1, 0.5, 0.5] }
 }
 
 /** Gribb–Hartmann frustum planes from a column-major view-proj matrix. */

@@ -1,6 +1,7 @@
-// Per-stand-entry parameters shared by the cull compute pass (cull.wgsl) and
-// the impostor draw (impostor.wgsl). Written every frame by main.ts — keep the
-// field order in sync with the info[] writes there (INFO_FLOATS = 96).
+// Per-stand-entry parameters shared by the cull compute pass (cull.wgsl), the
+// impostor draw (impostor.wgsl) and the carpet draw (carpet.wgsl). Written
+// every frame by main.ts — keep the field order in sync with the info[] writes
+// there (INFO_FLOATS = 112).
 
 struct EntryInfo {
   planes: array<vec4f, 6>,  // world-space frustum planes (nx,ny,nz,d), normalized
@@ -48,7 +49,30 @@ struct EntryInfo {
   tile_px: f32,             // atlas layer resolution
   max_lod: f32,             // highest mip level in the chain
   warp_lod: f32,            // floor mip level for the warp's depth estimate
+  /**
+   * Candidate slots per scatter cell for THIS entry, rounded up to a multiple
+   * of the 64-wide workgroup. A carpet entry has carpet_div^2 of them (484 for
+   * the bog moss) — deliberately more than SCATTER_MAX_PER_CELL, which is why
+   * nothing here may hardcode 128.
+   */
+  slots_per_cell: f32,
+  // --- carpet (mat) entries only; zero for upright species -------------------
+  tile_world: f32,          // footprint_m * carpet scale (m), = the grid step
+  carpet_y: f32,            // quad plane height above the ground (m)
+  relief_m: f32,            // world metres per unit of the stored depth code
+  t_lo_x: f32,              // texcoord of the tile square's (0,0) mesh corner
+  t_lo_y: f32,
+  t_span_x: f32,            // texcoord extent of one tile period
+  t_span_y: f32,
+  t_per_m_x: f32,           // texcoord shift per world metre in the tile frame
+  t_per_m_y: f32,
+  carpet_alpha: f32,        // alpha reference for mat tiles (NOT alpha_cut)
+  carpet_layer: f32,        // atlas layer holding the straight-down view
+  carpet_push: f32,         // metres toward the camera when writing frag depth
   _pad0: f32,
   _pad1: f32,
   _pad2: f32,
+  _pad3: f32,
+  _pad4: f32,
+  _pad5: f32,
 }

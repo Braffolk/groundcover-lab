@@ -1,34 +1,54 @@
 import cullSrc from './shaders/cull.wgsl'
 import prismsSrc from './shaders/prisms.wgsl'
+import carpetCullSrc from './shaders/carpet_cull.wgsl'
+import carpetSrc from './shaders/carpet.wgsl'
 import mipgenSrc from './shaders/mipgen.wgsl'
 import { ATLAS, MIP_LEVELS, loadSpeciesPrisms, type PrismAtlas } from './bake.ts'
 import {
+  CARPET_H,
+  CARPET_MARGIN,
+  CARPET_MIPS,
+  CARPET_TILE_PX,
+  CARPET_W,
+  N_SLICE,
+  loadSpeciesCarpet,
+  type CarpetAtlas,
+} from './carpet.ts'
+import {
   SCATTER_CELL_SIZE,
   SCATTER_MAX_PER_CELL,
+  standEntrySlots,
   type Experiment,
   type ExperimentContext,
   type FrameInfo,
+  type StandSpecies,
   type ViewTargets,
 } from '@harness'
 import type { PARAMS } from './manifest.ts'
 
 /**
- * Slice prisms. Startup: each species' prism atlas (8 azimuths x 3 vertical
- * depth slabs, 8 merged cards, 3 horizontal height slabs, 1 merged top;
- * albedo+coverage rgba8, oct normals rg8) is loaded from mesh/baked / OPFS or
- * baked in-browser from the raw mesh, uploaded and mipped.
+ * Slice prisms. Startup: each stand species is loaded (or baked in-browser
+ * from the raw mesh) in ONE of two shapes and uploaded + mipped:
  *
- * Per frame: one compute pass evaluates the shared scatter over a
+ *  * upright plants — the prism atlas (4 baked azimuths x 3 vertical depth
+ *    slabs mirrored to 8 views, 8 merged cards, 3 horizontal height slabs,
+ *    1 merged top).
+ *  * CARPET species (stand carpetDiv > 0, i.e. the bog's Sphagnum) — the
+ *    carpet atlas: five horizontal slices of ONE periodic tile plus a merged
+ *    top, cropped to the tile square. A mat has no silhouette, so every texel
+ *    an azimuth would have cost goes into tile detail instead (0.35mm/texel).
+ *
+ * Per frame: one compute pass per entry evaluates the shared scatter over a
  * camera-centered cell region, frustum-culls, and compacts survivors into TWO
- * indirect draws — near plants as three depth prisms placed at their baked
- * centroids, far plants as a single merged card. Per-frame cost is O(visible
- * region), independent of the stand's plant count; the prism list is bounded
- * by a disc of radius slabDist, so it does not grow with the region either.
+ * indirect draws — near plants as three depth prisms (or a carpet tile as its
+ * five-slice stack), far ones as a single merged card. Per-frame cost is
+ * O(visible region), independent of the stand's plant count.
  */
 
 const CELL = SCATTER_CELL_SIZE
 const REGION_MAX = 128 // keep equal to the manifest's regionRadius max
 const SLAB_DIST_MAX = 20 // keep equal to the manifest's slabDist max
+const SLICE_DIST_MAX = 24 // keep equal to the manifest's carpetSliceDist max
 const INFO_FLOATS = 256
 /**
  * Floats 0..47 of EntryInfo change every frame (frustum, region, params);
@@ -36,21 +56,31 @@ const INFO_FLOATS = 256
  * and geometry boxes) and are uploaded once at startup.
  */
 const INFO_DYNAMIC_FLOATS = 48
+/** CarpetInfo is small enough to rewrite whole; slice heights live at 52..59. */
+const CARPET_INFO_FLOATS = 60
 // Horizontal prisms only earn their fill from genuinely above the canopy top
 // (see the signed elevation in prisms.wgsl); below this the canopy is
 // described entirely by the vertical prisms and a lid would only read as a
 // pale cutout floating among them.
 const TOP_ELEV_LO = 0.15
 const TOP_ELEV_HI = 0.45
+/**
+ * Alpha-test reference for carpet tiles, INSTEAD of the params' alphaRef. A mat
+ * is a closed surface and must not dissolve with distance: tile coverage is
+ * ~80% up close, but the mip chain pulls each slice toward its own mean (a
+ * fifth of the tile), and at the 0.4 grass reference whole distant tiles then
+ * fail the test and punch holes in the carpet. Low reference = MORE hard-edged
+ * opaque coverage, which is the opposite of dithering it away.
+ */
+const CARPET_ALPHA_REF = 0.06
 
 interface SpeciesGpu {
-  atlas: PrismAtlas
   albedoTex: GPUTexture
   normalTex: GPUTexture
 }
 
-interface EntryGpu {
-  gpu: SpeciesGpu
+interface PrismEntry {
+  kind: 'prism'
   nearCapacity: number
   farCapacity: number
   infoBuffer: GPUBuffer
@@ -58,8 +88,30 @@ interface EntryGpu {
   cullBindGroup: GPUBindGroup
   nearDrawBindGroup: GPUBindGroup
   farDrawBindGroup: GPUBindGroup
+  atlas: PrismAtlas
   slotsPerFrame: number
 }
+
+interface CarpetEntry {
+  kind: 'carpet'
+  nearCapacity: number
+  farCapacity: number
+  infoBuffer: GPUBuffer
+  indirectBuffer: GPUBuffer
+  cullBindGroup: GPUBindGroup
+  nearDrawBindGroup: GPUBindGroup
+  farDrawBindGroup: GPUBindGroup
+  atlas: CarpetAtlas
+  /** Constant tile scale of this carpet (grid step / tile footprint). */
+  tileScale: number
+  /** carpetDiv^2 rounded up to a multiple of 64 (see carpet_cull.wgsl). */
+  paddedSlots: number
+  slotsPerFrame: number
+}
+
+type EntryGpu = PrismEntry | CarpetEntry
+
+const isCarpetEntry = (e: StandSpecies): boolean => (e.carpetDiv ?? 0) > 0
 
 export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Experiment> {
   const { device } = ctx
@@ -74,15 +126,42 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
     addressModeV: 'clamp-to-edge',
   })
 
-  // --- species atlases (sequential: the poa bake transiently needs ~400MB) --
-  const speciesGpu = new Map<string, SpeciesGpu>()
+  // --- species atlases (sequential: a moss bake transiently needs ~500MB) ---
+  const prismAtlases = new Map<string, { atlas: PrismAtlas; gpu: SpeciesGpu }>()
+  const carpetAtlases = new Map<string, { atlas: CarpetAtlas; gpu: SpeciesGpu }>()
   for (const entry of ctx.stand.species) {
-    if (speciesGpu.has(entry.species)) continue
-    const atlas = await loadSpeciesPrisms(ctx, entry.species)
-    speciesGpu.set(entry.species, uploadAtlas(ctx, entry.species, atlas))
+    if (isCarpetEntry(entry)) {
+      if (carpetAtlases.has(entry.species)) continue
+      const atlas = await loadSpeciesCarpet(ctx, entry.species)
+      carpetAtlases.set(entry.species, {
+        atlas,
+        gpu: uploadAtlas(ctx, entry.species, 'carpet', {
+          width: CARPET_W,
+          height: CARPET_H,
+          mips: CARPET_MIPS,
+          albedo: atlas.albedo,
+          normalOct: atlas.normalOct,
+        }),
+      })
+    } else {
+      if (prismAtlases.has(entry.species)) continue
+      const atlas = await loadSpeciesPrisms(ctx, entry.species)
+      prismAtlases.set(entry.species, {
+        atlas,
+        gpu: uploadAtlas(ctx, entry.species, 'prism', {
+          width: ATLAS,
+          height: ATLAS,
+          mips: MIP_LEVELS,
+          albedo: atlas.albedo,
+          normalOct: atlas.normalOct,
+        }),
+      })
+    }
   }
 
   // --- bind group layouts / pipelines ---------------------------------------
+  // Both paths use the same LAYOUTS; only the WGSL structs behind them differ
+  // (16B PlantInst vs a 4B packed grid node).
   const cullBgl = device.createBindGroupLayout({
     label: `${ctx.id}/cull-bgl`,
     entries: [
@@ -105,16 +184,12 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
 
   const sideMax = Math.ceil((2 * REGION_MAX) / CELL) + 1
   const slotsMax = sideMax * sideMax * SCATTER_MAX_PER_CELL
+  // Cells the stand itself owns — outside them the scatter is empty, so a
+  // carpet's instance capacity must not be sized for a bigger region.
+  const standSide = Math.floor(ctx.stand.radius / CELL) * 2 + 1
+  const carpetSide = Math.min(sideMax, standSide)
 
   const entries: EntryGpu[] = ctx.stand.species.map((standEntry, entryIndex) => {
-    const gpu = speciesGpu.get(standEntry.species)!
-    const density = Math.min(standEntry.density, 8)
-    const farCapacity = Math.ceil(slotsMax * (density / 8) * 1.06) + 1024
-    // The prism list only ever holds the disc of radius slabDist around the
-    // camera — that is what keeps the expensive LOD bounded no matter how far
-    // the region reaches or how many plants the stand has.
-    const nearCapacity = Math.ceil(Math.PI * (SLAB_DIST_MAX * standEntry.scaleMax) ** 2 * density * 1.3) + 1024
-
     const infoBuffer = ctx.res.createBuffer(
       {
         label: `${ctx.id}/info-${entryIndex}`,
@@ -122,14 +197,6 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
       },
       { species: standEntry.species, tag: 'entry-info' },
-    )
-    const nearBuffer = ctx.res.createBuffer(
-      { label: `${ctx.id}/near-${entryIndex}`, size: nearCapacity * 16, usage: GPUBufferUsage.STORAGE },
-      { species: standEntry.species, tag: 'prism-instances' },
-    )
-    const farBuffer = ctx.res.createBuffer(
-      { label: `${ctx.id}/far-${entryIndex}`, size: farCapacity * 16, usage: GPUBufferUsage.STORAGE },
-      { species: standEntry.species, tag: 'card-instances' },
     )
     const indirectBuffer = ctx.res.createBuffer(
       {
@@ -139,77 +206,162 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       },
       { species: standEntry.species, tag: 'indirect-args' },
     )
-    const cullBindGroup = device.createBindGroup({
-      label: `${ctx.id}/cull-bg-${entryIndex}`,
-      layout: cullBgl,
-      entries: [
-        { binding: 0, resource: { buffer: infoBuffer } },
-        { binding: 1, resource: { buffer: nearBuffer } },
-        { binding: 2, resource: { buffer: farBuffer } },
-        { binding: 3, resource: { buffer: indirectBuffer } },
-      ],
-    })
-    const drawBindGroup = (instances: GPUBuffer, tag: string): GPUBindGroup =>
-      device.createBindGroup({
-        label: `${ctx.id}/${tag}-bg-${entryIndex}`,
-        layout: drawBgl,
-        entries: [
-          { binding: 0, resource: { buffer: infoBuffer } },
-          { binding: 1, resource: { buffer: instances } },
-          { binding: 2, resource: gpu.albedoTex.createView() },
-          { binding: 3, resource: gpu.normalTex.createView() },
-          { binding: 4, resource: sampler },
-        ],
-      })
+    const bindGroups = (
+      near: GPUBuffer,
+      far: GPUBuffer,
+      gpu: SpeciesGpu,
+    ): Pick<PrismEntry, 'cullBindGroup' | 'nearDrawBindGroup' | 'farDrawBindGroup'> => {
+      const draw = (instances: GPUBuffer, tag: string): GPUBindGroup =>
+        device.createBindGroup({
+          label: `${ctx.id}/${tag}-bg-${entryIndex}`,
+          layout: drawBgl,
+          entries: [
+            { binding: 0, resource: { buffer: infoBuffer } },
+            { binding: 1, resource: { buffer: instances } },
+            { binding: 2, resource: gpu.albedoTex.createView() },
+            { binding: 3, resource: gpu.normalTex.createView() },
+            { binding: 4, resource: sampler },
+          ],
+        })
+      return {
+        cullBindGroup: device.createBindGroup({
+          label: `${ctx.id}/cull-bg-${entryIndex}`,
+          layout: cullBgl,
+          entries: [
+            { binding: 0, resource: { buffer: infoBuffer } },
+            { binding: 1, resource: { buffer: near } },
+            { binding: 2, resource: { buffer: far } },
+            { binding: 3, resource: { buffer: indirectBuffer } },
+          ],
+        }),
+        nearDrawBindGroup: draw(near, 'near'),
+        farDrawBindGroup: draw(far, 'far'),
+      }
+    }
+
+    if (isCarpetEntry(standEntry)) {
+      const { atlas, gpu } = carpetAtlases.get(standEntry.species)!
+      const carpetDiv = standEntry.carpetDiv!
+      // TWO DIFFERENT NUMBERS. `slots` is how many candidate nodes the cull
+      // must EVALUATE per cell — carpetDiv^2 (484 at life size), NEVER the
+      // 128-slot scatter budget, or three quarters of the mat never exists.
+      // Capacity only has to hold the SURVIVORS: the three Sphagnum states
+      // partition the wetness axis, so one entry owns roughly `wetWidth` of
+      // the nodes (measured on the bog: 0.16 / 0.50 / 0.34 of 1.16M nodes for
+      // seed 42). 2.2x that is the headroom.
+      const slots = standEntrySlots(standEntry)
+      const paddedSlots = Math.ceil(slots / 64) * 64
+      const band = Math.min(1, (standEntry.wetWidth ?? 1) * 2.2)
+      // A tile is 4 BYTES (cell | slot | quarter turn), not a 16B instance —
+      // see carpet_cull.wgsl. That is what lets a 1.1M-tile mat spend its VRAM
+      // on the atlas instead of on a list of positions.
+      const farCapacity = Math.ceil(carpetSide * carpetSide * slots * band * 1.06) + 4096
+      const nodesPerM2 = slots / (CELL * CELL)
+      const nearCapacity = Math.ceil(Math.PI * SLICE_DIST_MAX ** 2 * nodesPerM2 * band * 1.3) + 1024
+      const nearBuffer = ctx.res.createBuffer(
+        { label: `${ctx.id}/near-${entryIndex}`, size: nearCapacity * 4, usage: GPUBufferUsage.STORAGE },
+        { species: standEntry.species, tag: 'stack-tiles' },
+      )
+      const farBuffer = ctx.res.createBuffer(
+        { label: `${ctx.id}/far-${entryIndex}`, size: farCapacity * 4, usage: GPUBufferUsage.STORAGE },
+        { species: standEntry.species, tag: 'card-tiles' },
+      )
+      return {
+        kind: 'carpet',
+        nearCapacity,
+        farCapacity,
+        infoBuffer,
+        indirectBuffer,
+        atlas,
+        // The stand's own constant scale: a tile exactly fills its grid step.
+        // (carpetScale() is not exported from @harness, so it is recomputed
+        // here from the baked tile size — same expression.)
+        tileScale: CELL / carpetDiv / atlas.tileM,
+        paddedSlots,
+        slotsPerFrame: 0,
+        ...bindGroups(nearBuffer, farBuffer, gpu),
+      }
+    }
+
+    const { atlas, gpu } = prismAtlases.get(standEntry.species)!
+    const density = Math.min(standEntry.density, 8)
+    const farCapacity = Math.ceil(slotsMax * (density / 8) * 1.06) + 1024
+    // The prism list only ever holds the disc of radius slabDist around the
+    // camera — that is what keeps the expensive LOD bounded no matter how far
+    // the region reaches or how many plants the stand has.
+    const nearCapacity = Math.ceil(Math.PI * (SLAB_DIST_MAX * standEntry.scaleMax) ** 2 * density * 1.3) + 1024
+    const nearBuffer = ctx.res.createBuffer(
+      { label: `${ctx.id}/near-${entryIndex}`, size: nearCapacity * 16, usage: GPUBufferUsage.STORAGE },
+      { species: standEntry.species, tag: 'prism-instances' },
+    )
+    const farBuffer = ctx.res.createBuffer(
+      { label: `${ctx.id}/far-${entryIndex}`, size: farCapacity * 16, usage: GPUBufferUsage.STORAGE },
+      { species: standEntry.species, tag: 'card-instances' },
+    )
     // Baked atlas tables never change — upload them once, not every frame.
     const tail = new Float32Array(INFO_FLOATS - INFO_DYNAMIC_FLOATS)
-    tail.set(gpu.atlas.slabDepth, 0)
-    tail.set(gpu.atlas.topHeight, 12)
-    tail.set(gpu.atlas.uvRect, 16)
-    tail.set(gpu.atlas.geoRect, 112)
+    tail.set(atlas.slabDepth, 0)
+    tail.set(atlas.topHeight, 12)
+    tail.set(atlas.uvRect, 16)
+    tail.set(atlas.geoRect, 112)
     device.queue.writeBuffer(infoBuffer, INFO_DYNAMIC_FLOATS * 4, tail)
 
     return {
-      gpu,
+      kind: 'prism',
       nearCapacity,
       farCapacity,
       infoBuffer,
       indirectBuffer,
-      cullBindGroup,
-      nearDrawBindGroup: drawBindGroup(nearBuffer, 'near'),
-      farDrawBindGroup: drawBindGroup(farBuffer, 'far'),
+      atlas,
       slotsPerFrame: 0,
+      ...bindGroups(nearBuffer, farBuffer, gpu),
     }
   })
 
-  let cullPipeline!: GPUComputePipeline
-  let nearPipeline!: GPURenderPipeline
-  let farPipeline!: GPURenderPipeline
+  const hasPrisms = entries.some((e) => e.kind === 'prism')
+  const hasCarpets = entries.some((e) => e.kind === 'carpet')
+
+  let cullPipeline: GPUComputePipeline | null = null
+  let nearPipeline: GPURenderPipeline | null = null
+  let farPipeline: GPURenderPipeline | null = null
+  let carpetCullPipeline: GPUComputePipeline | null = null
+  let carpetNearPipeline: GPURenderPipeline | null = null
+  let carpetFarPipeline: GPURenderPipeline | null = null
   const build = (): void => {
-    cullPipeline = device.createComputePipeline({
-      label: `${ctx.id}/cull`,
-      layout: device.createPipelineLayout({
-        label: `${ctx.id}/cull-pl`,
-        bindGroupLayouts: [ctx.frame.layout, cullBgl],
-      }),
-      compute: { module: ctx.shaders.module(cullSrc), entryPoint: 'cs_cull' },
-    })
-    const module = ctx.shaders.module(prismsSrc)
+    const compute = (label: string, src: typeof cullSrc, entryPoint: string): GPUComputePipeline =>
+      device.createComputePipeline({
+        label: `${ctx.id}/${label}`,
+        layout: device.createPipelineLayout({
+          label: `${ctx.id}/${label}-pl`,
+          bindGroupLayouts: [ctx.frame.layout, cullBgl],
+        }),
+        compute: { module: ctx.shaders.module(src), entryPoint },
+      })
     const drawPl = device.createPipelineLayout({
       label: `${ctx.id}/draw-pl`,
       bindGroupLayouts: [ctx.frame.layout, drawBgl],
     })
-    const mkDraw = (label: string, entryPoint: string): GPURenderPipeline =>
-      device.createRenderPipeline({
+    const mkDraw = (label: string, src: typeof prismsSrc, vs: string, fs: string): GPURenderPipeline => {
+      const module = ctx.shaders.module(src)
+      return device.createRenderPipeline({
         label: `${ctx.id}/${label}`,
         layout: drawPl,
-        vertex: { module, entryPoint },
-        fragment: { module, entryPoint: 'fs_main', targets: [{ format: ctx.colorFormat }] },
+        vertex: { module, entryPoint: vs },
+        fragment: { module, entryPoint: fs, targets: [{ format: ctx.colorFormat }] },
         primitive: { topology: 'triangle-list', cullMode: 'none' },
         depthStencil: { format: ctx.depthFormat, depthCompare: 'less', depthWriteEnabled: true },
       })
-    nearPipeline = mkDraw('prisms-near', 'vs_near')
-    farPipeline = mkDraw('prisms-far', 'vs_far')
+    }
+    if (hasPrisms) {
+      cullPipeline = compute('cull', cullSrc, 'cs_cull')
+      nearPipeline = mkDraw('prisms-near', prismsSrc, 'vs_near', 'fs_main')
+      farPipeline = mkDraw('prisms-far', prismsSrc, 'vs_far', 'fs_main')
+    }
+    if (hasCarpets) {
+      carpetCullPipeline = compute('carpet-cull', carpetCullSrc, 'cs_carpet_cull')
+      carpetNearPipeline = mkDraw('carpet-near', carpetSrc, 'vs_carpet_near', 'fs_carpet')
+      carpetFarPipeline = mkDraw('carpet-far', carpetSrc, 'vs_carpet_far', 'fs_carpet')
+    }
   }
   build()
   const unsubscribe = ctx.shaders.onReload(build)
@@ -217,6 +369,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
   const cellMin = Math.floor(-ctx.stand.radius / CELL)
   const cellMax = Math.floor(ctx.stand.radius / CELL)
   const info = new Float32Array(INFO_DYNAMIC_FLOATS)
+  const carpetInfo = new Float32Array(CARPET_INFO_FLOATS)
   const planes = new Float32Array(24)
   const indirectReset = new Uint32Array(8)
 
@@ -233,15 +386,54 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       const sideX = Math.max(0, x1 - x0 + 1)
       const sideZ = Math.max(0, z1 - z0 + 1)
       frustumPlanes(frame.camera.viewProj, planes)
+      const camHeight = cam.y - ctx.scene.terrain.height(cam.x, cam.z)
 
       const tops = ctx.params.topCards
-      indirectReset[0] = tops ? 36 : 18
-      indirectReset[1] = 0
-      indirectReset[4] = tops ? 12 : 6
-      indirectReset[5] = 0
-
       entries.forEach((entry, entryIndex) => {
-        const a = entry.gpu.atlas
+        if (entry.kind === 'carpet') {
+          const a = entry.atlas
+          const s = entry.tileScale
+          carpetInfo.set(planes, 0)
+          carpetInfo[24] = x0
+          carpetInfo[25] = z0
+          carpetInfo[26] = sideX
+          carpetInfo[27] = sideZ
+          carpetInfo[28] = ctx.seed
+          carpetInfo[29] = entryIndex
+          carpetInfo[30] = R
+          carpetInfo[31] = entry.nearCapacity
+          carpetInfo[32] = entry.farCapacity
+          carpetInfo[33] = entry.paddedSlots
+          carpetInfo[34] = ctx.params.carpetSliceDist
+          carpetInfo[35] = CARPET_ALPHA_REF
+          carpetInfo[36] = a.tileM
+          carpetInfo[37] = s
+          carpetInfo[38] = a.y0
+          carpetInfo[39] = a.y1
+          carpetInfo[40] = CARPET_TILE_PX / CARPET_W
+          carpetInfo[41] = CARPET_TILE_PX / CARPET_H
+          carpetInfo[42] = CARPET_MARGIN / CARPET_TILE_PX
+          carpetInfo[43] = N_SLICE
+          carpetInfo[44] = ctx.params.carpetAO
+          // Tile bounding sphere from the FOOTPRINT (never from height_scale:
+          // a Sphagnum tile is 0.07m tall and 0.24m wide).
+          carpetInfo[45] = (a.tileM * 0.7072 + (a.y1 - a.y0)) * s * 1.05
+          carpetInfo[46] = camHeight
+          carpetInfo[47] = ctx.params.carpetReliefRef
+          carpetInfo[48] = ctx.params.carpetNormalGain
+          carpetInfo.set(a.sliceH, 52)
+          device.queue.writeBuffer(entry.infoBuffer, 0, carpetInfo)
+          // 5 relief slices + the base card that guarantees coverage.
+          indirectReset[0] = 6 * (N_SLICE + 1)
+          indirectReset[1] = 0
+          indirectReset[4] = 6
+          indirectReset[5] = 0
+          device.queue.writeBuffer(entry.indirectBuffer, 0, indirectReset)
+          entry.slotsPerFrame = sideX * sideZ * entry.paddedSlots
+          return
+        }
+
+        const a = entry.atlas
         info.set(planes, 0)
         info[24] = x0
         info[25] = z0
@@ -265,6 +457,10 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         info[43] = TOP_ELEV_LO
         info[44] = TOP_ELEV_HI
         device.queue.writeBuffer(entry.infoBuffer, 0, info)
+        indirectReset[0] = tops ? 36 : 18
+        indirectReset[1] = 0
+        indirectReset[4] = tops ? 12 : 6
+        indirectReset[5] = 0
         device.queue.writeBuffer(entry.indirectBuffer, 0, indirectReset)
         entry.slotsPerFrame = sideX * sideZ * SCATTER_MAX_PER_CELL
       })
@@ -272,12 +468,22 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
 
     encode(enc: GPUCommandEncoder, _frame: FrameInfo, targets: ViewTargets): void {
       const cull = ctx.timing.computePass(enc, 'cull')
-      cull.setPipeline(cullPipeline)
       cull.setBindGroup(0, ctx.frame.bindGroup)
-      for (const entry of entries) {
-        if (entry.slotsPerFrame === 0) continue // camera outside the stand
-        cull.setBindGroup(1, entry.cullBindGroup)
-        cull.dispatchWorkgroups(Math.ceil(entry.slotsPerFrame / 64))
+      if (cullPipeline) {
+        cull.setPipeline(cullPipeline)
+        for (const entry of entries) {
+          if (entry.kind !== 'prism' || entry.slotsPerFrame === 0) continue
+          cull.setBindGroup(1, entry.cullBindGroup)
+          cull.dispatchWorkgroups(Math.ceil(entry.slotsPerFrame / 64))
+        }
+      }
+      if (carpetCullPipeline) {
+        cull.setPipeline(carpetCullPipeline)
+        for (const entry of entries) {
+          if (entry.kind !== 'carpet' || entry.slotsPerFrame === 0) continue
+          cull.setBindGroup(1, entry.cullBindGroup)
+          cull.dispatchWorkgroups(Math.ceil(entry.slotsPerFrame / 64))
+        }
       }
       cull.end()
 
@@ -286,18 +492,25 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         depthStencilAttachment: { view: targets.depthView, depthLoadOp: 'load', depthStoreOp: 'store' },
       })
       pass.setBindGroup(0, ctx.frame.bindGroup)
-      // Prisms first: they are the nearest geometry in the frame, so the depth
-      // they lay down lets early-z reject the merged cards behind them.
-      pass.setPipeline(nearPipeline)
-      for (const entry of entries) {
-        pass.setBindGroup(1, entry.nearDrawBindGroup)
-        pass.drawIndirect(entry.indirectBuffer, 0)
+      // Near buckets first: they are the closest geometry in the frame, so the
+      // depth they lay down lets early-z reject the merged cards behind them.
+      const drawGroup = (
+        pipeline: GPURenderPipeline | null,
+        kind: EntryGpu['kind'],
+        bucket: 'near' | 'far',
+      ): void => {
+        if (!pipeline) return
+        pass.setPipeline(pipeline)
+        for (const entry of entries) {
+          if (entry.kind !== kind) continue
+          pass.setBindGroup(1, bucket === 'near' ? entry.nearDrawBindGroup : entry.farDrawBindGroup)
+          pass.drawIndirect(entry.indirectBuffer, bucket === 'near' ? 0 : 16)
+        }
       }
-      pass.setPipeline(farPipeline)
-      for (const entry of entries) {
-        pass.setBindGroup(1, entry.farDrawBindGroup)
-        pass.drawIndirect(entry.indirectBuffer, 16)
-      }
+      drawGroup(nearPipeline, 'prism', 'near')
+      drawGroup(carpetNearPipeline, 'carpet', 'near')
+      drawGroup(farPipeline, 'prism', 'far')
+      drawGroup(carpetFarPipeline, 'carpet', 'far')
       pass.end()
     },
 
@@ -308,41 +521,54 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
   }
 }
 
+interface AtlasUpload {
+  width: number
+  height: number
+  mips: number
+  albedo: Uint8Array<ArrayBuffer>
+  normalOct: Uint8Array<ArrayBuffer>
+}
+
 /** Upload atlas mip 0 and generate the mip chain on the GPU. */
-function uploadAtlas(ctx: ExperimentContext<typeof PARAMS>, speciesId: string, atlas: PrismAtlas): SpeciesGpu {
+function uploadAtlas(
+  ctx: ExperimentContext<typeof PARAMS>,
+  speciesId: string,
+  kind: 'prism' | 'carpet',
+  src: AtlasUpload,
+): SpeciesGpu {
   const { device } = ctx
   const usage = GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_DST
   const albedoTex = ctx.res.createTexture(
     {
       label: `${ctx.id}/${speciesId}/albedo`,
-      size: [ATLAS, ATLAS],
+      size: [src.width, src.height],
       format: 'rgba8unorm',
-      mipLevelCount: MIP_LEVELS,
+      mipLevelCount: src.mips,
       usage,
     },
-    { species: speciesId, tag: 'prism-albedo' },
+    { species: speciesId, tag: `${kind}-albedo` },
   )
   const normalTex = ctx.res.createTexture(
     {
       label: `${ctx.id}/${speciesId}/normal`,
-      size: [ATLAS, ATLAS],
+      size: [src.width, src.height],
       format: 'rg8unorm',
-      mipLevelCount: MIP_LEVELS,
+      mipLevelCount: src.mips,
       usage,
     },
-    { species: speciesId, tag: 'prism-normal' },
+    { species: speciesId, tag: `${kind}-normal` },
   )
   device.queue.writeTexture(
     { texture: albedoTex },
-    atlas.albedo,
-    { bytesPerRow: ATLAS * 4, rowsPerImage: ATLAS },
-    [ATLAS, ATLAS],
+    src.albedo,
+    { bytesPerRow: src.width * 4, rowsPerImage: src.height },
+    [src.width, src.height],
   )
   device.queue.writeTexture(
     { texture: normalTex },
-    atlas.normalOct,
-    { bytesPerRow: ATLAS * 2, rowsPerImage: ATLAS },
-    [ATLAS, ATLAS],
+    src.normalOct,
+    { bytesPerRow: src.width * 2, rowsPerImage: src.height },
+    [src.width, src.height],
   )
 
   const module = ctx.shaders.module(mipgenSrc)
@@ -364,7 +590,7 @@ function uploadAtlas(ctx: ExperimentContext<typeof PARAMS>, speciesId: string, a
 
   const enc = device.createCommandEncoder({ label: `${ctx.id}/mipgen` })
   const genMips = (tex: GPUTexture, pipeline: GPURenderPipeline): void => {
-    for (let level = 1; level < MIP_LEVELS; level++) {
+    for (let level = 1; level < src.mips; level++) {
       const srcView = tex.createView({ baseMipLevel: level - 1, mipLevelCount: 1 })
       const dstView = tex.createView({ baseMipLevel: level, mipLevelCount: 1 })
       const bg = device.createBindGroup({
@@ -386,7 +612,7 @@ function uploadAtlas(ctx: ExperimentContext<typeof PARAMS>, speciesId: string, a
   genMips(normalTex, normalPipe)
   device.queue.submit([enc.finish()])
 
-  return { atlas, albedoTex, normalTex }
+  return { albedoTex, normalTex }
 }
 
 /** Gribb–Hartmann frustum planes from a column-major view-proj matrix. */
