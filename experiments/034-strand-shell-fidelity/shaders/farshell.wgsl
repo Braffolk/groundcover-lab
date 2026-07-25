@@ -1,0 +1,100 @@
+#include "src/wgsl/hash.wgsl"
+#include "src/wgsl/terrain.wgsl"
+#include "src/wgsl/wind.wgsl"
+#include "src/wgsl/lighting.wgsl"
+#include "src/wgsl/debug.wgsl"
+#include "./common.wgsl"
+
+// Beyond r_outer the meadow IS one terrain-conformal canopy shell: a
+// camera-centred geometric annulus (~2.7 k tris) draped at the stand's mixed
+// canopy height, coloured by the baked per-species canopy albedos. Its normal
+// is perturbed by the same world-anchored mottle that colours it, so the far
+// field lights with variation instead of reading as one flat sheet.
+
+@group(1) @binding(0) var<uniform> globals: Globals;
+
+struct VIn {
+  @location(0) polar: vec2f, // (angle, ring-row index)
+}
+
+struct VOut {
+  @builtin(position) pos: vec4f,
+  @location(0) world: vec3f,
+  @location(1) ramp: f32,
+}
+
+@vertex
+fn vs_main(in: VIn) -> VOut {
+  let dir = vec2f(cos(in.polar.x), sin(in.polar.x));
+  let radius = globals.shell_in * pow(1.285, in.polar.y);
+  var xz = frame.camera_pos.xz + dir * radius;
+  // The meadow ends at the stand boundary: clamping collapses outside verts.
+  xz = clamp(xz, vec2f(-globals.stand_radius), vec2f(globals.stand_radius));
+  let r_eff = length(xz - frame.camera_pos.xz);
+  let ramp = smoothstep(globals.shell_in, globals.shell_in + 8.0, r_eff);
+
+  var y = terrain_height(xz) + 0.03 + globals.shell_h * ramp;
+  let bob = sin(frame.time * 1.9 - dot(xz, frame.wind_dir) * 0.35)
+    * frame.wind_strength * wind_gust(frame.time) * 0.06 * globals.shell_bob;
+  y += bob * ramp;
+
+  var out: VOut;
+  out.world = vec3f(xz.x, y, xz.y);
+  out.pos = frame.view_proj * vec4f(out.world, 1.0);
+  out.ramp = ramp;
+  return out;
+}
+
+fn vnoise(p: vec2f, salt: u32) -> f32 {
+  let i = vec2i(floor(p));
+  let f = fract(p);
+  let s = f * f * (3.0 - 2.0 * f);
+  let h00 = hash_f32(hash3(bitcast<u32>(i.x), bitcast<u32>(i.y), salt));
+  let h10 = hash_f32(hash3(bitcast<u32>(i.x + 1), bitcast<u32>(i.y), salt));
+  let h01 = hash_f32(hash3(bitcast<u32>(i.x), bitcast<u32>(i.y + 1), salt));
+  let h11 = hash_f32(hash3(bitcast<u32>(i.x + 1), bitcast<u32>(i.y + 1), salt));
+  return mix(mix(h00, h10, s.x), mix(h01, h11, s.x), s.y);
+}
+
+@fragment
+fn fs_main(in: VOut) -> @location(0) vec4f {
+  var color = vec3f(0.0);
+  var wsum = 0.0;
+  for (var s = 0u; s < 3u; s++) {
+    let dens = globals.species_density[s];
+    if (dens <= 0.0) { continue; }
+    let n = vnoise(in.world.xz * 0.7 + f32(s) * 37.31, 11u + s);
+    let w = dens * (0.3 + 0.7 * n * n);
+    color += globals.canopy[s].rgb * w;
+    wsum += w;
+  }
+  if (wsum <= 1e-5) { discard; }
+  color /= wsum;
+  let broad = vnoise(in.world.xz * 0.21, 7u);
+  let fine = vnoise(in.world.xz * 3.9, 23u);
+  color *= 0.8 + 0.35 * broad;
+  color *= 0.85 + 0.3 * fine;
+
+  // Canopy normal: terrain normal softened toward +Y (a canopy of leaves reads
+  // flatter than the ground under it), then tilted by the mottle gradient so
+  // the far field has light and shade instead of one constant value.
+  let e = 0.35;
+  let gx = vnoise((in.world.xz + vec2f(e, 0.0)) * 0.7, 12u) - vnoise((in.world.xz - vec2f(e, 0.0)) * 0.7, 12u);
+  let gz = vnoise((in.world.xz + vec2f(0.0, e)) * 0.7, 12u) - vnoise((in.world.xz - vec2f(0.0, e)) * 0.7, 12u);
+  let tn = terrain_normal(in.world.xz);
+  let n = normalize(tn + vec3f(-gx * 0.9, 1.2, -gz * 0.9));
+
+  let albedo = color * 0.72;
+  var lit = light_surface(albedo, n, in.world);
+  if (debug_mode() == DEBUG_OFF) {
+    lit = apply_fog(lit, in.world);
+  }
+
+  let b = max(abs(in.world.x), abs(in.world.z));
+  let alpha = (1.0 - smoothstep(globals.stand_radius - 3.0, globals.stand_radius, b)) * in.ramp;
+  if (alpha < 0.01) { discard; }
+  // Debug views paint the shell opaquely — otherwise its normals/albedo would
+  // come back blended with whatever the base pass left behind.
+  let out_alpha = select(1.0, alpha, debug_mode() == DEBUG_OFF);
+  return vec4f(debug_shade(lit, albedo, n, alpha, in.world), out_alpha);
+}
