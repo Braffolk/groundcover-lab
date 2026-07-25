@@ -49,6 +49,26 @@ fn rot_yaw(v: vec3f, a: f32) -> vec3f {
   return vec3f(c * v.x + s * v.z, v.y, -s * v.x + c * v.z);
 }
 
+/// Albedo out of a card-atlas tap. `a` is COVERAGE, and it must not be divided
+/// out here — `buildMips` in bake.ts already normalises by it:
+///
+///     rgb = sum(rgb_i * a_i) / sum(a_i)      a = sum(a_i) / 4
+///
+/// i.e. the stored rgb is the coverage-weighted mean colour of the *covered*
+/// texels, un-premultiplied, at every mip level. Dividing by `a` again inflated
+/// the albedo by 1/coverage, and coverage falls monotonically as the mip chain
+/// deepens — so the field got brighter the further away it was, up to 2.42x at
+/// mip 5 with 87% of texels clipping to white. Measured mean luma of the stored
+/// rgb across mips 0..5 is 0.399 / 0.399 / 0.404 / 0.399 / 0.395 / 0.377: flat
+/// by construction, which is exactly why no division belongs here.
+///
+/// (The CACHE texture in composite.wgsl is a different story and does need its
+/// divide: refresh writes a = 1 into a zero-cleared target, so a bilinear tap at
+/// a slot silhouette is genuinely premultiplied against black.)
+fn card_albedo_of(tap: vec4f) -> vec3f {
+  return tap.rgb;
+}
+
 /// The bake stores a plant-local unit normal as rgb = n * 0.5 + 0.5, already
 /// flipped toward its capture axis, so mip levels stay meaningful: a mip texel
 /// holds the aggregate normal of the blades under it, which may legitimately be
@@ -225,7 +245,7 @@ fn fs_near(i: VOut) -> @location(0) vec4f {
   // by THIS card's yaw and flipped toward the viewer (thin foliage is
   // two-sided). See shading_normal().
   let ne = textureSampleLevel(card_normal, card_sampler, i.uv, i.layer, i.lod);
-  let albedo = tex.rgb / max(tex.a, 1e-3);
+  let albedo = card_albedo_of(tex);
   let n = shading_normal(ne.rgb, i.card_yaw, i.world_pos, frame.camera_pos);
   // The grounding gradient is occlusion, so it multiplies into the LIGHT term,
   // not the albedo: debug=albedo stays the baked atlas colour exactly as
@@ -276,7 +296,7 @@ fn fs_refresh(i: VOut) -> RefreshOut {
   let thr = mix(0.5, 0.22, i.lod / 5.0) + i.thr_bias;
   if (tex.a < thr) { discard; }
   let ne = textureSampleLevel(card_normal, card_sampler, i.uv, i.layer, i.lod);
-  let albedo = tex.rgb / max(tex.a, 1e-3);
+  let albedo = card_albedo_of(tex);
   // Lit for the SLOT's camera — the only view-dependent term is the two-sided
   // flip, which the parallax invalidation already bounds (a slot is refreshed
   // long before the viewer crosses a card's plane).

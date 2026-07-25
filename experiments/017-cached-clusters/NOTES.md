@@ -229,11 +229,31 @@ code is 0.09%).
   a tighter per-cluster estimate (from the actual stand density inside the
   cluster's stand-clipped area) would let two big jobs share a frame.
 
-## Lighting bug (bake v3 -> v4)
+## Lighting bug — TWO independent mip-driven causes
 
 Reported symptom: the whole field uniformly bright and washed out, no
 directional light gradient, pink panicles blowing toward white with distance,
 oversaturated greens. "It doesn't seem to be using normals properly."
+
+There turned out to be **two** separate bugs, both keyed to mip level (therefore
+both monotonic in distance), in two different terms:
+
+1. **The normal atlas** stored raw octahedral codes whose mip average collapses
+   to `(0,1,0)`, feeding the *light term* its maximum argument. Fixed in bake
+   v3 -> v4, below.
+2. **The albedo tap divided by coverage a second time**, inflating the *stored
+   colour* by up to 2.42x at the deepest mip. Fixed below in "Second cause".
+
+Fixing (1) alone removed the flatness and most of the clipping but left the
+field still too light and *still brightening with distance* — the owner caught
+that on review, and the distance-band measurement (below) localised the residual
+to the albedo rather than the light term. Lesson worth keeping: "too bright" had
+two multiplicative contributors, and the debug views separate them cleanly only
+if you measure `albedo` and `lighting` **independently and per distance band**.
+The whole-field mean hid it, because 017's light term happens to fall with
+distance and partly cancelled the rising albedo.
+
+## First cause: normals (bake v3 -> v4)
 
 ### Root cause
 
@@ -310,6 +330,98 @@ the cache's `rgba8unorm`).
   `shadeEpoch` and bumps on either.
 - Drive-by: the committed-artifact fetch now goes through `assetUrl()`.
 
+## Second cause: the albedo was divided by coverage twice
+
+This is the one that made the field brighten with distance, and it survived the
+v4 normal fix untouched (`debug=albedo` was byte-identical before and after,
+which should have been the tell).
+
+`buildMips()` in `bake.ts` is an **alpha-weighted** box filter:
+
+```
+rgb = sum(rgb_i * a_i) / sum(a_i)        a = sum(a_i) / 4
+```
+
+so the stored `rgb` is the coverage-weighted mean colour of the *covered* texels
+— already un-premultiplied — at every mip level, and `a` is mean coverage. The
+fragment shaders then did:
+
+```wgsl
+let albedo = tex.rgb / max(tex.a, 1e-3);   // WRONG: divides by coverage AGAIN
+```
+
+which multiplies the albedo by `1/coverage`. Coverage falls monotonically as the
+mip chain deepens, and mip level rises monotonically with distance, so the
+albedo inflated monotonically with distance. Measured on the v4 atlas
+(`calamagrostis-canescens`, side tile, texels that pass that lod's alpha test):
+
+| lod | alpha thr | mean coverage | mean luma `rgb` | mean luma `rgb/a` | inflation | clipped |
+| --- | --------- | ------------- | --------------- | ----------------- | --------- | ------- |
+| 0   | 0.50      | 1.000         | 0.399           | 0.399             | 1.00x     | 0.0%    |
+| 1   | 0.44      | 0.682         | 0.399           | 0.621             | 1.56x     | 19.8%   |
+| 2   | 0.39      | 0.674         | 0.404           | 0.626             | 1.55x     | 18.1%   |
+| 3   | 0.33      | 0.578         | 0.399           | 0.708             | 1.78x     | 39.5%   |
+| 4   | 0.28      | 0.439         | 0.395           | 0.827             | 2.09x     | 63.4%   |
+| 5   | 0.22      | 0.323         | 0.377           | 0.911             | **2.42x** | **86.7%** |
+
+The `mean luma rgb` column is flat by construction (0.399 -> 0.377) — that is the
+proof that no division belongs there. The fix is one expression, now
+`card_albedo_of()` in `cards.wgsl`, with the derivation written next to it:
+
+```wgsl
+fn card_albedo_of(tap: vec4f) -> vec3f { return tap.rgb; }
+```
+
+The cache texture in `composite.wgsl` keeps *its* divide, and that is not an
+inconsistency: `fs_refresh` writes `a = 1` into a zero-cleared target, so a
+bilinear tap at a slot silhouette genuinely is premultiplied against black.
+Two textures, two different conventions — that is what made the bug easy to
+write and easy to miss.
+
+### Distance-band measurement (the method that found it)
+
+Whole-field means hid this bug. What exposes it is mean luma of plant pixels per
+**distance band**, in `debug=albedo` and `debug=lighting` separately. At
+`cam=grazing` the camera is fixed (eye 1.35m, pitch -0.06 rad, 60° vertical fov),
+so screen row maps monotonically to ground distance
+(`d = 1.35 / tan(-(pitch + atan(ndc_y * tan(30°))))`); the sample window is
+x 360-960, y 340-720 to miss every HUD panel, and sky is excluded by
+`b - r > 0.06`. The row->distance map is a lower bound where a ray hits plant
+tops rather than ground, but it is identical for every renderer, so band-to-band
+comparison is exact.
+
+```
+debug=albedo               0-5m    5-20m   20-60m    60m+   far/near
+017 v3 (original)         0.554    0.679    0.760   0.795   1.44x
+017 v4 (normals fixed)    0.554    0.679    0.760   0.795   1.44x   <- untouched
+017 v5 (albedo fixed)     0.416    0.414    0.418   0.437   1.05x
+001-billboard-smoke       0.411    0.405    0.397   0.418   1.02x
+000-ground-truth          0.196    0.201    0.198   0.198   1.01x
+
+debug=lighting            0-5m    5-20m   20-60m    60m+   far/near
+017 v3 (original)         0.899    0.962    0.969   0.970   1.08x
+017 v4 / v5               0.703    0.632    0.628   0.609   0.87x
+001-billboard-smoke       0.742    0.856    0.902   0.913   1.23x
+000-ground-truth          0.992    0.985    1.000   1.000   1.01x
+
+debug=off                 0-5m    5-20m   20-60m    60m+   far/near
+017 v3 (original)         0.532    0.708    0.786   0.819   1.54x
+017 v4 (normals fixed)    0.399    0.438    0.496   0.516   1.29x
+017 v5 (albedo fixed)     0.302    0.269    0.271   0.281   0.93x
+001-billboard-smoke       0.315    0.363    0.381   0.412   1.31x
+000-ground-truth          0.214    0.238    0.246   0.257   1.20x
+```
+
+Reading it: **both reference renderers have a flat albedo (1.02x, 1.01x) and 017
+had 1.44x** — that single row is the bug, and it says the drift is in the stored
+colour, not the light term. After the fix 017 is 1.05x and its absolute level
+(0.416) lands on 001's (0.411). The light-term row separately confirms the v4
+normal fix did its job on a *different* axis: 1.08x rising became 0.87x falling.
+
+Note `000-ground-truth` is stand-independent (a 3-tile clump), so its 20-60m and
+60m+ bands are mostly bare terrain rather than plants — treat it as a reference
+for the near bands and for flatness, not for absolute far-field values.
+
 ### Debug views, before -> after
 
 Field region of `#/run/017-cached-clusters?cam=grazing` (luma histogram over
@@ -317,32 +429,40 @@ x 400-1270, y 420-700; buckets are 0.0-0.1 ... 0.9-1.0 in percent of pixels):
 
 ```
 debug=lighting   mean   >0.97   histogram
-017 before       0.918  72.3%    0  1  1  2  2  2  3  4  6 79
-017 after        0.659  21.6%    0  5  9  9  9  9 10 10 10 29
+017 v3           0.918  72.3%    0  1  1  2  2  2  3  4  6 79
+017 v4 / v5      0.659  21.6%    0  5  9  9  9  9 10 10 10 29
 001 (reference)  0.774  24.6%    0  1  2  3  5  8 12 16 15 37
 
-debug=off        mean   >0.97
-017 before       0.613   4.6%
-017 after        0.412   1.0%
-001 (reference)  0.333   0.0%
+debug=off        mean   >0.97   histogram
+017 v3           0.613   4.6%    1  3  8  8 13 15 16 14 11 12
+017 v4           0.412   1.0%    4 15 18 16 16 12  8  6  3  3
+017 v5           0.287   0.0%   10 21 25 21 15  4  2  1  0  0
+001 (reference)  0.333   0.0%    3 11 30 25 19 10  1  0  0  0
 
-debug=albedo     mean   >0.97
-017 before       0.613   3.2%    <- identical before and after, bit for bit
-017 after        0.613   3.2%
+debug=albedo     mean   >0.97   histogram
+017 v3           0.613   3.2%    0  2  2  8 17 21 19 14 10  8
+017 v4           0.613   3.2%    0  2  2  8 17 21 19 14 10  8
+017 v5           0.422   0.0%    0  2  9 36 29 16  4  2  0  0
+001 (reference)  0.415   0.0%    0  3  8 33 35 20  1  0  0  0
 ```
 
 Read the first block as: the light term used to be a **spike at the ceiling**
 (79% of the field in the top bucket, 72% clipped) and is now **broad and nearly
-flat across the range** — a gradient, and slightly less clipped than 001's.
+flat across the range** — a gradient, and slightly less clipped than 001's. It is
+identical in v4 and v5 because `debug=lighting` is `shaded / albedo`, which is
+invariant to an albedo scale — a useful internal check that the second fix was
+purely an albedo scale and touched nothing else.
 
-The second block is the sharpest single piece of evidence: **before, the shaded
-field's mean (0.613) equalled its albedo mean (0.613) exactly** — the light term
-averaged 1.0, i.e. the lighting was doing nothing but adding noise. After, the
-shaded mean is 0.412 against the same 0.613 albedo, a mean light term of ~0.67.
-Blowout in the final image fell from 4.6% to 1.0% of field pixels.
+The albedo block is the second fix landing: 017's distribution went from a long
+bright tail with 3.2% clipping (`... 19 14 10 8`) to `0 2 9 36 29 16 4 2 0 0`,
+which is nearly 001's shape (`0 3 8 33 35 20 1 0 0 0`) at nearly the same mean
+(0.422 vs 0.415). **Clipping in the final image is now 0.0%**, down from 4.6% in
+v3 and 1.0% in v4. Overall 017 now sits slightly *darker* than 001 (0.287 vs
+0.333) and above ground truth — the ordering GT < 017 < 001 is where it belongs.
 
-The albedo view is byte-identical before and after, which proves the change is
-confined to the light term and the bake did not disturb the colour atlas.
+One more note on v3: the shaded field's mean (0.613) equalled its albedo mean
+(0.613) exactly — the light term averaged 1.0, i.e. the lighting was doing
+nothing but adding noise. That coincidence is what the first fix addressed.
 
 Qualitatively, same-mode side by side
 (`#/ab/001-billboard-smoke/017-cached-clusters?cam=grazing&debug=normals`):
@@ -359,29 +479,83 @@ the directional work on their own; `baseShade` only adds the vertical root-to-ti
 depth on top. That is the check worth repeating if this ever regresses: if
 `baseShade=0` looks flat again, the normal path is broken, not the shading knob.
 
+### Candidates checked and ruled out
+
+Recorded because each of these was a plausible cause of a distance-dependent
+brightening, and knowing they are *not* it saves the next person the work.
+
+- **Does the mip-averaged normal drift in a direction that raises the light
+  term, and should it be renormalised after filtering?** It drifts (mean `n.z`
+  0.31 -> 0.61 from mip 0 to mip 4, i.e. toward the capture axis) but the drift
+  *lowers* the light term, and the measurement proves it: `debug=lighting` per
+  band is 0.87x far/near, falling. Renormalising is correct — an un-normalised
+  short average would shrink `dot(n, sun_dir)` toward 0 and push half-lambert
+  toward its 0.5 floor and `hemi` toward 0.8, which darkens further rather than
+  brightening. So this axis is benign and physically reasonable: at a grazing
+  view the far field really does show more blade *sides* and fewer tops.
+- **Grounding / AO term stronger near than far.** `shade` is
+  `mix(1 - baseShade, 1, height_fraction)` — purely geometric, evaluated per
+  vertex from the card's own height, with no mip or distance input. Averaging a
+  linear gradient over a shrinking card preserves its mean, so there is no bias.
+  Confirmed by `p.baseShade=0`, where the distance profile is unchanged.
+- **Inter-plant shadowing that exists near and averages away far.** There is no
+  shadowing term in this renderer at all (no shadow map, and the shared light
+  model has none), so there was nothing to average away.
+- **Applied per cluster before the merge.** The composite does not light; it
+  re-projects and fogs. `light_surface()` is called exactly once, in
+  `cards.wgsl`, for both the near ring and the refresh path.
+
+### The alpha-test threshold ramp is load-bearing — do not flatten it
+
+The other half of the coverage candidate: at high mip a texel is part blade, part
+gap, and the hard alpha test writes it fully **opaque**, so gaps get painted as
+grass. The threshold ramp `thr = mix(0.5, 0.22, lod/5)` is what decides how much.
+Measuring drawn area against true coverage (`texels passing / sum of coverage`,
+1.00 = unbiased) on the `calamagrostis-canescens` side tile:
+
+| lod | ramp thr | drawn/true (ramp) | drawn/true (constant 0.5) |
+| --- | -------- | ----------------- | ------------------------- |
+| 0   | 0.50     | 1.00              | 1.00                      |
+| 1   | 0.44     | 1.29              | 1.29                      |
+| 2   | 0.39     | 0.89              | 0.75                      |
+| 3   | 0.33     | 0.96              | 0.57                      |
+| 4   | 0.28     | 1.27              | 0.37                      |
+| 5   | 0.22     | 1.86              | **0.12**                  |
+
+The ramp keeps coverage roughly honest (0.89-1.29) through lod 3 and over-covers
+at lod 4-5. A constant 0.5 threshold — the "unbiased" choice, and my first
+instinct — would lose **88% of far-field coverage** and dissolve the horizon into
+holes. So the ramp is doing necessary work against mip coverage dilution and is
+staying. Its residual over-coverage at lod 4-5 is a *density* bias, not a
+brightness one: with the albedo inflation gone, per-band luma is flat (0.93x)
+while the ramp was never touched. Left as-is rather than traded for holes.
+
 ### Performance
 
-No structural change: one extra varying (`shade`), one repurposed flat varying
-(`yaw` -> `card_yaw`), one dot+negate per fragment, and an `atan2` on far-card
-vertices only. Nothing was added to any pass, dispatch, or attachment.
+No structural change across either fix: one extra varying (`shade`), one
+repurposed flat varying (`yaw` -> `card_yaw`), one dot+negate per fragment, an
+`atan2` on far-card vertices only, and — from the second fix — one **fewer**
+divide per fragment. Nothing was added to any pass, dispatch, or attachment, and
+the albedo fix is strictly less ALU than what it replaced.
 
-Steady-state HUD readings after the fix, default stand, 1280x800, three samples
-4s apart once the cache had converged:
+Steady-state HUD readings, default stand, 1280x800, three samples 4s apart once
+the cache had converged. Two runs, because contention changed materially between
+them — read `base` (the harness's own terrain+sky pass, which is not mine and
+should be ~0.4ms) as the contention gauge:
 
-| cam          | Σp50 (3 samples) | base | fill | refresh | cc-main | composite |
-| ------------ | ---------------- | ---- | ---- | ------- | ------- | --------- |
-| grazing      | 4.00 / 4.67 / 3.82 | 0.40 | 0.05 | 0.19 | 1.7-2.0 | 1.5-2.0 |
-| topdown      | 1.55 / 4.83 / 3.52 | 0.4-1.6 | 0.03 | 0.07 | 0.6-1.6 | 0.5-1.6 |
-| far-horizon  | 5.87 / 6.35 / 5.23 | 0.38 | 0.05 | 2.01 | 1.4-1.9 | 1.4-1.9 |
+| cam          | Σp50, quiet GPU    | Σp50, busy GPU     | base (quiet -> busy) |
+| ------------ | ------------------ | ------------------ | -------------------- |
+| grazing      | 4.00 / 4.67 / 3.82 | 7.10 / 7.03 / 6.58 | 0.40 -> 1.0-1.3      |
+| topdown      | 1.55 / 4.83 / 3.52 | 4.26 / 3.94 / 3.98 | 0.4-1.6 -> 0.7-0.9   |
+| inside-plant | contaminated       | 6.29 / 6.71 / 6.57 | 1.3-2.9 -> 0.8-0.9   |
+| far-horizon  | 5.87 / 6.35 / 5.23 | 5.97 / 6.75 / 6.53 | 0.38 -> 0.9-1.0      |
 
-`cam=grazing` at **~3.8-4.7ms** is inside the band this experiment recorded
-before the lighting work (4.2-4.6ms in Findings above) and well under the 9ms
-ceiling. The spread within a single camera is contention, not signal: `base` is
-the harness's own terrain+sky pass and it moves 0.4 -> 1.6ms across samples of
-the *same* view, which is other agents' dev pages hitting the GPU. `inside-plant`
-sampled 7.0 / 9.0 / 12.3 in the same run with `base` climbing 1.34 -> 2.87, so
-those three are contaminated and not usable. Still no bench JSON, for exactly
-this reason — these are HUD readings, not quotable bench numbers.
+`cam=grazing` at **3.8-4.7ms on a quiet GPU** is inside the band this experiment
+recorded before any of the lighting work (4.2-4.6ms in Findings above), and the
+6.6-7.1ms readings come with `base` tripled, i.e. they measure the machine, not
+the change. Everything stays under the 9ms ceiling even under load. Still no
+bench JSON, for exactly this reason — these are HUD readings, not quotable bench
+numbers, and ~15 other agents share this GPU.
 
 ### Still not right
 
@@ -390,19 +564,36 @@ this reason — these are HUD readings, not quotable bench numbers.
   up-facing normals) written to an 8-bit target, and the terrain and 001 (24.6%)
   do the same. Not fixed here on purpose: the brief was to apply the shared
   model exactly once, not to replace it.
-- **~1% of field pixels still clip in the final image**, essentially all of it
-  crown cards. The top capture's normals are flipped toward +Y by construction,
-  so a horizontal crown card genuinely faces the sun; `topdown` is the brightest
-  view for that reason. Physically defensible, but if the owner wants it pulled
-  down, `baseShade` is the knob and the crown card's `1 - baseShade * 0.25`
-  coefficient is the place.
+- **Final-image clipping is now 0.0%** of field pixels (was 4.6% in v3, 1.0%
+  after the normal fix alone). Nothing left to chase here; `baseShade` and the
+  crown card's `1 - baseShade * 0.25` coefficient remain the knobs if the owner
+  wants the overall level moved.
+- **017's light term falls with distance (0.87x) where ground truth's is flat
+  (1.01x) and 001's rises (1.23x).** After the albedo fix this makes the final
+  image 0.93x far/near — flat, but *not* showing the mild fog-driven brightening
+  toward the horizon that GT does (1.20x). The cause is understood and physical
+  (far-field aggregate normals turn viewer-facing, so `ndl` drops for this
+  camera/sun pair) rather than a defect, and it is the one place where a
+  distance-dependent term still differs from the references. Deliberately NOT
+  compensated with a distance knob — that would mask it. If it ever needs
+  addressing, the honest lever is what the far card's aggregate normal should be,
+  not a brightness ramp.
+- **017 now reads slightly darker than 001** (field mean 0.287 vs 0.333) and
+  brighter than ground truth (0.214-0.257). That ordering is defensible, but it
+  is a *level* judgement rather than a measurement, so it is the owner's call.
 - **The two-sided flip is frozen at refresh time** for cached clusters (it uses
   the slot's camera, not the live one). Parallax invalidation bounds the error —
   a slot refreshes long before the viewer crosses a card's plane — but a slow
   orbit at a fixed distance can in principle hold a stale flip. Not observed.
-- **Far-field normals now converge toward the capture axis** rather than +Y
-  (mean `n.z` 0.31 -> 0.61 from mip 0 to mip 4). That is the right aggregate for
-  a card impostor and it keeps the light term flat at ~0.48 across the whole mip
-  chain, but it does mean the deepest far field shades as a viewer-facing sheet;
+- **Far-field normals converge toward the capture axis** rather than +Y (mean
+  `n.z` 0.31 -> 0.61 from mip 0 to mip 4). That is the right aggregate for a card
+  impostor and it keeps the light term flat at ~0.48 across the whole mip chain,
+  but it does mean the deepest far field shades as a viewer-facing sheet;
   per-plant orientation variety lives in levels 0-2 (out to ~200m), where the
   crossed cards keep their yaw / yaw+90° facings.
+- **The far-field alpha test over-covers at lod 4-5** (drawn/true 1.27x, 1.86x).
+  A density bias, not a brightness one — see the threshold-ramp section for why
+  flattening it would be much worse.
+- The 001 comparison numbers here were captured at one point in time; another
+  agent was editing `001-billboard-smoke/shaders/cards.wgsl` during this session,
+  so re-measure 001 rather than trusting these figures if it has moved since.
