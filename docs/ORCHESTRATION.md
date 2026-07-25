@@ -144,6 +144,31 @@ recurring hazard, not the carpet specifics.
    identically in 001 and 039, i.e. it is the harness's ground, not a renderer
    bug — which makes this a look fix as well as a geometry fix.
 
+## Determinism: the lab is NOT bit-deterministic, and now we know by how much
+
+Measured 2026-07-26 during the Stage refactor, by capturing the full golden set
+three times — once before, once after, and once more on IDENTICAL code as a
+control:
+
+- refactor vs baseline: **77 of 160 goldens differ**, median 18 px of 1.46M
+  (0.001%), median RMSE 0.076/255.
+- identical code vs identical code: **79 of 160 differ**, median 15 px, and the
+  per-file numbers are indistinguishable (93,113 vs 95,078 px on the worst file).
+
+So roughly half the goldens move between two runs of the same code. Causes:
+GPU atomic ordering in cull passes changes instance order and flips
+exactly-depth-tied fragments; and `det=1&t=2` freezes *time* but not *frame
+history*, so any accumulating/temporal method drifts with settle timing —
+`016-screen-stamp` moves **6% of its pixels** at grazing this way.
+
+Consequences, both of which have bitten already:
+1. **Strict byte-equality goldens are not a usable gate.** Always run a
+   same-code control alongside any before/after comparison, and compare the two
+   distributions rather than asking "did anything change".
+2. A single screenshot pair proves much less than it appears to. When judging a
+   visual change, prefer a measurement over many pixels (differing-pixel count
+   and RMSE) to an eyeball verdict on one frame.
+
 ## Measuring performance under contention
 
 Absolute milliseconds are meaningless while agents share the GPU. Use the
