@@ -18,3 +18,10 @@ mesh/baked/005-octa-impostors/views-v2-11x128-*.bin
 mesh/baked/008-relief-tap/views-v1-g5t256-calamagrostis-canescens.bin
 mesh/baked/008-relief-tap/views-v1-g5t256-elymus-repens.bin
 mesh/baked/008-relief-tap/views-v1-g5t256-poa-pratensis.bin
+
+# Goldens are a LOCAL regression net, not an artifact. A full capture of every
+# experiment at the four standard cams is ~400MB of near-lossless PNG, and
+# `npm run capture:goldens` regenerates the lot in ~25 minutes. They are already
+# excluded from the static deploy for the same reason. Keep a before/after pair
+# outside the repo when refactoring shared code, and diff those.
+goldens/
