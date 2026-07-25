@@ -114,6 +114,19 @@ recurring hazard, not the carpet specifics.
    "bit-identical twins" invariant was simply false for carpets. Now recorded as
    a deliberate non-fix in a `@deprecated` comment at both sites.
 2. ~~**`carpetScale()` is not exported from `@harness`.**~~ Same reason.
+4. **OPEN QUESTION: the GCMESH1 octahedral normal convention may be wrong in
+   shared code.** Two independent agents have now measured this. `GcMesh.normalAt()`
+   (`src/mesh/gcmesh.ts`, commented "validated visually in the mesh inspector")
+   derives **Y** from the two stored components; `experiments/004-raycast-lut/shaders/
+   rayfield-common.wgsl` applies a y↔z swap and reports measuring the decoded
+   normals against face normals computed from raw vertex positions — mean |cos|
+   **0.75 for a z-derived reading vs 0.57 for the y-derived one**. If that holds,
+   every experiment using the shared decoder has subtly wrong normals, and
+   `mesh/README.md` documents only "octahedral normal U/V" without stating which.
+   The new `src/gpu/texture.ts` deliberately matched `gcmesh.ts` rather than
+   silently picking a side. Worth settling with a direct test: decode both ways
+   and compare against face normals over a large triangle sample.
+
 3. **The drawn ground is not the sampled ground.** STILL LIVE and still worth
    fixing — it has nothing to do with carpets. `basePass.ts` draws
    `TERRAIN_QUADS = 256` over a 256 m terrain (1 m triangles, linear across
