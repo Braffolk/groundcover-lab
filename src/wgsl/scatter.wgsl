@@ -73,6 +73,8 @@ fn scatter_candidate(seed: u32, entry_index: u32, cell: vec2i, i: u32) -> Scatte
   let h = hash4(seed, bitcast<u32>(cell.x), bitcast<u32>(cell.y), (entry_index << 16u) ^ i);
 
   // --- Carpet layout: seamless mat of periodic tiles ------------------------
+  // DEPRECATED carpet branch. A tiled ground mat is a MATERIAL, not a species of
+  // plant; no stand sets carpet_div any more, so this is dead but preserved.
   if (entry.carpet_div > 0.0) {
     let n = u32(entry.carpet_div);
     if (i >= n * n) {

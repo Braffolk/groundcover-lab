@@ -111,6 +111,11 @@ export class Scatter {
     const out: ScatterPoint[] = []
 
     // Carpet layout — mirror of the carpet branch in scatter.wgsl.
+    // DEPRECATED (see StandSpecies.carpetDiv): no stand uses this any more.
+    // Known, deliberately unfixed: `scale` below is the stand's PLACEHOLDER
+    // scaleMin, while the WGSL twin reads carpetScale() out of the stand table —
+    // so the two placement twins disagree for carpet entries. Repairing a
+    // deprecated path is not worth reviving it.
     const div = e.carpetDiv ?? 0
     if (div > 0) {
       const step = fround(SCATTER_CELL_SIZE / div)

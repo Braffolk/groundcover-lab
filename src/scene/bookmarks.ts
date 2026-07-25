@@ -18,9 +18,10 @@ export function standardBookmarks(terrain: Terrain): Record<string, CameraPose> 
     'inside-plant': { x: 0.2, y: h(0.2, 0.2) + 0.55, z: 0.2, yaw: -Math.PI / 4, pitch: 0.12, fov: 70 },
     // Standing height looking to the horizon — LOD / plant-count scaling check.
     'far-horizon': { x: 0, y: h(0, 60) + 1.7, z: 60, yaw: 0, pitch: -0.06, fov: 60 },
-    // 1m straight down — tile-level detail and seams for ground carpets. Named
-    // rather than hand-written because URL `cam=x,y,z,...` poses are ABSOLUTE
-    // while terrain here sits metres below zero, so "y=2" is not 2m up.
+    // 1m straight down — ground-level detail. Kept after carpets were deprecated
+    // because "look closely at the ground" is generally useful. Named rather
+    // than hand-written because URL `cam=x,y,z,...` poses are ABSOLUTE while
+    // terrain here sits metres below zero, so "y=2" is not 2m up.
     'carpet-close': { x: 0, y: h(0, 0) + 1, z: 0.01, yaw: 0, pitch: -1.55, fov: 60 },
   }
 }

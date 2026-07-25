@@ -15,8 +15,10 @@ export interface SpeciesDesc {
   heightScale: number
   /**
    * Periodic community-tile footprint in meters, from the mesh manifest, for
-   * meshes that tile (omit for single specimens). Carpet stands use it to size
-   * tiles so they abut exactly.
+   * meshes that tile (omit for single specimens). This is the species' true
+   * horizontal footprint and is the ONLY correct way to size a plant's width —
+   * never derive width from `heightScale`. It reaches shaders as
+   * `stand_table[i].footprint_m`.
    */
   tileM?: number
 }
@@ -25,13 +27,11 @@ export const SPECIES: readonly SpeciesDesc[] = [
   { id: 'calamagrostis-canescens', index: 0, meshId: 'calamagrostis-canescens', heightScale: 1.18, tileM: 0.52 },
   { id: 'elymus-repens', index: 1, meshId: 'elymus-repens', heightScale: 1.21, tileM: 0.62 },
   { id: 'poa-pratensis', index: 2, meshId: 'poa-pratensis', heightScale: 0.75 },
-  // Sphagnum palustre in three micro-habitat states — same species, different
-  // conditions, which is exactly what bog hummock/hollow zoning needs. Tiny
-  // 0.18m carpet tiles (vs 0.52-0.62m for the grasses) and ~19.8M tris each.
-  // NOTE: mesh directory names spell it "spaghnum"; ids match the directories.
-  { id: 'spaghnum-palustre-wet-vigorous', index: 3, meshId: 'spaghnum-palustre-wet-vigorous', tileM: 0.18, heightScale: 0.091 },
-  { id: 'spaghnum-palustre-late-season', index: 4, meshId: 'spaghnum-palustre-late-season', tileM: 0.18, heightScale: 0.069 },
-  { id: 'spaghnum-palustre-sun-exposed', index: 5, meshId: 'spaghnum-palustre-sun-exposed', tileM: 0.18, heightScale: 0.072 },
+  // Indices 3-5 were three Sphagnum palustre micro-habitat states, removed when
+  // the lab stopped treating a ground carpet as a kind of plant. Moss is now a
+  // MATERIAL (experiments/materials/...), and the maps measured off those meshes
+  // survive as PNGs in assets/materials/sphagnum-*. Do not reuse 3-5: the index
+  // is carried into the GPU stand table and this list is append-only.
 ]
 
 export function speciesById(id: string): SpeciesDesc {

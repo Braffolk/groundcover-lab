@@ -44,6 +44,7 @@ struct StandEntry {
   // disables it entirely (uniform cover, the historical behaviour).
   wet_center: f32,
   wet_width: f32,
+  // DEPRECATED (always 0 now — a ground mat is a material, not a plant).
   // Carpet layout. >0 lays this species out as a SEAMLESS MAT: carpet_div x
   // carpet_div periodic tiles per scatter cell, grid-snapped, constant scale,
   // and rotated only in 90-degree steps — the three things a periodic square

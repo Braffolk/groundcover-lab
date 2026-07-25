@@ -34,6 +34,13 @@ export interface StandSpecies {
   wetCenter?: number
   wetWidth?: number
   /**
+   * @deprecated Carpets are a deprecated concept. A tiled ground mat turned out
+   * to be a MATERIAL, not a kind of plant, and forcing both through one renderer
+   * generalised badly — nearly every renderer in the repo independently mis-sized
+   * its enumeration loop and drew a quarter of the mat. Ground cover of this kind
+   * now belongs in a `material` experiment. The machinery below still works and
+   * no stand currently uses it; do not build anything new on it.
+   *
    * Lay this species out as a SEAMLESS CARPET rather than scattering it:
    * `carpetDiv` × `carpetDiv` periodic tiles per 4m scatter cell, grid-snapped
    * at constant scale with 90°-only rotations, which is what a periodic square
@@ -82,28 +89,6 @@ const CALAMAGROSTIS: Omit<StandSpecies, 'density'> = {
 const ELYMUS: Omit<StandSpecies, 'density'> = { species: 'elymus-repens', scaleMin: 0.8, scaleMax: 1.2, sway: 0.65 }
 const POA: Omit<StandSpecies, 'density'> = { species: 'poa-pratensis', scaleMin: 0.75, scaleMax: 1.3, sway: 0.85 }
 
-// Sphagnum cushions: rigid (moss does not sway). scaleMin/scaleMax below are
-// placeholders — carpet entries have their scale computed by carpetScale() so a
-// tile exactly fills its grid step, and life size is the goal.
-const WET_MOSS: Omit<StandSpecies, 'density'> = {
-  species: 'spaghnum-palustre-wet-vigorous',
-  scaleMin: 1.7,
-  scaleMax: 2.5,
-  sway: 0,
-}
-const MID_MOSS: Omit<StandSpecies, 'density'> = {
-  species: 'spaghnum-palustre-late-season',
-  scaleMin: 1.6,
-  scaleMax: 2.3,
-  sway: 0,
-}
-const DRY_MOSS: Omit<StandSpecies, 'density'> = {
-  species: 'spaghnum-palustre-sun-exposed',
-  scaleMin: 1.4,
-  scaleMax: 2.0,
-  sway: 0,
-}
-
 export const STANDS: readonly Stand[] = [
   {
     id: 'default',
@@ -145,32 +130,13 @@ export const STANDS: readonly Stand[] = [
       { ...POA, density: 4 },
     ],
   },
-  {
-    id: 'bog',
-    title: 'raised bog: moss carpet + hummock zoning',
-    description:
-      'Sphagnum palustre in its three micro-habitat states zoned across the wetness field — vigorous moss in the wet hollows, late-season on the flanks, sun-exposed on the dry hummock crests — with Calamagrostis canescens scattered through the wet hollows and a trace of Poa on the driest crests. Moss is life size, so ~1.13M plants over ±96m.',
-    radius: 96,
-    species: [
-      // Sphagnum carpet: one continuous mat on a 22x22 grid per scatter cell,
-      // i.e. 484 slots — deliberately over the 128 scatter budget, because
-      // div 22 is what puts a 0.18m tile at LIFE SIZE (scale 1.01); div 11
-      // would fit the budget but render 0.36m tiles of 18cm moss.
-      // 90°-only rotations for variation. The three states PARTITION the wetness axis
-      // into thirds, so every grid node is claimed by exactly one of them —
-      // no gaps, no double-stacking — and the boundary jitter in the scatter
-      // makes the zones interlock.
-      { ...WET_MOSS, density: 8, carpetDiv: 22, wetCenter: 5 / 6, wetWidth: 1 / 3 },
-      { ...MID_MOSS, density: 8, carpetDiv: 22, wetCenter: 0.5, wetWidth: 1 / 3 },
-      { ...DRY_MOSS, density: 8, carpetDiv: 22, wetCenter: 1 / 6, wetWidth: 1 / 3 },
-      // Calamagrostis canescens is genuinely a fen / wet-meadow grass, so it
-      // belongs in the hollows — sparse, emergent above the carpet.
-      { ...CALAMAGROSTIS, density: 1.4, wetCenter: 0.78, wetWidth: 0.26, slopeAlign: 0.3 },
-      // Poa is a meadow grass, not a bog plant: a trace on the driest crests
-      // only, reading as encroachment from the drier margin.
-      { ...POA, density: 0.5, wetCenter: 0.04, wetWidth: 0.2 },
-    ],
-  },
+  // The `bog` stand lived here: a life-size Sphagnum carpet in three
+  // micro-habitat states zoned across the wetness field. It was removed with the
+  // moss meshes when the lab split materials out from plant renderers — a ground
+  // carpet is a MATERIAL, not a species of plant. The wetness field, the habitat
+  // bands and the carpet machinery all survive (see the deprecation notes on
+  // `carpetDiv`), so an equivalent stand can be reconstructed if one is ever
+  // wanted; nothing about its removal is one-way except the meshes themselves.
   {
     id: 'scaling-100m',
     title: 'scaling 100M+',
@@ -188,6 +154,12 @@ export const STANDS: readonly Stand[] = [
  * Constant tile scale for a carpet entry: the periodic tile must exactly fill
  * its grid step, or the mat shows seams (too small) or overlaps (too large).
  * Returns null for ordinary scattered entries.
+ *
+ * @deprecated Carpets are deprecated — see `StandSpecies.carpetDiv`. Known
+ * defect, left unfixed deliberately: `Scatter.cell()`'s carpet branch returns
+ * the stand's placeholder `scaleMin` rather than this computed value, so the TS
+ * and WGSL placement twins disagree for carpet entries. Nothing uses either path
+ * now; do not repair a deprecated path.
  */
 export function carpetScale(entry: StandSpecies): { min: number; max: number } | null {
   if (!entry.carpetDiv || entry.carpetDiv <= 0) return null
@@ -203,6 +175,10 @@ export function carpetScale(entry: StandSpecies): { min: number; max: number } |
  * Slots per scatter cell for a stand entry — carpetDiv² for a carpet (which may
  * exceed SCATTER_MAX_PER_CELL), otherwise the ordinary scatter budget. Use this
  * for every enumeration loop and buffer capacity.
+ *
+ * Still the correct call for ANY entry: with carpets gone it simply returns the
+ * scatter budget, and a renderer that asks the entry rather than hardcoding 128
+ * stays right if the budget ever changes.
  */
 export function standEntrySlots(entry: StandSpecies): number {
   return entry.carpetDiv && entry.carpetDiv > 0 ? entry.carpetDiv ** 2 : SCATTER_MAX_PER_CELL
