@@ -222,6 +222,17 @@ What changed on disk:
 - Species indices 3-5 are retired and must never be reused: the index goes into
   the GPU stand table and the catalog is append-only.
 
+## Owner decisions not yet executed
+
+- **The hierarchy must end up uniform.** The 40 existing renderers still sit at
+  `experiments/<nnn>-<slug>/` while materials are nested. Move them under
+  `experiments/renderers/` as part of the UI phase — ids are decoupled from
+  paths now, so ratings, bench results and goldens all survive the move.
+- **The 25MB VRAM bar has no material-appropriate meaning.** It was calibrated
+  for a plant species' baked representation; the first material measures 48MiB
+  for one uncompressed 2048² albedo+normal+AO set (BC7/BC5/BC4 would be ~14MB).
+  Needs either a per-kind budget or block compression — owner's call.
+
 ## In flight / queued (as of this writing)
 
 - The moss round (`w1hf8i2cc` = run `wf_a5a3432c-55e`) was **stopped by the owner
