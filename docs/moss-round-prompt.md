@@ -84,6 +84,19 @@ Your test scene: `http://localhost:5175/#/run/{{ID}}?stand=bog`
 Diagnose which of these actually apply to *your* renderer before changing
 anything — they differ a lot between techniques.
 
+## Carpet slots exceed the scatter budget
+
+A carpet entry has exactly `carpetDiv²` slots per 4 m cell — **484** for the bog
+moss, deliberately over `SCATTER_MAX_PER_CELL` (128). That is because div 22 is
+what puts a 0.18 m tile at **life size** (scale 1.01); div 11 would fit the
+budget but render 0.36 m tiles of 18 cm moss. Drive enumeration and buffer
+capacity from `standEntrySlots(entry)` (exported from `@harness`) or from
+`stand_table[i].carpet_div²` — **never** from `SCATTER_MAX_PER_CELL`. Hardcoding
+128 renders about a quarter of the mat and leaves holes that look exactly like a
+placement bug. Life size also means ~4x as many moss tiles as an oversized mat
+would need, so if your renderer has no distance aggregation, this is where it
+will show.
+
 ## The lattice invariant
 
 Tiled species read as one continuous stand only while every tile still agrees

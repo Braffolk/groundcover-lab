@@ -46,7 +46,12 @@ export interface StandSpecies {
    * grid must PARTITION [0,1) so exactly one claims each node — otherwise the
    * mat gets holes (gaps) or double-stacked tiles (overlaps).
    *
-   * carpetDiv² must not exceed SCATTER_MAX_PER_CELL (128), so div ≤ 11.
+   * A carpet entry has EXACTLY carpetDiv² slots per scatter cell, and that is
+   * deliberately NOT bounded by SCATTER_MAX_PER_CELL — a life-size 0.18m tile
+   * needs div 22 (484 slots) to fill a 4m cell, where the 128-slot budget would
+   * force 2x life size. Size buffers and enumeration loops from
+   * standEntrySlots(), never from SCATTER_MAX_PER_CELL, or you will render only
+   * a fraction of the mat.
    */
   carpetDiv?: number
   /**
@@ -77,9 +82,9 @@ const CALAMAGROSTIS: Omit<StandSpecies, 'density'> = {
 const ELYMUS: Omit<StandSpecies, 'density'> = { species: 'elymus-repens', scaleMin: 0.8, scaleMax: 1.2, sway: 0.65 }
 const POA: Omit<StandSpecies, 'density'> = { species: 'poa-pratensis', scaleMin: 0.75, scaleMax: 1.3, sway: 0.85 }
 
-// Sphagnum cushions: rigid (moss does not sway), and scaled well above 1 so
-// the 0.18m carpet tiles close into a continuous mat at the 8/m² scatter cap.
-// Wetter states grow larger and looser, sun-exposed ones tighter.
+// Sphagnum cushions: rigid (moss does not sway). scaleMin/scaleMax below are
+// placeholders — carpet entries have their scale computed by carpetScale() so a
+// tile exactly fills its grid step, and life size is the goal.
 const WET_MOSS: Omit<StandSpecies, 'density'> = {
   species: 'spaghnum-palustre-wet-vigorous',
   scaleMin: 1.7,
@@ -144,18 +149,20 @@ export const STANDS: readonly Stand[] = [
     id: 'bog',
     title: 'raised bog: moss carpet + hummock zoning',
     description:
-      'Sphagnum palustre in its three micro-habitat states zoned across the wetness field — vigorous moss in the wet hollows, late-season on the flanks, sun-exposed on the dry hummock crests — with Calamagrostis canescens scattered through the wet hollows and a trace of Poa on the driest crests. ~460k plants over ±96m.',
+      'Sphagnum palustre in its three micro-habitat states zoned across the wetness field — vigorous moss in the wet hollows, late-season on the flanks, sun-exposed on the dry hummock crests — with Calamagrostis canescens scattered through the wet hollows and a trace of Poa on the driest crests. Moss is life size, so ~1.13M plants over ±96m.',
     radius: 96,
     species: [
-      // Sphagnum carpet: one continuous mat, laid out on an 11x11 grid per
-      // scatter cell so the periodic tiles abut exactly, with 90°-only
-      // rotations for variation. The three states PARTITION the wetness axis
+      // Sphagnum carpet: one continuous mat on a 22x22 grid per scatter cell,
+      // i.e. 484 slots — deliberately over the 128 scatter budget, because
+      // div 22 is what puts a 0.18m tile at LIFE SIZE (scale 1.01); div 11
+      // would fit the budget but render 0.36m tiles of 18cm moss.
+      // 90°-only rotations for variation. The three states PARTITION the wetness axis
       // into thirds, so every grid node is claimed by exactly one of them —
       // no gaps, no double-stacking — and the boundary jitter in the scatter
       // makes the zones interlock.
-      { ...WET_MOSS, density: 8, carpetDiv: 11, wetCenter: 5 / 6, wetWidth: 1 / 3 },
-      { ...MID_MOSS, density: 8, carpetDiv: 11, wetCenter: 0.5, wetWidth: 1 / 3 },
-      { ...DRY_MOSS, density: 8, carpetDiv: 11, wetCenter: 1 / 6, wetWidth: 1 / 3 },
+      { ...WET_MOSS, density: 8, carpetDiv: 22, wetCenter: 5 / 6, wetWidth: 1 / 3 },
+      { ...MID_MOSS, density: 8, carpetDiv: 22, wetCenter: 0.5, wetWidth: 1 / 3 },
+      { ...DRY_MOSS, density: 8, carpetDiv: 22, wetCenter: 1 / 6, wetWidth: 1 / 3 },
       // Calamagrostis canescens is genuinely a fen / wet-meadow grass, so it
       // belongs in the hollows — sparse, emergent above the carpet.
       { ...CALAMAGROSTIS, density: 1.4, wetCenter: 0.78, wetWidth: 0.26, slopeAlign: 0.3 },
@@ -188,11 +195,17 @@ export function carpetScale(entry: StandSpecies): { min: number; max: number } |
   if (species.tileM === undefined) {
     throw new Error(`stand entry "${entry.species}" uses carpetDiv but the species has no periodic tileM`)
   }
-  if (entry.carpetDiv ** 2 > SCATTER_MAX_PER_CELL) {
-    throw new Error(`carpetDiv ${entry.carpetDiv} needs ${entry.carpetDiv ** 2} slots, over the ${SCATTER_MAX_PER_CELL} cap`)
-  }
   const s = SCATTER_CELL_SIZE / entry.carpetDiv / species.tileM
   return { min: s, max: s }
+}
+
+/**
+ * Slots per scatter cell for a stand entry — carpetDiv² for a carpet (which may
+ * exceed SCATTER_MAX_PER_CELL), otherwise the ordinary scatter budget. Use this
+ * for every enumeration loop and buffer capacity.
+ */
+export function standEntrySlots(entry: StandSpecies): number {
+  return entry.carpetDiv && entry.carpetDiv > 0 ? entry.carpetDiv ** 2 : SCATTER_MAX_PER_CELL
 }
 
 export function standById(id: string): Stand {
