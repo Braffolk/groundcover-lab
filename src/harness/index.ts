@@ -52,10 +52,71 @@ export { ScopedTimer } from '../gpu/timing.ts'
 export type { ShaderRegistry, WgslSource } from '../gpu/shaders.ts'
 export { createFullscreenPipeline } from '../gpu/screenPass.ts'
 
+/**
+ * Texel semantics. ONE declaration produces BOTH the mip filter and the WGSL
+ * decoder, so they cannot disagree — which is what makes the two documented
+ * mip bugs (un-premultiplying already-normalised colour, box-filtering
+ * octahedral normals) unrepresentable rather than merely documented. Do not
+ * hand-roll a mipgen shader or a `rgb / a` in a fragment shader; declare the
+ * semantics and let `generateMips` + `wgslDecoder` agree.
+ */
+export {
+  checkMipConvention,
+  createTexture2D,
+  dilateWrap,
+  generateMips,
+  mipLevelsFor,
+  octDecode,
+  octEncode,
+  readTexture,
+  uploadImageBitmap,
+  wgslDecoder,
+  wgslOctahedral,
+  type DilateOptions,
+  type MipCheckLevel,
+  type MipCheckReport,
+  type MipPlan,
+  type NonMippableEncoding,
+  type ReadTextureOptions,
+  type ReadTextureResult,
+  type TexelSemantics,
+  type Texture2DDesc,
+  type TextureEncoding,
+} from '../gpu/texture.ts'
+
+/**
+ * PNG loading/encoding, including the 16-bit path the browser cannot do:
+ * canvas cannot ENCODE 16-bit PNG and `createImageBitmap` silently TRUNCATES
+ * one to 8 bits, so 16-bit maps go through the hand-written codec here.
+ * Every loader guards the dev server's SPA fallback (index.html at HTTP 200)
+ * by content-type AND the PNG magic bytes.
+ */
+export {
+  assertPngBytes,
+  bakedImage,
+  decodePng,
+  encodePng,
+  fetchPngBytes,
+  hasPngMagic,
+  loadImage16Texture,
+  loadImageTexture,
+  readPngHeader,
+  readTextureRgba8,
+  textureFromPng16,
+  type BakedImageContext,
+  type EncodePngInput,
+  type LoadImage16Options,
+  type LoadImageTextureOptions,
+  type PngChannels,
+  type PngHeader,
+  type PngImage,
+  type ReadRgba8Options,
+} from '../gpu/image.ts'
+
 export { GcMesh, parseGcMesh, type GcMeshHeader } from '../mesh/gcmesh.ts'
 export { MeshCatalog, type MeshInfo } from '../mesh/catalog.ts'
 
-export { bakedArtifact, commitBake, type BakeContext } from '../bake/io.ts'
+export { bakedArtifact, commitBake, type BakeContext, type BakeExt } from '../bake/io.ts'
 
 /**
  * Deploy-awareness. `assetUrl('/mesh/baked/...')` is the correct way to build

@@ -42,6 +42,11 @@ const BYTES_PER_TEXEL: Record<string, number> = {
   stencil8: 1,
 }
 
+/** Bytes per texel for an uncompressed format, or undefined if unknown. */
+export function textureFormatBytes(format: GPUTextureFormat): number | undefined {
+  return BYTES_PER_TEXEL[format]
+}
+
 export function textureBytes(desc: GPUTextureDescriptor): number {
   const perTexel = BYTES_PER_TEXEL[desc.format]
   if (perTexel === undefined) {
@@ -67,7 +72,7 @@ export class VramTracker {
   private entries: VramEntry[] = []
   private inTracker = false
 
-  constructor(private device: GPUDevice) {
+  constructor(readonly device: GPUDevice) {
     if (import.meta.env.DEV) this.installUntrackedWarning()
   }
 
@@ -184,6 +189,20 @@ export class VramScope {
     private tracker: VramTracker,
     readonly owner: string,
   ) {}
+
+  /** The device this scope allocates on — so helpers can take just a scope. */
+  get device(): GPUDevice {
+    return this.tracker.device
+  }
+
+  /**
+   * Run `fn` with the untracked-allocation warning suppressed. For transient
+   * harness-side staging/readback buffers that would only add noise to the
+   * budget meter — never for anything an experiment keeps alive.
+   */
+  exempt<T>(fn: () => T): T {
+    return this.tracker.exempt(fn)
+  }
 
   createBuffer(desc: GPUBufferDescriptor, attr?: VramAttr): GPUBuffer {
     const { resource, entry } = this.tracker.allocBuffer(this.owner, desc, attr)

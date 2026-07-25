@@ -11,9 +11,12 @@ import type { Plugin } from 'vite'
  *   GET  /__bench/list                   JSON string[] of results/ filenames
  *   POST /__thumb?exp=<id>               PNG body -> experiments/<id>/thumbnail.png
  *   POST /__thumb?exp=<id>&cam=<name>    PNG body -> goldens/<id>/<name>.png
- *   POST /__bake?exp=<id>&key=<key>      binary body -> mesh/baked/<id>/<key>.bin
+ *   POST /__bake?exp=<id>&key=<key>[&ext=bin|png|json]
+ *                                        binary body -> mesh/baked/<id>/<key>.<ext> (ext defaults to bin)
  *   POST /__rating?exp=<id>              {"visual":1..5|null} -> experiments/<id>/rating.json (null deletes)
  */
+const BAKE_EXTS = ['bin', 'png', 'json']
+
 export function devSink(): Plugin {
   let root = process.cwd()
 
@@ -109,7 +112,12 @@ export function devSink(): Plugin {
           if (route === '/__bake' && req.method === 'POST') {
             const exp = segment(url.searchParams.get('exp'), 'exp')
             const key = segment(url.searchParams.get('key'), 'key')
-            const saved = write(path.join('mesh', 'baked', exp), `${key}.bin`, await readBody(req))
+            // Extension is a separate parameter on purpose: segment() allows
+            // '.' inside a key, so an extension smuggled into the key would
+            // land as `foo.png.bin`.
+            const ext = url.searchParams.get('ext') ?? 'bin'
+            if (!BAKE_EXTS.includes(ext)) throw new Error(`invalid ext: ${JSON.stringify(ext)} (allowed: ${BAKE_EXTS.join(', ')})`)
+            const saved = write(path.join('mesh', 'baked', exp), `${key}.${ext}`, await readBody(req))
             json(res, 200, { saved })
             return
           }
