@@ -1,0 +1,33 @@
+{
+  "note": "Measured off the 19.8M-tri Sphagnum source mesh by experiments/039-nd-moss/bake.ts (NDM1 v4). The mesh has since been deleted; these values cannot be regenerated.",
+  "speciesId": "spaghnum-palustre-wet-vigorous",
+  "texPx": 2048,
+  "tileM": 0.18000000715255737,
+  "y0": -0.0019753817468881607,
+  "y1": 0.09119119495153427,
+  "planeH": 0.07307802885770798,
+  "topH": 0.09316657483577728,
+  "cover": 0.9845446944236755,
+  "tipColor": [
+    0.3165394067764282,
+    0.5965346097946167,
+    0.15279585123062134
+  ],
+  "baseColor": [
+    0.29383164644241333,
+    0.5725986361503601,
+    0.14170153439044952
+  ],
+  "meanColor": [
+    0.3044706881046295,
+    0.5855064392089844,
+    0.14692580699920654
+  ],
+  "apexH": 0.08448836952447891,
+  "maps": {
+    "albedo.png": "rgb8, linear, coverage-weighted mip convention (already normalised by coverage — do NOT divide by alpha again)",
+    "height.png": "gray8, 0 = y0, 255 = y1 (see y0/y1, metres at mesh scale 1)",
+    "normal.png": "rgb8, plain xyz * 0.5 + 0.5, upper hemisphere. NOT octahedral — this map is mipped and octahedral pairs are not mip-averageable.",
+    "ao.png": "gray8, cavity AO from a wrapping horizon sweep, 8 azimuths x 5 radii (1.05-16.9mm)"
+  }
+}

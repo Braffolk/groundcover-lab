@@ -122,6 +122,11 @@ export function staticDeploy(options: StaticDeployOptions = {}): Plugin {
       copy(path.join('mesh', 'baked'), baked)
       stats.push(baked)
 
+      // --- shared material assets (maps + measured scalars) ---------------
+      const assets: CopyStat = { label: 'assets', files: 0, bytes: 0 }
+      copy('assets', assets)
+      stats.push(assets)
+
       // --- raw source meshes: manifests always, binaries on request -------
       const raw: CopyStat = { label: rawMeshes ? 'mesh/raw (manifests + binaries)' : 'mesh/raw (manifests only)', files: 0, bytes: 0 }
       const missing: string[] = []
