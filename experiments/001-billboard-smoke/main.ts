@@ -18,8 +18,10 @@ import type { PARAMS } from './manifest.ts'
  * is loaded from mesh/baked / OPFS or baked in-browser from the raw mesh,
  * uploaded, and mipped. Per frame: a compute pass evaluates the shared
  * scatter over a camera-centered cell region, frustum-culls, and compacts
- * survivors into an indirect draw; each surviving plant is one camera-facing
- * side card + one horizontal top card, alpha-tested with depth write.
+ * survivors into an indirect draw. An upright plant is one camera-facing side
+ * card + one horizontal top card; a CARPET species (stand carpetDiv > 0, e.g.
+ * Sphagnum) is instead a single ground-parallel quad the size of its periodic
+ * tile, conformed to the terrain per vertex. Alpha-tested with depth write.
  * Per-frame cost is O(visible region), independent of the stand's plant count.
  */
 
@@ -39,6 +41,8 @@ interface EntryGpu {
   speciesId: string
   gpu: SpeciesGpu
   capacity: number
+  /** Mat species (stand carpetDiv > 0): one ground-parallel quad, no side card. */
+  isCarpet: boolean
   infoBuffer: GPUBuffer
   indirectBuffer: GPUBuffer
   cullBindGroup: GPUBindGroup
@@ -87,13 +91,24 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
     ],
   })
 
-  const sideMax = Math.ceil((2 * REGION_MAX) / CELL) + 1
-  const slotsMax = sideMax * sideMax * SCATTER_MAX_PER_CELL
+  // Worst-case region extent in cells, but never more cells than the stand
+  // itself owns: outside its radius the scatter is empty, so instance capacity
+  // sized for a 128m region on a +/-96m stand is pure dead VRAM. On the
+  // +/-128m stands (default, close-quality via its own radius) this is exactly
+  // the old number — the clamp only ever removes cells that hold nothing.
+  const standSide = Math.floor(ctx.stand.radius / CELL) * 2 + 1
+  const sideMax = Math.min(Math.ceil((2 * REGION_MAX) / CELL) + 1, standSide)
 
   const entries: EntryGpu[] = ctx.stand.species.map((standEntry, entryIndex) => {
     const gpu = speciesGpu.get(standEntry.species)!
-    const density = Math.min(standEntry.density, 8)
-    const capacity = Math.ceil(slotsMax * (density / 8) * 1.06) + 1024
+    const carpetDiv = standEntry.carpetDiv ?? 0
+    const isCarpet = carpetDiv > 0
+    // A carpet entry fills carpetDiv^2 of the cell's slots and ignores
+    // `density`; a scattered entry uses density/8 of all SCATTER_MAX_PER_CELL.
+    const slotsPerCell = isCarpet
+      ? Math.min(carpetDiv * carpetDiv, SCATTER_MAX_PER_CELL)
+      : SCATTER_MAX_PER_CELL * (Math.min(standEntry.density, 8) / 8)
+    const capacity = Math.ceil(sideMax * sideMax * slotsPerCell * 1.06) + 1024
     const infoBuffer = ctx.res.createBuffer(
       {
         label: `${ctx.id}/info-${entryIndex}`,
@@ -138,6 +153,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       speciesId: standEntry.species,
       gpu,
       capacity,
+      isCarpet,
       infoBuffer,
       indirectBuffer,
       cullBindGroup,
@@ -187,9 +203,11 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       const sideZ = Math.max(0, z1 - z0 + 1)
       frustumPlanes(frame.camera.viewProj, planes)
 
-      indirectReset[0] = ctx.params.topCard ? 12 : 6
       entries.forEach((entry, entryIndex) => {
         const a = entry.gpu.atlas
+        // A carpet tile is ONE ground-parallel quad — never a side card, so it
+        // never needs the second 6 vertices (and `topCard` does not apply).
+        indirectReset[0] = entry.isCarpet ? 6 : ctx.params.topCard ? 12 : 6
         info.set(planes, 0)
         info[24] = x0
         info[25] = z0
@@ -208,6 +226,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         info[38] = ctx.params.alphaRef
         info[39] = TOP_FRAC
         info[40] = ctx.params.bottomShade
+        info[41] = ctx.params.carpetOverscale
         device.queue.writeBuffer(entry.infoBuffer, 0, info)
         device.queue.writeBuffer(entry.indirectBuffer, 0, indirectReset)
         entry.slotsPerFrame = sideX * sideZ * SCATTER_MAX_PER_CELL

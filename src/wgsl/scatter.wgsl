@@ -58,7 +58,13 @@ fn scatter_wetness(seed: u32, xz: vec2f) -> f32 {
 
 // Zone boundaries get a little positional jitter so neighbouring carpet zones
 // interlock like real vegetation instead of meeting along a clean contour.
+// CRITICAL: the jitter must be a property of the NODE, never of the entry
+// asking about it. Hashing it together with entry_index made the competing
+// entries evaluate different wetness at the same node, so the partition
+// leaked — 2.55% of nodes were claimed by no entry (bare holes) and 2.63% by
+// two (double-stacked tiles).
 const CARPET_JITTER: f32 = 0.06;
+const CARPET_JITTER_SALT: u32 = 0x51ed2701u;
 const QUARTER_TURN: f32 = 1.5707963;
 
 fn scatter_candidate(seed: u32, entry_index: u32, cell: vec2i, i: u32) -> ScatterPoint {
@@ -76,7 +82,9 @@ fn scatter_candidate(seed: u32, entry_index: u32, cell: vec2i, i: u32) -> Scatte
     let step = SCATTER_CELL_SIZE / entry.carpet_div;
     let g = vec2f(f32(i % n), f32(i / n));
     let xz = vec2f(cell) * SCATTER_CELL_SIZE + (g + 0.5) * step;
-    let jitter = (hash_f32(hash2(h, 7u)) - 0.5) * CARPET_JITTER;
+    // Node-only hash: identical for every entry competing for this node.
+    let node_h = hash4(seed, bitcast<u32>(cell.x), bitcast<u32>(cell.y), i ^ CARPET_JITTER_SALT);
+    let jitter = (hash_f32(node_h) - 0.5) * CARPET_JITTER;
     let w = clamp(scatter_wetness(seed, xz) + jitter, 0.0, 0.9999);
     let lo = entry.wet_center - entry.wet_width * 0.5;
     let hi = entry.wet_center + entry.wet_width * 0.5;

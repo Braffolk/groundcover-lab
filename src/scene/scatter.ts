@@ -26,6 +26,8 @@ const WET_CELL = 12
 const WET_SALT = 0x9e37
 const WET_SLOPE_SQ = fround(0.3276)
 const CARPET_JITTER = fround(0.06)
+// Must be a property of the node, not of the entry asking — see scatter.wgsl.
+const CARPET_JITTER_SALT = 0x51ed2701
 const QUARTER_TURN = fround(1.5707963)
 
 export interface ScatterPoint {
@@ -118,7 +120,8 @@ export class Scatter {
         const h = hash4(this.seed, asU32(cx), asU32(cz), ((entryIndex << 16) ^ i) >>> 0)
         const x = fround(fround(cx * SCATTER_CELL_SIZE) + fround(fround((i % div) + 0.5) * step))
         const z = fround(fround(cz * SCATTER_CELL_SIZE) + fround(fround(Math.floor(i / div) + 0.5) * step))
-        const jitter = fround(fround(hashF32(hash2(h, 7)) - 0.5) * CARPET_JITTER)
+        const nodeH = hash4(this.seed, asU32(cx), asU32(cz), (i ^ CARPET_JITTER_SALT) >>> 0)
+        const jitter = fround(fround(hashF32(nodeH) - 0.5) * CARPET_JITTER)
         const w = Math.min(Math.max(fround(this.wetness(x, z) + jitter), 0), 0.9999)
         if (!(w >= lo && w < hi)) continue
         out.push({

@@ -21,7 +21,7 @@ struct EntryInfo {
   alpha_ref: f32,          // base alpha-test reference
   top_frac: f32,           // top card height as fraction of [y0, y1]
   bottom_shade: f32,       // grounding gradient strength
-  _pad0: f32,
+  carpet_over: f32,        // uniform overscale of every carpet tile (>= 1)
   _pad1: f32,
   _pad2: f32,
 }
