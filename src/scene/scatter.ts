@@ -21,6 +21,11 @@ export const SCATTER_MAX_DENSITY = 8
 
 const TWO_PI = fround(6.2831853)
 
+// Habitat-modulation constants — must match src/wgsl/scatter.wgsl exactly.
+const WET_CELL = 12
+const WET_SALT = 0x9e37
+const WET_SLOPE_SQ = fround(0.3276)
+
 export interface ScatterPoint {
   x: number
   y: number
@@ -61,10 +66,44 @@ export class Scatter {
     return e
   }
 
+  /**
+   * Shared wetness field in [0,1] that stands zone species against — smooth
+   * value noise on a 12m grid, damped on slopes. f32-exact mirror of
+   * scatter_wetness() in src/wgsl/scatter.wgsl (every step is fround'ed
+   * because a threshold comparison would otherwise flip plants near a band
+   * edge between the two twins).
+   */
+  wetness(x: number, z: number): number {
+    const ux = fround(x / WET_CELL)
+    const uz = fround(z / WET_CELL)
+    const bx = Math.floor(ux)
+    const bz = Math.floor(uz)
+    const fx = fround(ux - bx)
+    const fz = fround(uz - bz)
+    const sx = fround(fround(fx * fx) * fround(3 - fround(2 * fx)))
+    const sz = fround(fround(fz * fz) * fround(3 - fround(2 * fz)))
+    const corner = (dx: number, dz: number): number =>
+      hashF32(hash4(this.seed, asU32(bx + dx), asU32(bz + dz), WET_SALT))
+    const a = corner(0, 0)
+    const c = corner(1, 0)
+    const d = corner(0, 1)
+    const e = corner(1, 1)
+    const lo = fround(a + fround(fround(c - a) * sx))
+    const hi = fround(d + fround(fround(e - d) * sx))
+    const n = fround(lo + fround(fround(hi - lo) * sz))
+    const flat = Math.min(
+      Math.max(fround(fround(WET_SLOPE_SQ - this.terrain.slopeSq(x, z)) / WET_SLOPE_SQ), 0),
+      1,
+    )
+    return Math.min(Math.max(fround(n * fround(0.3 + fround(0.7 * flat))), 0), 1)
+  }
+
   /** All plants of stand entry `entryIndex` in cell (cx, cz). Mirror of scatter_candidate(). */
   cell(entryIndex: number, cx: number, cz: number): ScatterPoint[] {
     const e = this.entry(entryIndex)
     const threshold = Math.min(e.density, SCATTER_MAX_DENSITY) / SCATTER_MAX_DENSITY
+    const wetWidth = e.wetWidth ?? 0
+    const wetCenter = e.wetCenter ?? 0
     const out: ScatterPoint[] = []
     for (let i = 0; i < SCATTER_MAX_PER_CELL; i++) {
       const h = hash4(this.seed, asU32(cx), asU32(cz), ((entryIndex << 16) ^ i) >>> 0)
@@ -73,6 +112,10 @@ export class Scatter {
       const oz = hashF32(hash2(h, 2))
       const x = fround(fround(cx + ox) * SCATTER_CELL_SIZE)
       const z = fround(fround(cz + oz) * SCATTER_CELL_SIZE)
+      if (wetWidth > 0) {
+        const dist = fround(Math.abs(fround(this.wetness(x, z) - wetCenter)) / wetWidth)
+        if (hashF32(hash2(h, 6)) >= Math.min(Math.max(fround(1 - dist), 0), 1)) continue
+      }
       const t = hashF32(hash2(h, 4))
       out.push({
         x,

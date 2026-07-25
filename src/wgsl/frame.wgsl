@@ -39,8 +39,11 @@ struct StandEntry {
   sway: f32,          // 0 = rigid (moss), 1 = full wind response
   height_scale: f32,  // nominal plant height (m) from the species catalog
   species_index: f32, // global species catalog index (mesh identity)
-  _pad0: f32,
-  _pad1: f32,
+  // Optional habitat band: this entry only grows where the shared wetness
+  // field is near wet_center, thinning out over wet_width. wet_width = 0
+  // disables it entirely (uniform cover, the historical behaviour).
+  wet_center: f32,
+  wet_width: f32,
 }
 
 @group(0) @binding(0) var<uniform> frame: Frame;

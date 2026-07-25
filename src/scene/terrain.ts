@@ -119,6 +119,17 @@ export class Terrain {
     const ny = Math.sqrt(Math.max(1 - nx * nx - nz * nz, 0))
     return [nx, ny, nz]
   }
+
+  /**
+   * Squared horizontal slope (nx² + nz²) — f32-exact mirror of
+   * `g.y*g.y + g.z*g.z` on terrain_sample() in WGSL. Used by the scatter
+   * wetness field, which needs bit-identical twins and so avoids the sqrt in
+   * normal().
+   */
+  slopeSq(x: number, z: number): number {
+    const [, nx, nz] = this.sample(x, z)
+    return fround(fround(nx * nx) + fround(nz * nz))
+  }
 }
 
 /**

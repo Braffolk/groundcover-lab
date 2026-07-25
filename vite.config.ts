@@ -31,7 +31,9 @@ export default defineConfig(({ command, isPreview }) => ({
         '**/goldens/**',
         '**/results/**',
         '**/mesh/baked/**',
-        '**/mesh/raw/**',
+        // Only the huge binaries — manifest.json MUST stay watched, or
+        // import.meta.glob never notices a newly added source mesh.
+        '**/mesh/raw/**/*.bin',
       ],
     },
   },
