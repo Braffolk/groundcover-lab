@@ -10,8 +10,18 @@ export interface BenchResult {
     params: Record<string, unknown>
     spline: string
     seed: number
-    /** Stand (placement setup) id — results are only comparable within one. */
-    stand: string
+    /**
+     * Stand (placement setup) id — RENDERERS only; results are comparable
+     * only within one. Absent for kinds that have no stand.
+     */
+    stand?: string
+    /**
+     * What the run was measured against when it was not a stand — for a
+     * material, the preview object (`sphere`, `plane`, …). Same role as
+     * `stand`: a partition key, not a label. Exactly one of the two is set,
+     * and every result file written before materials existed has `stand`.
+     */
+    context?: string
   }
   meta: {
     date: string
@@ -32,6 +42,15 @@ export interface BenchResult {
   vram: { totalBytes: number; bySpecies: Record<string, number> }
   /** Raw measured samples for offline analysis. */
   samples: { cpuFrameMs: number[]; gpu: Record<string, number[]> }
+}
+
+/**
+ * The partition a result belongs to: its stand, or — for a kind that has no
+ * stand — whatever it was measured against. Numbers are only comparable within
+ * one of these, so every facet and dedup key goes through here.
+ */
+export function benchContext(r: BenchResult): string {
+  return r.experiment.stand ?? r.experiment.context ?? '(none)'
 }
 
 /** Total of per-pass GPU p50s — the single sortable "GPU cost" number. */

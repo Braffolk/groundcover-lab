@@ -57,6 +57,14 @@ export class CameraController {
   pose: CameraPose
   /** Set false while a bench spline drives the camera. */
   inputEnabled = true
+  /**
+   * Fixed world point orbit rotation pivots about. Null (the default) keeps
+   * the historical free-orbit behaviour: the pivot is a point `orbitDistance`
+   * ahead of the eye, which is what a world you fly through wants. A stage
+   * with ONE subject — a material preview object — sets it to that subject, so
+   * the camera stays framed on it however far you have zoomed in.
+   */
+  orbitPivot: [number, number, number] | null = null
 
   private orbitDistance = 12
   private keys = new Set<string>()
@@ -84,17 +92,30 @@ export class CameraController {
       if (!this.inputEnabled || this.dragButton === -1) return
       if (this.dragButton === 0) {
         const sens = this.mode === 'orbit' ? 0.005 : 0.003
+        // Capture the pivot and the radius BEFORE rotating. Reading them after
+        // made orbit drag a no-op (target = eye + newForward*d, then eye =
+        // target - newForward*d is the identity), so "orbit" behaved exactly
+        // like fly-look for as long as the mode has existed.
+        const orbit = this.mode === 'orbit' ? { target: this.orbitTarget(), radius: this.orbitRadius() } : null
         this.pose.yaw += ev.movementX * sens
         this.pose.pitch = clamp(this.pose.pitch - ev.movementY * sens, -PITCH_LIMIT, PITCH_LIMIT)
-        if (this.mode === 'orbit') this.snapToOrbit()
+        if (orbit) this.placeOnOrbit(orbit.target, orbit.radius)
         this.changed = true
       } else {
         // Right/middle drag: pan target (orbit) or slide (fly).
         const right = this.right()
-        const scale = (this.mode === 'orbit' ? this.orbitDistance : 10) * 0.0015
-        this.pose.x -= (right[0] * ev.movementX - 0) * scale
-        this.pose.z -= right[2] * ev.movementX * scale
-        this.pose.y += ev.movementY * scale
+        const scale = (this.mode === 'orbit' ? this.orbitRadius() : 10) * 0.0015
+        const dx = -right[0] * ev.movementX * scale
+        const dz = -right[2] * ev.movementX * scale
+        const dy = ev.movementY * scale
+        this.pose.x += dx
+        this.pose.y += dy
+        this.pose.z += dz
+        // A fixed pivot pans WITH the eye, or the subject would swing out of
+        // frame instead of sliding.
+        if (this.orbitPivot && this.mode === 'orbit') {
+          this.orbitPivot = [this.orbitPivot[0] + dx, this.orbitPivot[1] + dy, this.orbitPivot[2] + dz]
+        }
         this.changed = true
       }
     }
@@ -103,8 +124,8 @@ export class CameraController {
       ev.preventDefault()
       if (this.mode === 'orbit') {
         const target = this.orbitTarget()
-        this.orbitDistance = clamp(this.orbitDistance * Math.exp(ev.deltaY * 0.0012), 0.2, 400)
-        this.snapToOrbit(target)
+        this.orbitDistance = clamp(this.orbitRadius() * Math.exp(ev.deltaY * 0.0012), 0.05, 400)
+        this.placeOnOrbit(target, this.orbitDistance)
       } else {
         this.flySpeed = clamp(this.flySpeed * Math.exp(-ev.deltaY * 0.001), 0.1, 100)
       }
@@ -190,7 +211,9 @@ export class CameraController {
     return [Math.cos(this.pose.yaw), 0, Math.sin(this.pose.yaw)]
   }
 
+  /** The point orbit rotation turns around, right now. */
   private orbitTarget(): [number, number, number] {
+    if (this.orbitPivot) return [...this.orbitPivot]
     const f = poseForward(this.pose)
     return [
       this.pose.x + f[0] * this.orbitDistance,
@@ -199,10 +222,26 @@ export class CameraController {
     ]
   }
 
-  private snapToOrbit(target = this.orbitTarget()): void {
+  /**
+   * Distance from the eye to the orbit target. With a fixed pivot this is
+   * MEASURED, not remembered, so jumping to a bookmark (or a bench spline)
+   * re-establishes the radius instead of snapping the camera back to whatever
+   * the last wheel event left behind.
+   */
+  private orbitRadius(): number {
+    if (!this.orbitPivot) return this.orbitDistance
+    const d = Math.hypot(
+      this.pose.x - this.orbitPivot[0],
+      this.pose.y - this.orbitPivot[1],
+      this.pose.z - this.orbitPivot[2],
+    )
+    return Math.max(d, 1e-4)
+  }
+
+  private placeOnOrbit(target: readonly [number, number, number], radius: number): void {
     const f = poseForward(this.pose)
-    this.pose.x = target[0] - f[0] * this.orbitDistance
-    this.pose.y = target[1] - f[1] * this.orbitDistance
-    this.pose.z = target[2] - f[2] * this.orbitDistance
+    this.pose.x = target[0] - f[0] * radius
+    this.pose.y = target[1] - f[1] * radius
+    this.pose.z = target[2] - f[2] * radius
   }
 }

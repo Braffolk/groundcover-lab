@@ -89,15 +89,21 @@ export function devSink(): Plugin {
           }
           if (route === '/__bench' && req.method === 'POST') {
             const body = JSON.parse((await readBody(req)).toString('utf8')) as {
-              experiment?: { id?: string; stand?: string }
+              experiment?: { id?: string; stand?: string; context?: string }
               meta?: { paramsHash?: string; adapterSlug?: string; date?: string }
             }
             const exp = segment(body.experiment?.id ?? null, 'experiment id')
-            const stand = segment(body.experiment?.stand ?? null, 'stand id')
+            // Renderers file under their stand; kinds with no stand (materials)
+            // file under `context` — the preview object. Same slot in the name,
+            // so every historical filename still parses the same way.
+            const partition = segment(
+              body.experiment?.stand ?? body.experiment?.context ?? 'none',
+              'stand/context id',
+            )
             const hash = segment(body.meta?.paramsHash ?? null, 'params hash')
             const adapter = segment(body.meta?.adapterSlug ?? null, 'adapter slug')
             const date = (body.meta?.date ?? new Date().toISOString()).replace(/[:.]/g, '-')
-            const name = `${exp}__${stand}__p-${hash}__${adapter}__${segment(date, 'date')}.json`
+            const name = `${exp}__${partition}__p-${hash}__${adapter}__${segment(date, 'date')}.json`
             const saved = write('results', name, JSON.stringify(body, null, 2))
             json(res, 200, { saved })
             return

@@ -1,7 +1,11 @@
 import { parsePose, type CameraPose } from '../../scene/camera.ts'
 import { MESH_NOT_DEPLOYED } from '../../mesh/catalog.ts'
+import { DEFAULT_PREVIEW_OBJECT, isPreviewObjectId, type PreviewObjectId } from '../../scene/preview.ts'
 import { standById, standPlantCounts, STANDS, type Stand } from '../../scene/stands.ts'
 import { updateQuery } from '../../url/state.ts'
+import { isMaterialStage, materialStage } from '../materialStage.ts'
+import type { RegistryEntry } from '../registry.ts'
+import { standStage, type StageFactory } from '../stage.ts'
 
 export interface View {
   dispose(): void
@@ -86,6 +90,115 @@ export function standPicker(current: Stand): HTMLElement {
   select.addEventListener('change', () => {
     updateQuery({ stand: select.value === 'default' ? null : select.value })
     location.reload()
+  })
+  label.appendChild(select)
+  return label
+}
+
+// ---------------------------------------------------------------------------
+// Choosing the stage from the experiment's kind
+// ---------------------------------------------------------------------------
+
+/**
+ * What a route needs to know once it has looked at `manifest.kind`: which
+ * Stage to build, and which partition key the bench result should record.
+ * Exactly one of `stand` / `previewObject` is set.
+ */
+export interface StageChoice {
+  kind: 'stand' | 'material'
+  stage: StageFactory
+  /** Renderers only — the placement setup being drawn. */
+  stand: Stand | null
+  /** Materials only — the preview object the stage opens on. */
+  previewObject: PreviewObjectId | null
+  /** One line for the topbar/HUD. */
+  summary: string
+}
+
+/** The preview object from the URL (`obj=`), else the manifest's, else sphere. */
+export function readPreviewObject(q: URLSearchParams, entry?: RegistryEntry): PreviewObjectId {
+  const fromUrl = q.get('obj')
+  if (isPreviewObjectId(fromUrl)) return fromUrl
+  if (fromUrl !== null) console.warn(`unknown preview object "${fromUrl}" — falling back to ${DEFAULT_PREVIEW_OBJECT}`)
+  const fromManifest = entry?.manifest?.previewObject
+  return isPreviewObjectId(fromManifest) ? fromManifest : DEFAULT_PREVIEW_OBJECT
+}
+
+/**
+ * Pick the stage for an experiment. This is the ONLY place a route branches on
+ * kind — `#/run`, `#/ab` and `#/bench` are otherwise identical for a material
+ * and for a renderer, which is the point of the Stage seam.
+ */
+export function stageFor(entry: RegistryEntry, q: URLSearchParams, seed: number): StageChoice {
+  if (entry.kind === 'material') {
+    const previewObject = readPreviewObject(q, entry)
+    return {
+      kind: 'material',
+      stage: materialStage(previewObject),
+      stand: null,
+      previewObject,
+      summary: `material preview · ${previewObject}`,
+    }
+  }
+  const stand = readStand(q)
+  return {
+    kind: 'stand',
+    stage: standStage(stand, seed),
+    stand,
+    previewObject: null,
+    summary: standSummary(stand),
+  }
+}
+
+/**
+ * The preview object a running app is showing RIGHT NOW (the picker changes it
+ * live), or the default for a page that has no material stage.
+ */
+export function currentPreviewObject(app: LabApp): PreviewObjectId {
+  return isMaterialStage(app.stage) ? app.stage.previewObject : DEFAULT_PREVIEW_OBJECT
+}
+
+/**
+ * One-line summary of the active preview object, for HUDs/topbars — the
+ * material counterpart of `standSummary`. Reports the uv-to-world density
+ * because that is what a material turns into a life-size tile repeat.
+ */
+export function previewSummary(app: LabApp): string {
+  const stage = app.stage
+  if (!isMaterialStage(stage)) return 'no preview object'
+  const m = stage.geometry.mesh
+  const wrap = m.uvPeriod.map((p, i) => (p > 0 ? `${'uv'[i]} wraps @${p.toFixed(2)}m` : `${'uv'[i]} open`)).join(' · ')
+  return (
+    `${m.title} · ${formatCount(m.indexCount / 3)} tris · uv in metres ` +
+    `[${m.uvBounds.min[0].toFixed(2)},${m.uvBounds.min[1].toFixed(2)}]–` +
+    `[${m.uvBounds.max[0].toFixed(2)},${m.uvBounds.max[1].toFixed(2)}] · ${wrap}`
+  )
+}
+
+/**
+ * Toolbar preview-object picker — the material counterpart of `standPicker`.
+ * Switching is live (the stage holds all four meshes and the experiment reads
+ * `ctx.preview.mesh` per frame), so unlike the stand picker it does not reload.
+ *
+ * Deliberately the same unstyled label+select as everything else in this
+ * toolbar: the UI rework is a later phase.
+ */
+export function previewObjectPicker(app: LabApp): HTMLElement {
+  const stage = app.stage
+  const label = el('label', undefined, 'object')
+  const select = el('select')
+  if (!isMaterialStage(stage)) return label
+  for (const mesh of stage.geometry.objects) {
+    const option = el('option', undefined, mesh.id)
+    option.value = mesh.id
+    option.title = mesh.purpose
+    option.selected = mesh.id === stage.previewObject
+    select.appendChild(option)
+  }
+  select.addEventListener('change', () => {
+    if (!isPreviewObjectId(select.value)) return
+    stage.previewObject = select.value
+    updateQuery({ obj: select.value === DEFAULT_PREVIEW_OBJECT ? null : select.value })
   })
   label.appendChild(select)
   return label

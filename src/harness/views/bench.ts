@@ -5,10 +5,10 @@ import { buildHash, type HashState } from '../../url/state.ts'
 import { HAS_DEV_SINK } from '../../util/env.ts'
 import { Overlay } from '../../ui/overlay.ts'
 import { LabApp } from '../loop.ts'
-import { standStage } from '../stage.ts'
+import { MATERIAL_DEFAULT_SPLINE } from '../materialStage.ts'
 import { paramsHash } from '../params.ts'
 import { findExperiment, HARNESS_API } from '../registry.ts'
-import { button, el, fatalDetail, link, readSeed, readStand, topbar, type View } from './shared.ts'
+import { button, currentPreviewObject, el, fatalDetail, link, readSeed, stageFor, topbar, type View } from './shared.ts'
 
 const CANVAS: [number, number] = [1600, 900]
 
@@ -32,8 +32,9 @@ export async function benchView(root: HTMLElement, state: HashState): Promise<Vi
   try {
     const entry = await findExperiment(id)
     const seed = readSeed(state.q)
-    const stand = readStand(state.q)
-    const splineName = state.q.get('spline') ?? 'orbit-low'
+    const choice = stageFor(entry, state.q, seed)
+    // Each stage has its own camera paths, so it has its own default one.
+    const splineName = state.q.get('spline') ?? (choice.kind === 'material' ? MATERIAL_DEFAULT_SPLINE : 'orbit-low')
     const warmup = Math.max(1, Number(state.q.get('warmup')) || 120)
     const frames = Math.max(1, Number(state.q.get('frames')) || 600)
 
@@ -42,7 +43,8 @@ export async function benchView(root: HTMLElement, state: HashState): Promise<Vi
         el(
           'span',
           'hint',
-          `${stand.id} · ${splineName} · seed ${seed} · ${warmup}+${frames} frames · ${CANVAS[0]}×${CANVAS[1]}`,
+          `${choice.stand?.id ?? choice.previewObject} · ${splineName} · seed ${seed} · ` +
+            `${warmup}+${frames} frames · ${CANVAS[0]}×${CANVAS[1]}`,
         ),
         link(buildHash(['results']), 'results table'),
       ]),
@@ -62,7 +64,7 @@ export async function benchView(root: HTMLElement, state: HashState): Promise<Vi
     const app = await LabApp.create({
       canvas,
       seed,
-      stage: standStage(stand, seed),
+      stage: choice.stage,
       experiments: [{ entry, ns: 'p', query: state.q }],
       onProgress: (fraction, note) => {
         status.textContent = `${Math.round(fraction * 100)}% · ${note ?? ''}`
@@ -123,7 +125,16 @@ export async function benchView(root: HTMLElement, state: HashState): Promise<Vi
         : null
       const result: BenchResult = {
         schemaVersion: BENCH_SCHEMA_VERSION,
-        experiment: { id, params: { ...view.params }, spline: splineName, seed, stand: stand.id },
+        experiment: {
+          id,
+          params: { ...view.params },
+          spline: splineName,
+          seed,
+          // Exactly one partition key: a renderer's stand, or a material's
+          // preview object. Both feed the same `stand` facet in the results
+          // table and the same slot in the saved filename.
+          ...(choice.stand ? { stand: choice.stand.id } : { context: currentPreviewObject(app) }),
+        },
         meta: {
           date: new Date().toISOString(),
           paramsHash: paramsHash(view.params),

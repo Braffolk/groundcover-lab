@@ -9,8 +9,15 @@ import { CameraController, poseMatrices, type CameraPose } from '../scene/camera
 import { createFrameLayout, FrameGroup } from '../scene/frameUbo.ts'
 import type { CameraSpline } from '../scene/spline.ts'
 import { WIND_DEFAULTS } from '../scene/wind.ts'
-import type { Stage, StageFactory } from './stage.ts'
-import type { Experiment, ExperimentContext, FrameInfo, RegistryEntry, ViewTargets } from './registry.ts'
+import type { Stage, StageContextExt, StageFactory } from './stage.ts'
+import type {
+  Experiment,
+  ExperimentContext,
+  ExperimentContextCore,
+  FrameInfo,
+  RegistryEntry,
+  ViewTargets,
+} from './registry.ts'
 import { paramDefaults, paramsFromQuery, type ParamSchema, type ParamValues } from './params.ts'
 
 export const DEPTH_FORMAT: GPUTextureFormat = 'depth32float'
@@ -21,7 +28,8 @@ export interface ViewSlot {
   name: 'solo' | 'A' | 'B'
   entry: RegistryEntry
   experiment: Experiment
-  ctx: ExperimentContext
+  /** Core + whatever the active stage merged in; the union is stage-dependent. */
+  ctx: ExperimentContextCore & StageContextExt
   params: ParamValues<ParamSchema>
   scope: VramScope
   color: GPUTexture
@@ -140,6 +148,8 @@ export class LabApp {
 
     const camera = new CameraController(opts.initialPose ?? stage.defaultPose)
     camera.mode = stage.cameraMode
+    // A stage with one subject (a material preview object) orbits about it.
+    camera.orbitPivot = stage.orbitPivot ? [...stage.orbitPivot] : null
     camera.attach(opts.canvas)
     const canvasCtx = configureCanvas(gpu, opts.canvas)
 
@@ -171,12 +181,11 @@ export class LabApp {
     const params = paramsFromQuery(manifest.params, query, ns)
     const { color, colorView, depth, depthView } = this.createTargets(name)
     const app = this
-    const ctx: ExperimentContext = {
+    const core: ExperimentContextCore = {
       id: entry.id,
       device: this.gpu.device,
       colorFormat: this.gpu.format,
       depthFormat: DEPTH_FORMAT,
-      ...this.stage.contextFor(name),
       frame: { layout: this.frameGroup.layout, bindGroup: this.frameGroup.bindGroup },
       res: scope,
       shaders: this.shaders,
@@ -187,8 +196,13 @@ export class LabApp {
       size: () => ({ width: app.width, height: app.height }),
       progress: (fraction, note) => this.opts.onProgress?.(fraction, note),
     }
+    // The stage decides what else the experiment sees — ctx.scene/ctx.stand for
+    // a stand, ctx.preview for a material. Which one it is was already settled
+    // when the view picked the stage from `manifest.kind`, so the cast here is
+    // the one place that knowledge crosses from the route into the experiment.
+    const ctx = { ...core, ...this.stage.contextFor(name) }
     const module = await manifest.load()
-    const experiment = await module.create(ctx)
+    const experiment = await module.create(ctx as ExperimentContext)
     return { ns, name, entry, experiment, ctx, params, scope, color, colorView, depth, depthView }
   }
 

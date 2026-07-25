@@ -8,22 +8,23 @@ import { captureViewPng, downloadBlob, uploadCapture } from '../capture.ts'
 import { fetchRating, saveRating } from '../ratings.ts'
 import { pipsRow } from '../../ui/pips.ts'
 import { LabApp } from '../loop.ts'
-import { standStage } from '../stage.ts'
 import { paramsToQuery } from '../params.ts'
 import { findExperiment } from '../registry.ts'
 import {
   button,
   copyToClipboard,
   currentBookmarkName,
+  currentPreviewObject,
   debugPicker,
   el,
   fatalDetail,
+  previewObjectPicker,
+  previewSummary,
   readSeed,
-  readStand,
   resolveCam,
   setupCameraSync,
+  stageFor,
   standPicker,
-  standSummary,
   topbar,
   type View,
 } from './shared.ts'
@@ -43,13 +44,28 @@ export async function runView(root: HTMLElement, state: HashState): Promise<View
     const entry = await findExperiment(id)
     const manifest = entry.manifest!
     const seed = readSeed(state.q)
-    const stand = readStand(state.q)
+    const choice = stageFor(entry, state.q, seed)
     const isReference = manifest.status === 'reference'
+    const isMaterial = choice.kind === 'material'
 
     page.appendChild(
       topbar(manifest.title, [
-        el('span', 'hint', isReference ? 'reference — ignores the stand' : `${stand.id} · seed ${seed}`),
-        el('span', 'hint', 'drag=look · WASD/QE=fly · Tab=orbit · 1-4 cams · Shift+N save cam'),
+        el(
+          'span',
+          'hint',
+          isMaterial
+            ? `preview · ${choice.previewObject}`
+            : isReference
+              ? 'reference — ignores the stand'
+              : `${choice.stand!.id} · seed ${seed}`,
+        ),
+        el(
+          'span',
+          'hint',
+          isMaterial
+            ? 'drag=orbit · wheel=zoom · 1-4 cams · Shift+N save cam'
+            : 'drag=look · WASD/QE=fly · Tab=orbit · 1-4 cams · Shift+N save cam',
+        ),
       ]),
     )
     const content = el('div', 'content')
@@ -69,7 +85,7 @@ export async function runView(root: HTMLElement, state: HashState): Promise<View
     const app = await LabApp.create({
       canvas,
       seed,
-      stage: standStage(stand, seed),
+      stage: choice.stage,
       experiments: [{ entry, ns: 'p', query: state.q }],
       onProgress: (fraction, note) => {
         status.textContent = `${Math.round(fraction * 100)}% · ${note ?? ''}`
@@ -105,7 +121,10 @@ export async function runView(root: HTMLElement, state: HashState): Promise<View
       stats: app.stats,
       vram: () => app.vramReport(),
       gpuTimingAvailable: app.gpu.hasTimestamps,
-      extraLines: () => [isReference ? 'reference — ignores the stand' : standSummary(stand)],
+      extraLines: () =>
+        isMaterial
+          ? [previewSummary(app)]
+          : [isReference ? 'reference — ignores the stand' : choice.summary],
     })
     cleanups.push(() => hud.dispose())
 
@@ -158,9 +177,16 @@ export async function runView(root: HTMLElement, state: HashState): Promise<View
     }
     toolbar.append(
       button('bench', () => {
-        location.hash = buildHash(['bench', id], { seed: String(seed), stand: stand.id })
+        location.hash = buildHash(
+          ['bench', id],
+          isMaterial
+            ? { seed: String(seed), obj: currentPreviewObject(app) }
+            : { seed: String(seed), stand: choice.stand!.id },
+        )
       }),
-      standPicker(stand),
+      // The stand picker is meaningless for a material — it shows the preview
+      // object instead, which is the material's equivalent partition.
+      isMaterial ? previewObjectPicker(app) : standPicker(choice.stand!),
       debugPicker(app, state.q.get('debug')),
     )
     if (!isReference) {

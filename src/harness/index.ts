@@ -7,15 +7,43 @@
 export {
   HARNESS_API,
   defineExperiment,
+  defineMaterial,
   type Experiment,
   type ExperimentContext,
+  type ExperimentContextCore,
+  type ExperimentKind,
   type ExperimentManifest,
   type ExperimentModule,
   type ExperimentStatus,
   type FrameInfo,
   type SceneServices,
+  type StandContextExt,
   type ViewTargets,
 } from './registry.ts'
+
+/**
+ * MATERIALS. A material experiment is previewed on harness-owned geometry, so
+ * its context carries `ctx.preview` where a renderer's carries `ctx.scene` /
+ * `ctx.stand`; declare it as
+ * `ExperimentContext<typeof PARAMS, MaterialContextExt>`.
+ *
+ * It never authors a preview mesh — two materials on two slightly different
+ * spheres turn every A/B into a comparison of geometry. Draw `ctx.preview.mesh`
+ * with `PREVIEW_VERTEX_LAYOUT`; the uv/tangent contract is documented in full
+ * at the top of src/scene/preview.ts.
+ */
+export {
+  DEFAULT_PREVIEW_OBJECT,
+  PREVIEW_OBJECTS,
+  PREVIEW_VERTEX_FLOATS,
+  PREVIEW_VERTEX_LAYOUT,
+  PREVIEW_VERTEX_STRIDE,
+  isPreviewObjectId,
+  type MaterialContextExt,
+  type PreviewMesh,
+  type PreviewObjectId,
+  type PreviewScene,
+} from '../scene/preview.ts'
 
 export {
   p,

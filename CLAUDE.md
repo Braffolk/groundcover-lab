@@ -10,9 +10,10 @@ rules for your kind.
 
 - **renderer** — draws the plants of a stand. The original kind; everything in
   "Renderer rules" applies.
-- **material** — a surface material: channels authored as an inspectable graph
-  plus WGSL for the parallax/BRDF behaviour, previewed on standard geometry.
-  *(Being built now. Until its section here exists, do not start one.)*
+- **material** — a surface material, previewed on standard geometry. See
+  "Material rules". *(The graph/codegen half is NOT built yet: a material today
+  is an ordinary `Experiment` that draws the preview geometry with its own
+  shader. Do not invent a graph format ahead of it.)*
 - **reference** — a stand-independent visual baseline (000-ground-truth).
 
 **Carpets are DEPRECATED.** A tiled ground mat is a *material*, not a species of
@@ -41,6 +42,57 @@ Forbidden: `src/**`, other experiments, `package.json`, any shared file. If the 
 - **Experiments are RENDERERS of a stand, never placers.** The active stand (`ctx.stand`, URL `stand=<id>`, default `default`) is the harness-owned placement setup: which species, densities, scale ranges, sway, region. Stand + seed fully determines every plant instance via `ctx.scene.scatter` (TS buffers) or the bit-identical WGSL twin (`src/wgsl/scatter.wgsl` + `stand_table`). Render exactly the stand's plants — all its species entries, at their exact positions/scales. Your params may only affect HOW it is drawn, never what/where grows. Stands live in `src/scene/stands.ts` (shared code — don't touch); A/B and bench results are only comparable within one stand + seed.
 - The only sanctioned exception is `status: 'reference'` (e.g. 000-ground-truth): stand-independent visual baselines, shown in a separate browser row and clearly labeled. Don't add more without a reason as good as "the raw mesh is a community tile and physically cannot follow per-plant placement".
 - You MAY read the raw source mesh (`ctx` mesh catalog, GCMESH1) and invent any novel baked representation. Put baked artifacts in `mesh/baked/<your-id>/` via the bake flow; format is entirely yours.
+
+## Material rules
+
+> **PROVISIONAL — written mid-build.** The graph/codegen half of the material
+> system is not built yet. Three things here expire when it lands and must be
+> rewritten rather than patched: "a material is an ordinary `Experiment` that
+> draws the preview geometry with its own shader", "do not invent a graph
+> format", and the instruction to hand-write map sampling. Everything else —
+> the preview-geometry contract, uv in metres, the id/path rules, debug views,
+> the VRAM note — is about the *stage*, not the authoring model, and survives.
+> If you are reading this after the graph exists and this banner is still here,
+> the doc is stale; trust `src/material/` over this section.
+
+Everything in the shared core above binds you too — `@harness`-only imports,
+`ctx.res` for every allocation, determinism, `assetUrl()`, and **debug views are
+just as mandatory**. What differs:
+
+- Declare it with `defineMaterial({...})` (sets `kind: 'material'` for you) and
+  type your context `ExperimentContext<typeof PARAMS, MaterialContextExt>`. You
+  get `ctx.preview` instead of `ctx.scene`/`ctx.stand` — there is no stand.
+- Live under `experiments/materials/<class>/<subject>/<nnn>-<slug>/`. Your id is
+  the LAST path segment and must be unique across the whole tree.
+- **Materials are SHADERS of the preview geometry, never authors of it.** Draw
+  `ctx.preview.mesh` with `PREVIEW_VERTEX_LAYOUT` and nothing else — two
+  materials on two slightly different spheres turn every A/B into a comparison
+  of geometry. The object shown is a runtime choice (`obj=`, the toolbar picker,
+  `previewObject` in the manifest) and both A/B sides always see the same one.
+- **The preview uv is in METRES OF SURFACE, not [0,1].** A material with a
+  real-world period divides by that period ONCE, isotropically, and is at life
+  size on every object. A per-axis scale factor is the "material stretched to
+  fit the polygons" bug; it has already been made twice. `PreviewMesh.uvPeriod`
+  tells you which axis closes on itself (snap to a whole number of tiles there,
+  and apply the snapped value to BOTH axes so tiles stay square); `uvBounds` is
+  the metre rectangle a displacing method must test its offset uv against. Full
+  contract at the top of `src/scene/preview.ts`.
+- The preview sphere is a **cube-sphere**, on purpose. A lat/long sphere's u
+  compresses by sin(colatitude) and every tiling material inherits a pinwheel
+  singularity at the poles; a singularity is not a distortion you can tune away.
+- A material has no species, and nothing is renamed for it: list your own
+  experiment id in `manifest.species` and pass the same string as `{ species }`
+  to `ctx.res`, so the HUD budget bar has one row meaning "this material's
+  maps". The 25MB figure was calibrated for a plant species' baked
+  representation and has no material-appropriate meaning yet — state your actual
+  bytes in NOTES.md rather than reading the bar as a verdict.
+- Cameras: `three-quarter` (default), `macro`, `grazing`, `silhouette`. Bench
+  splines: `orbit-object` (the default) and `macro-pass`. Bench results record
+  the preview object as `experiment.context` where a renderer records `stand`;
+  they are only comparable within one object.
+- The harness base pass clears the studio backdrop and depth and **does not draw
+  the object** — you do, so a silhouette-POM material stays free to discard
+  fragments and write its own depth.
 
 ## Silent-failure traps (each of these has already cost an experiment a wrong result)
 

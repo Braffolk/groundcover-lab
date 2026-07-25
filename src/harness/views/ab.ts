@@ -4,7 +4,6 @@ import { Hud } from '../../ui/hud.ts'
 import { buildParamsPanel } from '../../ui/panel.ts'
 import { CompareCompositor, type CompareMode } from '../compare.ts'
 import { LabApp, type ViewSlot } from '../loop.ts'
-import { standStage } from '../stage.ts'
 import { paramsToQuery } from '../params.ts'
 import { findExperiment } from '../registry.ts'
 import {
@@ -13,12 +12,13 @@ import {
   debugPicker,
   el,
   fatalDetail,
+  previewObjectPicker,
+  previewSummary,
   readSeed,
-  readStand,
   resolveCam,
   setupCameraSync,
+  stageFor,
   standPicker,
-  standSummary,
   topbar,
   type View,
 } from './shared.ts'
@@ -42,22 +42,34 @@ export async function abView(root: HTMLElement, state: HashState): Promise<View>
   try {
     const [entryA, entryB] = await Promise.all([findExperiment(idA), findExperiment(idB)])
     const seed = readSeed(state.q)
-    const stand = readStand(state.q)
+    // One page, one stage, one camera — so both sides must want the same
+    // world. Comparing a material against a stand renderer is not a thing that
+    // has an answer; say so rather than silently previewing one of them.
+    if (entryA.kind !== entryB.kind) {
+      throw new Error(
+        `cannot A/B a ${entryA.kind} against a ${entryB.kind}: "${idA}" is a ${entryA.kind} and "${idB}" is a ${entryB.kind}. ` +
+          'A/B shares ONE stage (scene, camera and base pass) between the two sides, and the two kinds do not share one.',
+      )
+    }
+    const choice = stageFor(entryA, state.q, seed)
+    const isMaterial = choice.kind === 'material'
 
     // Surface renderers that do not cover part of the stand.
     const warnings: string[] = []
-    for (const [side, entry] of [['A', entryA], ['B', entryB]] as const) {
-      if (entry.manifest!.status === 'reference') {
-        warnings.push(`${side} is a reference — it ignores the stand`)
-        continue
+    if (!isMaterial) {
+      for (const [side, entry] of [['A', entryA], ['B', entryB]] as const) {
+        if (entry.manifest!.status === 'reference') {
+          warnings.push(`${side} is a reference — it ignores the stand`)
+          continue
+        }
+        const missing = choice.stand!.species.filter((e) => !entry.manifest!.species.includes(e.species))
+        if (missing.length > 0) warnings.push(`${side} does not render: ${missing.map((e) => e.species).join(', ')}`)
       }
-      const missing = stand.species.filter((e) => !entry.manifest!.species.includes(e.species))
-      if (missing.length > 0) warnings.push(`${side} does not render: ${missing.map((e) => e.species).join(', ')}`)
     }
 
     page.appendChild(
       topbar(`A/B — timings contended, bench solo for truth`, [
-        el('span', 'hint', `${stand.id} · seed ${seed}`),
+        el('span', 'hint', isMaterial ? `preview · ${choice.previewObject}` : `${choice.stand!.id} · seed ${seed}`),
         ...warnings.map((w) => el('span', 'hint', w)),
       ]),
     )
@@ -76,7 +88,7 @@ export async function abView(root: HTMLElement, state: HashState): Promise<View>
     const app = await LabApp.create({
       canvas,
       seed,
-      stage: standStage(stand, seed),
+      stage: choice.stage,
       experiments: [
         { entry: entryA, ns: 'a', query: state.q },
         { entry: entryB, ns: 'b', query: state.q },
@@ -174,7 +186,7 @@ export async function abView(root: HTMLElement, state: HashState): Promise<View>
       gpuTimingAvailable: app.gpu.hasTimestamps,
       contended: true,
       extraLines: () => {
-        const lines = [standSummary(stand)]
+        const lines = [isMaterial ? previewSummary(app) : choice.summary]
         if (compositor.mode === 'flicker') lines.push(`showing ${compositor.side === 0 ? 'A' : 'B'} — Space to swap`)
         if (compositor.mode === 'diff' && compositor.lastDiff) {
           const d = compositor.lastDiff
@@ -216,7 +228,7 @@ export async function abView(root: HTMLElement, state: HashState): Promise<View>
       button('copy link', () => {
         void copyToClipboard(location.href).then(() => overlay.toast('link copied'))
       }),
-      standPicker(stand),
+      isMaterial ? previewObjectPicker(app) : standPicker(choice.stand!),
       debugPicker(app, state.q.get('debug')),
     )
     viewer.appendChild(toolbar)

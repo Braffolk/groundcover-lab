@@ -1,6 +1,7 @@
 import type { CameraPose } from '../scene/camera.ts'
 import type { CameraMatrices } from '../scene/camera.ts'
 import type { CameraSpline } from '../scene/spline.ts'
+import type { MaterialContextExt, PreviewObjectId } from '../scene/preview.ts'
 import type { Scatter } from '../scene/scatter.ts'
 import type { SpeciesDesc } from '../scene/species.ts'
 import type { Stand } from '../scene/stands.ts'
@@ -26,7 +27,7 @@ export type ExperimentStatus = 'idea' | 'wip' | 'working' | 'best' | 'abandoned'
  */
 export type ExperimentKind = 'renderer' | 'material'
 
-export interface ExperimentManifest<S extends ParamSchema = ParamSchema> {
+export interface ExperimentManifest<S extends ParamSchema = ParamSchema, X = StandContextExt> {
   /**
    * Unique id. For a top-level experiment this is the directory name; for a
    * nested one (materials/mosses/sphagnum/003-nd-fuzz) it is the LAST path
@@ -40,18 +41,32 @@ export interface ExperimentManifest<S extends ParamSchema = ParamSchema> {
   /** Defaults to 'renderer'. */
   kind?: ExperimentKind
   harnessApi: number
-  /** Species ids rendered — each gets a 25MB VRAM budget row. */
+  /**
+   * Species ids rendered — each gets a 25MB VRAM budget row in the HUD.
+   *
+   * A MATERIAL has no species, and nothing here is renamed for it: a material
+   * lists its own experiment id and tags its `ctx.res` allocations with the
+   * same string, so the existing budget bar keeps working unchanged and one
+   * row means "this material's maps". (25MB was calibrated for a plant
+   * species' baked representation, not for a measured 2048² map set — see the
+   * VRAM section of a material's NOTES.md before reading the bar as a verdict.)
+   */
   species: string[]
   params: S
   /** Optional extra camera bookmarks (serialized poses). */
   cams?: Record<string, string>
+  /**
+   * MATERIAL ONLY — which preview object to open on (`sphere` by default). The
+   * URL `obj=` wins over it, and the toolbar picker changes it live.
+   */
+  previewObject?: PreviewObjectId
   /** Bump to invalidate this experiment's bake caches. */
   bakeVersion?: number
-  load: () => Promise<ExperimentModule<S>>
+  load: () => Promise<ExperimentModule<S, X>>
 }
 
-export interface ExperimentModule<S extends ParamSchema = ParamSchema> {
-  create(ctx: ExperimentContext<S>): Experiment | Promise<Experiment>
+export interface ExperimentModule<S extends ParamSchema = ParamSchema, X = StandContextExt> {
+  create(ctx: ExperimentContext<S, X>): Experiment | Promise<Experiment>
 }
 
 export interface SceneServices {
@@ -61,6 +76,20 @@ export interface SceneServices {
   species: readonly SpeciesDesc[]
   bookmarks: Record<string, CameraPose>
   splines: Record<string, CameraSpline>
+}
+
+/**
+ * What the `stand` stage merges into an experiment's context — declared here,
+ * beside SceneServices, so registry.ts never has to import from stage.ts.
+ */
+export interface StandContextExt {
+  scene: SceneServices
+  /**
+   * The active stand — THE definition of what grows (species, densities,
+   * scales, sway, region). Render exactly its plants via ctx.scene.scatter
+   * (or the WGSL twin); experiments never define placement themselves.
+   */
+  stand: Stand
 }
 
 export interface FrameInfo {
@@ -84,16 +113,24 @@ export interface ViewTargets {
   view: 'solo' | 'A' | 'B'
 }
 
-export interface ExperimentContext<S extends ParamSchema = ParamSchema> {
+/**
+ * Everything an experiment gets regardless of kind. The stage-specific half
+ * (`ctx.scene`/`ctx.stand` for a renderer, `ctx.preview` for a material) is
+ * merged in on top — see `ExperimentContext`.
+ */
+export interface ExperimentContextCore<S extends ParamSchema = ParamSchema> {
   /** This experiment's id (directory name) — use it in labels and bake keys. */
   id: string
   device: GPUDevice
   colorFormat: GPUTextureFormat
   depthFormat: GPUTextureFormat
-  scene: SceneServices
   /** Shared @group(0) — bind `frame.bindGroup`, include src/wgsl/frame.wgsl. */
   frame: { layout: GPUBindGroupLayout; bindGroup: GPUBindGroup }
-  /** VRAM-tracked allocator scoped to this experiment. Pass { species }. */
+  /**
+   * VRAM-tracked allocator scoped to this experiment. Pass `{ species }` — a
+   * plant species id for a renderer, the experiment's own id for a material
+   * (see `ExperimentManifest.species`).
+   */
   res: VramScope
   shaders: ShaderRegistry
   /** Pass factory — all passes are auto-timed and labeled per view. */
@@ -102,12 +139,6 @@ export interface ExperimentContext<S extends ParamSchema = ParamSchema> {
   params: ParamValues<S>
   /** Placement seed (URL `seed`). Feed it to scatter / the shared hash. */
   seed: number
-  /**
-   * The active stand — THE definition of what grows (species, densities,
-   * scales, sway, region). Render exactly its plants via ctx.scene.scatter
-   * (or the WGSL twin); experiments never define placement themselves.
-   */
-  stand: Stand
   meshes: MeshCatalog
   size(): { width: number; height: number }
   /**
@@ -119,6 +150,21 @@ export interface ExperimentContext<S extends ParamSchema = ParamSchema> {
   progress(fraction: number, note?: string): void
 }
 
+/**
+ * The context an experiment's `create()` receives: the core above plus the
+ * active stage's extension.
+ *
+ * `X` defaults to `StandContextExt`, so every renderer keeps writing
+ * `ExperimentContext<typeof PARAMS>` and keeps getting `ctx.scene` and
+ * `ctx.stand`. A material writes
+ * `ExperimentContext<typeof PARAMS, MaterialContextExt>` and gets `ctx.preview`
+ * instead — and, correctly, no `ctx.stand`, because there is no stand.
+ */
+export type ExperimentContext<
+  S extends ParamSchema = ParamSchema,
+  X = StandContextExt,
+> = ExperimentContextCore<S> & X
+
 export interface Experiment {
   /** CPU work + uniform uploads. Called once per frame before encoding. */
   update?(frame: FrameInfo): void
@@ -129,8 +175,27 @@ export interface Experiment {
   dispose(): void
 }
 
-export function defineExperiment<S extends ParamSchema>(manifest: ExperimentManifest<S>): ExperimentManifest<S> {
+/**
+ * Declare a RENDERER (the default kind). `X` exists so the same helper can
+ * declare any kind explicitly, but a material should use `defineMaterial`,
+ * which infers the context for you.
+ */
+export function defineExperiment<S extends ParamSchema, X = StandContextExt>(
+  manifest: ExperimentManifest<S, X>,
+): ExperimentManifest<S, X> {
   return manifest
+}
+
+/**
+ * Declare a MATERIAL. Sets `kind: 'material'` (so it cannot be forgotten, and
+ * the route therefore always builds the material stage) and types `create`'s
+ * context as core + `ctx.preview` — with no `ctx.stand`, because there is no
+ * stand.
+ */
+export function defineMaterial<S extends ParamSchema>(
+  manifest: Omit<ExperimentManifest<S, MaterialContextExt>, 'kind'>,
+): ExperimentManifest<S, MaterialContextExt> {
+  return { ...manifest, kind: 'material' }
 }
 
 // ---------------------------------------------------------------------------
