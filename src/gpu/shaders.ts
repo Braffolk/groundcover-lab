@@ -33,6 +33,22 @@ export class ShaderRegistry {
     }
   }
 
+  /**
+   * The current code for a source id — the hot-reloaded version if there is one,
+   * otherwise the imported text.
+   *
+   * GENERATED SHADERS MUST USE THIS. Anything that builds WGSL by concatenating
+   * imported `WgslSource` objects (material codegen, for example) would
+   * otherwise paste the text captured at import time and silently ignore every
+   * hot edit to the included file. Note also that `module()` keys its cache on
+   * `src.id`, so a generator that reuses one stable id for changing code gets
+   * the FIRST code it ever registered, forever: derive the id from a hash of the
+   * generated text instead.
+   */
+  latestCode(src: WgslSource): string {
+    return this.latest.get(src.id) ?? src.code
+  }
+
   module(src: WgslSource): GPUShaderModule {
     if (!this.latest.has(src.id)) this.latest.set(src.id, src.code)
     const code = this.latest.get(src.id)!
