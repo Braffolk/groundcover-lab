@@ -1,7 +1,7 @@
 import slicesSrc from './shaders/slices.wgsl'
 import farshellSrc from './shaders/farshell.wgsl'
-import { SPECIES, commitBake, speciesById } from '@harness'
-import type { Aabb2, Experiment, ExperimentContext, FrameInfo, ViewTargets } from '@harness'
+import { SCATTER_CELL_SIZE, commitBake, speciesById } from '@harness'
+import type { Aabb2, Experiment, ExperimentContext, FrameInfo, StandSpecies, ViewTargets } from '@harness'
 import {
   BAKE_VERSION,
   TOP_RES,
@@ -35,8 +35,29 @@ import type { PARAMS } from './manifest.ts'
  */
 
 const MIPS_3D = 3
+/**
+ * Carpet species get a deeper 3D mip chain. A 0.18m Sphagnum tile is 2-5px
+ * beyond ~20m, i.e. ~1/40 of its 138-voxel width, so mip 2 (4x, 6mm voxels) is
+ * still a massive undersample and the distant mat sparkles. Two more levels cost
+ * 0.2% of the volume's bytes. Kept off the grasses so the `default` stand keeps
+ * its exact behaviour (mip_max is per species, in the species uniform).
+ */
+const MIPS_3D_CARPET = 5
 const MIPS_2D = 6
 const REBUILD_DIST = 6
+
+/**
+ * The constant tile scale of a carpet entry (grid step / periodic tile size) —
+ * every tile of the species shares it, which is what keeps the mat a lattice.
+ * The harness computes the same value into `stand_table[i].scale_min`, but does
+ * not export its `carpetScale()` helper, and the TS scatter mirror reports the
+ * stand's placeholder scaleMin instead. Null for ordinary scattered entries.
+ */
+function carpetTileScale(entry: StandSpecies): number | null {
+  if (!entry.carpetDiv || entry.carpetDiv <= 0) return null
+  const tileM = speciesById(entry.species).tileM
+  return tileM ? SCATTER_CELL_SIZE / entry.carpetDiv / tileM : null
+}
 
 /**
  * Validating artifact flow: committed file -> OPFS cache -> bake in-browser.
@@ -134,9 +155,12 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
   // Bake (or load) one voxel volume per species used by the stand
   // -------------------------------------------------------------------------
   const uniqueSpecies = [...new Set(stand.species.map((e) => e.species))]
+  const carpetSpecies = new Set(stand.species.filter((e) => (e.carpetDiv ?? 0) > 0).map((e) => e.species))
   const volumes = new Map<string, SpeciesVol>()
 
   for (const spId of uniqueSpecies) {
+    const isCarpet = carpetSpecies.has(spId)
+    const mips3d = isCarpet ? MIPS_3D_CARPET : MIPS_3D
     const meshId = speciesById(spId).meshId
     const key = `${spId}-v${BAKE_VERSION}`
     const data = await loadValidatedArtifact(ctx.id, key, async () => {
@@ -159,7 +183,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
           dimension: '3d',
           size: [nx, ny, nz],
           format: 'rgba8unorm',
-          mipLevelCount: MIPS_3D,
+          mipLevelCount: mips3d,
           usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
         },
         { species: spId, tag: 'voxel-volume' },
@@ -170,7 +194,8 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         { bytesPerRow: nx * 4, rowsPerImage: ny },
         { width: nx, height: ny, depthOrArrayLayers: nz },
       )
-      buildMips3D(nx, ny, nz, base, MIPS_3D).forEach((m, i) => {
+      // Rounded mip averages only for carpets — see buildMips3D().
+      buildMips3D(nx, ny, nz, base, mips3d, isCarpet).forEach((m, i) => {
         device.queue.writeTexture(
           { texture: tex, mipLevel: i + 1 },
           m.data as BufferSource,
@@ -216,7 +241,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
     device.queue.writeBuffer(
       uniform,
       0,
-      new Float32Array([h.lmin[0], h.lmin[1], h.lmin[2], h.voxel, h.lsize[0], h.lsize[1], h.lsize[2], MIPS_3D - 1]),
+      new Float32Array([h.lmin[0], h.lmin[1], h.lmin[2], h.voxel, h.lsize[0], h.lsize[1], h.lsize[2], mips3d - 1]),
     )
 
     volumes.set(spId, {
@@ -288,7 +313,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
   const bandGroups: GPUBindGroup[] = []
   for (let b = 0; b < 3; b++) {
     const buf = ctx.res.createBuffer(
-      { label: `${ctx.id}/band${b}`, size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST },
+      { label: `${ctx.id}/band${b}`, size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST },
       { tag: 'uniforms' },
     )
     bandBuffers.push(buf)
@@ -305,42 +330,82 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
     { label: `${ctx.id}/shell`, size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST },
     { tag: 'uniforms' },
   )
-  const catalogViews = SPECIES.map((s) => volumes.get(s.id)?.topView ?? dummyView)
+
+  // ---------------------------------------------------------------------------
+  // Far-shell slots: the THREE HEAVIEST-COVERING SPECIES OF THIS STAND.
+  //
+  // It used to be "the first three species of the catalog", which was the same
+  // thing while the catalog had three. With the Sphagnum states appended at
+  // indices 3-5 the bog stand's far field was built from calamagrostis + poa
+  // (0.5-1.4 plants/m² of emergent grass) and drew the mat's replacement 0.6m
+  // ABOVE the ground — a floating grass plateau over a moss bog.
+  //
+  // Coverage for a carpet entry comes from its GRID (carpet_div² tiles per 4m
+  // cell, times the share of the wetness axis it claims), never from `density`,
+  // which is 8 for every carpet entry regardless.
+  // ---------------------------------------------------------------------------
+  interface ShellSlot {
+    speciesId: string
+    weight: number
+    /** World-space tiling period of the top view (m). */
+    period: number
+    /** Canopy height the shell should be draped at (m above terrain). */
+    canopy: number
+    catalogIndex: number
+  }
+  const slotBySpecies = new Map<string, ShellSlot>()
+  for (const e of stand.species) {
+    const sp = speciesById(e.species)
+    const carpetScale = carpetTileScale(e)
+    const scale = carpetScale ?? (e.scaleMin + e.scaleMax) / 2
+    const band = e.wetWidth !== undefined && e.wetWidth > 0 ? Math.min(1, e.wetWidth) : 1
+    const weight = carpetScale
+      ? ((e.carpetDiv ?? 1) ** 2 / SCATTER_CELL_SIZE ** 2) * band
+      : Math.min(e.density, 8) * band
+    const existing = slotBySpecies.get(e.species)
+    if (existing) {
+      existing.weight += weight
+      continue
+    }
+    const tile = volumes.get(e.species)?.volume.header.tile[0] ?? 0.5
+    slotBySpecies.set(e.species, {
+      speciesId: e.species,
+      weight,
+      period: Math.max(tile * scale, 0.05),
+      canopy: sp.heightScale * scale * 0.55,
+      catalogIndex: sp.index,
+    })
+  }
+  const shellSlots = [...slotBySpecies.values()]
+    .sort((a, b) => b.weight - a.weight)
+    .slice(0, 3)
+    // Catalog order among the chosen three, so a three-species stand keeps the
+    // exact slot assignment (and therefore the exact mottle-noise salts) it had.
+    .sort((a, b) => a.catalogIndex - b.catalogIndex)
+
   const shellGroup = device.createBindGroup({
     label: `${ctx.id}/shell`,
     layout: shellBGL,
     entries: [
-      { binding: 0, resource: catalogViews[0]! },
-      { binding: 1, resource: catalogViews[1]! },
-      { binding: 2, resource: catalogViews[2]! },
+      { binding: 0, resource: volumes.get(shellSlots[0]?.speciesId ?? '')?.topView ?? dummyView },
+      { binding: 1, resource: volumes.get(shellSlots[1]?.speciesId ?? '')?.topView ?? dummyView },
+      { binding: 2, resource: volumes.get(shellSlots[2]?.speciesId ?? '')?.topView ?? dummyView },
       { binding: 3, resource: { buffer: shellBuffer } },
     ],
   })
 
-  // Shell blend weights / tiling periods per catalog species from the stand.
   const shellWeights = [0, 0, 0]
   const shellInvTiles = [1, 1, 1]
   let avgH = 0.5
   {
-    const scaleSum = [0, 0, 0]
-    const scaleN = [0, 0, 0]
-    for (const e of stand.species) {
-      const idx = speciesById(e.species).index
-      shellWeights[idx]! += e.density
-      scaleSum[idx]! += (e.scaleMin + e.scaleMax) / 2
-      scaleN[idx]! += 1
-    }
     let hSum = 0
     let wSum = 0
-    for (let i = 0; i < 3; i++) {
-      if (shellWeights[i]! <= 0 || scaleN[i]! === 0) continue
-      const avgScale = scaleSum[i]! / scaleN[i]!
-      const vol = volumes.get(SPECIES[i]!.id)
-      const tile = vol ? vol.volume.header.tile[0] : 0.5
-      shellInvTiles[i] = 1 / Math.max(tile * avgScale, 0.05)
-      hSum += shellWeights[i]! * SPECIES[i]!.heightScale * avgScale * 0.55
-      wSum += shellWeights[i]!
-    }
+    shellSlots.forEach((slot, i) => {
+      shellWeights[i] = slot.weight
+      shellInvTiles[i] = 1 / slot.period
+      hSum += slot.weight * slot.canopy
+      wSum += slot.weight
+    })
     if (wSum > 0) avgH = hSum / wSum
   }
 
@@ -470,7 +535,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
   // -------------------------------------------------------------------------
   // Frame loop
   // -------------------------------------------------------------------------
-  const bandData = new Float32Array(12)
+  const bandData = new Float32Array(16)
   const shellData = new Float32Array(16)
   /** Slices per plant per band — kept in lockstep with the band uniforms. */
   const bandK = [0, 0, 1]
@@ -511,6 +576,8 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         bandData[8] = p.lodBias
         bandData[9] = p.debugAxis ? 1 : 0
         bandData[10] = mpp1
+        bandData[11] = p.carpetAlpha
+        bandData[12] = p.carpetOcc
         device.queue.writeBuffer(bandBuffers[b]!, 0, bandData)
       }
       shellData[0] = shellWeights[0]!

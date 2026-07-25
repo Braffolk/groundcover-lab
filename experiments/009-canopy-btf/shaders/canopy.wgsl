@@ -3,6 +3,11 @@
 #include "src/wgsl/lighting.wgsl"
 #include "src/wgsl/hash.wgsl"
 #include "src/wgsl/debug.wgsl"
+// For scatter_wetness() + the carpet zone constants: this renderer has no
+// per-plant instances, so it evaluates the stand's habitat zoning PER FRAGMENT
+// from the same shared field the scatter uses. Same function, same seed, so the
+// zones land exactly where the placement puts them.
+#include "src/wgsl/scatter.wgsl"
 
 // Canopy BTF runtime. The scene's groundcover is drawn as ONE plant-count-free
 // proxy: a camera-centred terrain-following grid rasterised twice (ground
@@ -20,19 +25,27 @@ const CONTENT_PX: f32 = 256.0;
 const BORDER_PX: f32 = 8.0;
 const INNER_CELLS: f32 = 32.0; // uniform-spacing half-width of the grid
 
+const MAX_ENTRIES: u32 = 6u;  // stand entries (bog has 5)
+const MAX_LAYERS: u32 = 4u;   // composited layers per fragment (see fs_main)
+
 struct EntryU {
   tile: f32,        // world metres per BTF tile (already scale-adjusted)
   top_h: f32,       // world canopy top of this entry (m)
-  s_mean: f32,      // mean plant scale (info)
+  // >0: this entry is a CARPET laid out on a grid of this step (m). The step
+  // equals `tile`, but it also flags "mat" and keys the zone lookup.
+  carpet_step: f32,
   sway: f32,        // stand wind response
   alpha_scale: f32, // density modulation vs the baked reference
-  species: f32,     // catalog species index -> texture slot
+  species: f32,     // texture slot (index among the stand's unique species)
   avg_r: f32,
   avg_g: f32,
   avg_b: f32,
-  _p0: f32,
-  _p1: f32,
-  _p2: f32,
+  slope_align: f32, // stand slope_align: how much this species lies into the ground
+  // Habitat band. Carpet: the half-open wetness interval [wet_a, wet_b) that
+  // claims a grid node. Scattered: (centre, width) of the soft falloff.
+  // wet_b == 0 disables it.
+  wet_a: f32,
+  wet_b: f32,
 }
 
 struct U {
@@ -47,7 +60,11 @@ struct U {
   coverage: f32,
   macro_tint: f32,
   inspect: f32, // method-local inspect view (manifest param), 0 = off
-  entries: array<EntryU, 4>,
+  seed: f32,    // placement seed — the wetness field depends on it
+  _pad0: f32,
+  _pad1: f32,
+  _pad2: f32,
+  entries: array<EntryU, MAX_ENTRIES>,
   bin_dirs: array<vec4f, 32>,
 }
 
@@ -55,7 +72,10 @@ struct U {
 @group(1) @binding(1) var btf0: texture_2d_array<f32>;
 @group(1) @binding(2) var btf1: texture_2d_array<f32>;
 @group(1) @binding(3) var btf2: texture_2d_array<f32>;
-@group(1) @binding(4) var samp: sampler;
+@group(1) @binding(4) var btf3: texture_2d_array<f32>;
+@group(1) @binding(5) var btf4: texture_2d_array<f32>;
+@group(1) @binding(6) var btf5: texture_2d_array<f32>;
+@group(1) @binding(7) var samp: sampler;
 
 // --- helpers ---------------------------------------------------------------
 
@@ -82,10 +102,35 @@ fn ign(p: vec2f) -> f32 {
   return fract(52.9829189 * fract(dot(p, vec2f(0.06711056, 0.00583715))));
 }
 
+/**
+ * Smooth (C1) value noise in [0,1] on a `cell`-metre grid — the macro variation
+ * for a MAT. A per-cell constant tint is invisible under grass texture but on a
+ * near-uniform moss carpet it paints the cell grid straight onto the ground as
+ * hard-edged squares, which is what a 0.36m cell did here. Interpolating the
+ * same hashes removes the edges at the cost of 3 extra hashes.
+ */
+fn macro_noise(xz: vec2f, cell: f32, salt: u32) -> f32 {
+  let p = xz / cell;
+  let b = floor(p);
+  let f = p - b;
+  let s = f * f * (3.0 - 2.0 * f);
+  let ci = vec2i(b);
+  let cx = bitcast<u32>(ci.x);
+  let cz = bitcast<u32>(ci.y);
+  let h00 = hash_f32(hash3(cx, cz, salt));
+  let h10 = hash_f32(hash3(cx + 1u, cz, salt));
+  let h01 = hash_f32(hash3(cx, cz + 1u, salt));
+  let h11 = hash_f32(hash3(cx + 1u, cz + 1u, salt));
+  return mix(mix(h00, h10, s.x), mix(h01, h11, s.x), s.y);
+}
+
 fn sample_a(si: u32, uv: vec2f, gx: vec2f, gy: vec2f) -> vec4f {
   switch si {
     case 1u: { return textureSampleGrad(btf1, samp, uv, 0u, gx, gy); }
     case 2u: { return textureSampleGrad(btf2, samp, uv, 0u, gx, gy); }
+    case 3u: { return textureSampleGrad(btf3, samp, uv, 0u, gx, gy); }
+    case 4u: { return textureSampleGrad(btf4, samp, uv, 0u, gx, gy); }
+    case 5u: { return textureSampleGrad(btf5, samp, uv, 0u, gx, gy); }
     default: { return textureSampleGrad(btf0, samp, uv, 0u, gx, gy); }
   }
 }
@@ -94,8 +139,36 @@ fn sample_b(si: u32, uv: vec2f, gx: vec2f, gy: vec2f) -> vec4f {
   switch si {
     case 1u: { return textureSampleGrad(btf1, samp, uv, 1u, gx, gy); }
     case 2u: { return textureSampleGrad(btf2, samp, uv, 1u, gx, gy); }
+    case 3u: { return textureSampleGrad(btf3, samp, uv, 1u, gx, gy); }
+    case 4u: { return textureSampleGrad(btf4, samp, uv, 1u, gx, gy); }
+    case 5u: { return textureSampleGrad(btf5, samp, uv, 1u, gx, gy); }
     default: { return textureSampleGrad(btf0, samp, uv, 1u, gx, gy); }
   }
+}
+
+/**
+ * Which zoned carpet state owns the mat node under `xz`, as a wetness value.
+ * Exact per-fragment twin of the carpet branch of scatter_candidate(): the node
+ * centre, the NODE-ONLY jitter hash (never keyed by the entry, or competing
+ * entries disagree and the partition leaks) and the shared wetness field. The
+ * result is constant over a whole tile, so each tile is one state — which is
+ * what the placement actually does.
+ */
+fn carpet_node_wetness(xz: vec2f, step: f32) -> vec2f {
+  let n = u32(round(SCATTER_CELL_SIZE / step));
+  let gi = floor(xz / step);                 // global node index
+  let cell = floor(gi / f32(n));             // scatter cell
+  let g = vec2u(gi - cell * f32(n));         // node within the cell
+  let node = (gi + vec2f(0.5)) * step;       // node centre, == scatter's xz
+  let ci = vec2i(cell);
+  let node_h = hash4(u32(u.seed), bitcast<u32>(ci.x), bitcast<u32>(ci.y),
+    (g.y * n + g.x) ^ CARPET_JITTER_SALT);
+  let jitter = (hash_f32(node_h) - 0.5) * CARPET_JITTER;
+  let base = scatter_wetness(u32(u.seed), node);
+  // x: the exact per-node value the placement tests. y: the same without the
+  // interlock jitter, which is smooth in space and so is what the distant
+  // (many-tiles-per-pixel) share is computed from.
+  return vec2f(clamp(base + jitter, 0.0, 0.9999), base);
 }
 
 // Non-linear grid spacing: 1:1 for the inner INNER_CELLS, exponential beyond,
@@ -185,14 +258,19 @@ fn fs_main(in: VOut) -> FOut {
   // heightfield (a lookup, not a march). Bottom-layer fragments ARE the
   // ground; top-layer fragments project forward along the ray.
   var G = in.world;
-  var hg = terrain_height(G.xz);
   if (in.layer > 0.5) {
     for (var it = 0; it < 2; it++) {
-      let t = clamp((G.y - hg) / max(-v.y, 1e-4), 0.0, 4000.0);
+      let h_it = terrain_height(G.xz);
+      let t = clamp((G.y - h_it) / max(-v.y, 1e-4), 0.0, 4000.0);
       G += v * t;
-      hg = terrain_height(G.xz);
     }
   }
+  // The last ground tap also yields the terrain normal: terrain_sample() returns
+  // height AND (nx, nz) from one bilinear fetch, so the ground `up` used to lay
+  // mats into the slope is free (terrain_height IS terrain_sample().x).
+  let gsamp = terrain_sample(G.xz);
+  let hg = gsamp.x;
+  let ground_up = vec3f(gsamp.y, sqrt(max(1.0 - gsamp.y * gsamp.y - gsamp.z * gsamp.z, 0.0)), gsamp.z);
   G.y = hg;
   let tG = distance(cam, G);
 
@@ -246,19 +324,84 @@ fn fs_main(in: VOut) -> FOut {
   // Nearest bin, used by the parallax pre-tap below — also entry-independent.
   let ni = clamp(round(gc), vec2f(0.0), vec2f(BINS - 1.0));
 
-  var cols: array<vec3f, 4>;
-  var alphas: array<f32, 4>;
-  var ts: array<f32, 4>;
+  // Layers are COMPACTED, not indexed by entry: a stand can carry more entries
+  // than can ever be visible at one point (the bog's three Sphagnum states
+  // partition the same grid, so at most two of them exist at any pixel and they
+  // share ONE layer), and the sort/composite below is quadratic in the layer
+  // count. Colour and hit distance are accumulated coverage-weighted and
+  // normalised after the loop.
+  var cols: array<vec3f, MAX_LAYERS>;
+  var alphas: array<f32, MAX_LAYERS>;
+  var ts: array<f32, MAX_LAYERS>;
+  for (var l = 0u; l < MAX_LAYERS; l++) {
+    cols[l] = vec3f(0.0);
+    alphas[l] = 0.0;
+    ts[l] = 0.0;
+  }
+  var lc = 0u; // layers written
+  // Layer slot shared by the carpet entries of one grid, -1 = none yet.
+  var mat_layer = -1;
   var last_lod = 0.0; // diagnostic only (the `inspect=lod` view)
-  let ec = min(u32(u.entry_count), 4u);
+  let ec = min(u32(u.entry_count), MAX_ENTRIES);
+  // Habitat zoning, evaluated once per fragment (not per entry): the carpet
+  // grid's node wetness, and the plain field value for scattered bands. Both
+  // branches are uniform over the draw, so a stand without zoning pays nothing.
+  var zone_step = -1.0;
+  var zone_w = 0.0;    // node wetness INCLUDING the interlock jitter (hard test)
+  var zone_base = 0.0; // the same node without jitter (soft share at distance)
+  var wet_g = -1.0;
+  // Metres of ground per pixel, ANALYTIC (distance x pixel angle / incidence)
+  // rather than from dpdx/dpdy of G: the proxy grid is 2m quads, so a
+  // derivative-based footprint is constant within a quad and steps at its edges
+  // — feeding that into the zone crossfade below made whole 2m quads flip
+  // between crisp and blended zones, i.e. visible blocks in the mid-field.
+  let px_ang = 2.0 / max(frame.proj[1][1] * frame.viewport.y, 1e-4);
+  let fp_m = tG * px_ang / max(dot(-v, ground_up), 0.03);
 
-  for (var e = 0u; e < 4u; e++) {
-    alphas[e] = 0.0;
-    ts[e] = 1e9;
+  for (var e = 0u; e < MAX_ENTRIES; e++) {
     if (e >= ec || edge <= 0.001) { continue; }
     let ent = u.entries[e];
     let si = u32(ent.species);
     let sc = ent.tile;
+
+    // The canopy-top shell exists for tall foliage: crest/sky silhouettes and
+    // cameras under the canopy. A 9cm mat has neither, and drawing it twice is
+    // actively harmful — the shell layer reaches its ground point through two
+    // refinement steps instead of exactly, so it lands in a DIFFERENT carpet
+    // node than the ground layer and the two disagree about which zoned state
+    // lives there, which showed up as per-pixel species speckle over every
+    // mid-field tile (visible in `inspect=layer`). Mats: ground layer only.
+    if (in.layer > 0.5 && ent.carpet_step > 0.0) { continue; }
+
+    // --- habitat zoning ------------------------------------------------------
+    var band = 1.0;
+    if (ent.carpet_step > 0.0 && ent.wet_b > ent.wet_a) {
+      if (ent.carpet_step != zone_step) {
+        zone_step = ent.carpet_step;
+        mat_layer = -1; // a different grid is a different mat
+        let zw = carpet_node_wetness(G.xz, zone_step);
+        zone_w = zw.x;
+        zone_base = zw.y;
+      }
+      // Up close a node belongs to exactly ONE state (crisp interlocking tiles,
+      // exactly the placement). Once a pixel covers several tiles that hard test
+      // is a point sample of an 18cm-period map and aliases into crawling
+      // speckle, so it crossfades into this entry's expected SHARE of the nodes
+      // in the pixel: the interlock jitter is uniform over +-CARPET_JITTER/2, so
+      // that share is the fraction of the jitter window inside [wet_a, wet_b).
+      let hard = select(0.0, 1.0, zone_w >= ent.wet_a && zone_w < ent.wet_b);
+      let j = CARPET_JITTER * 0.5;
+      let share = clamp((min(ent.wet_b, zone_base + j) - max(ent.wet_a, zone_base - j)) / (2.0 * j), 0.0, 1.0);
+      band = mix(hard, share, clamp(fp_m / ent.carpet_step - 0.5, 0.0, 1.0));
+      if (band <= 0.002) { continue; }
+    } else if (ent.wet_b > 0.0) {
+      // Scattered band: acceptance falls off linearly from the centre and is
+      // resolved per plant, so its expected LOCAL DENSITY — which is what this
+      // aggregate renderer represents — is exactly that acceptance fraction.
+      if (wet_g < 0.0) { wet_g = scatter_wetness(u32(u.seed), G.xz); }
+      band = clamp(1.0 - abs(wet_g - ent.wet_a) / ent.wet_b, 0.0, 1.0);
+      if (band <= 0.002) { continue; }
+    }
 
     // Aggregate wind: the whole texel column is advected upstream by the
     // shared sway field at ~mid-canopy weight.
@@ -326,22 +469,40 @@ fn fs_main(in: VOut) -> FOut {
     // Distant detail fade: past the last mip, converge to the baked mean.
     col = mix(col, vec3f(ent.avg_r, ent.avg_g, ent.avg_b), lodX);
     nrm = normalize(mix(nrm, vec3f(0.0, 1.0, 0.0), lodX * 0.7));
+    // Lay the species into the ground by its stand slope_align (1 for a mat).
+    // The captures are taken over a flat tile, so their aggregate normals live
+    // in the tile frame; on a slope a mat's normals must tilt with the ground or
+    // a whole hillside of moss lights as if it were level. Ground height and the
+    // lookup itself are already per-pixel (the carpet grid is snapped in world
+    // XZ, so the horizontal parameterisation is exactly the placement's).
+    if (ent.slope_align > 0.001) {
+      nrm = normalize(plant_basis_from_up(mix(vec3f(0.0, 1.0, 0.0), ground_up, ent.slope_align), 0.0) * nrm);
+    }
 
     // Reconstructed hit along the actual view ray.
     let hitY = hg + hN * ent.top_h;
     let tH = clamp((cam.y - hitY) / max(-v.y, 1e-4), 0.1, tG * 1.5 + 60.0);
     let H = cam + v * tH;
 
-    // Camera-inside-canopy fade (the sanctioned break-down case).
-    alpha *= smoothstep(0.12, 0.55, tH);
-    alpha *= ent.alpha_scale * u.coverage * edge;
+    // Camera-inside-canopy fade (the sanctioned break-down case) — but NEVER
+    // for a mat: a carpet you are standing on must not open a hole under you,
+    // and at 7cm tall the camera is never inside it anyway.
+    if (ent.carpet_step <= 0.0) { alpha *= smoothstep(0.12, 0.55, tH); }
+    alpha *= ent.alpha_scale * band * u.coverage * edge;
 
-    // Macro variation: per 2-tile cell brightness jitter breaks periodicity.
+    // Macro variation: per-cell brightness jitter breaks periodicity. A mat gets
+    // a SMOOTH field over ~1.4 m (hummock mottling) because a hard-edged cell
+    // grid is plainly visible on a uniform carpet; foliage keeps the historical
+    // per-2-tile constant, where the canopy texture hides the cell edges.
     var tint = 1.0;
     if (u.macro_tint > 0.5) {
-      let ci = vec2i(floor(Xw / (sc * 2.0)));
-      let hsh = hash3(bitcast<u32>(ci.x), bitcast<u32>(ci.y), 77u + e);
-      tint = 0.86 + 0.28 * hash_f32(hsh);
+      if (ent.carpet_step > 0.0) {
+        tint = 0.88 + 0.24 * macro_noise(Xw, 1.4, 77u + e);
+      } else {
+        let ci = vec2i(floor(Xw / (sc * 2.0)));
+        let hsh = hash3(bitcast<u32>(ci.x), bitcast<u32>(ci.y), 77u + e);
+        tint = 0.86 + 0.28 * hash_f32(hsh);
+      }
     }
     // Statistical sparkle: baked luminance sigma re-injected as spatial noise,
     // faded out with distance (footprint) so it never shimmers.
@@ -361,15 +522,42 @@ fn fs_main(in: VOut) -> FOut {
     // Debug per ENTRY (albedo/normal/light term are per-entry quantities); the
     // composite below then blends them with the same front-to-back weights as
     // the shaded colour, so albedo/normals/lighting stay exact per layer.
-    cols[e] = debug_shade(lit, albedo, nrm, a_e, H);
-    alphas[e] = a_e;
-    ts[e] = tH;
+    // Which layer this entry lands in. The zoned states of ONE carpet grid are
+    // mutually exclusive per tile, so they are not separate surfaces to
+    // composite: over-compositing two 0.5-coverage boundary states would give
+    // 0.75 total coverage on a mat that is in fact closed, and the missing 25%
+    // came out as dither holes along every zone boundary. They share one layer
+    // and mix by coverage instead.
+    let is_mat = ent.carpet_step > 0.0;
+    var slot = lc;
+    if (is_mat && mat_layer >= 0) {
+      slot = u32(mat_layer);
+    } else {
+      if (lc >= MAX_LAYERS) { continue; }
+      slot = lc;
+      lc += 1u;
+      if (is_mat) { mat_layer = i32(slot); }
+    }
+    cols[slot] += debug_shade(lit, albedo, nrm, a_e, H) * a_e;
+    alphas[slot] += a_e;
+    ts[slot] += tH * a_e;
+  }
+  // Normalise the coverage-weighted sums.
+  for (var l = 0u; l < MAX_LAYERS; l++) {
+    let w = alphas[l];
+    if (w > 1e-5) {
+      cols[l] /= w;
+      ts[l] /= w;
+      alphas[l] = min(w, 1.0);
+    } else {
+      ts[l] = 1e9;
+    }
   }
 
-  // Front-to-back composite of the (up to 4) species layers.
-  var order = array<u32, 4>(0u, 1u, 2u, 3u);
-  for (var i = 0u; i < 3u; i++) {
-    for (var j = i + 1u; j < 4u; j++) {
+  // Front-to-back composite of the (up to MAX_LAYERS) species layers.
+  var order = array<u32, MAX_LAYERS>(0u, 1u, 2u, 3u);
+  for (var i = 0u; i < MAX_LAYERS - 1u; i++) {
+    for (var j = i + 1u; j < MAX_LAYERS; j++) {
       if (ts[order[j]] < ts[order[i]]) {
         let tmp = order[i];
         order[i] = order[j];
@@ -381,7 +569,7 @@ fn fs_main(in: VOut) -> FOut {
   var A = 0.0;
   var depth_t = -1.0;
   var first_t = -1.0;
-  for (var i = 0u; i < 4u; i++) {
+  for (var i = 0u; i < MAX_LAYERS; i++) {
     let e = order[i];
     let a = alphas[e];
     if (a <= 0.002) { continue; }

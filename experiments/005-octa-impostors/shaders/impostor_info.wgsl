@@ -16,6 +16,15 @@ const TILE_PX: f32 = 128.0;
 // three blended views look from slightly different directions, so their
 // content can reach a little past that. Pad the quad, not the tiles.
 const CARD_PAD: f32 = 1.10;
+// Height of a CARPET tile's proxy plane above the ground, as a fraction of the
+// species' horizontal footprint (i.e. of the grid step, since footprint_m *
+// scale IS the step). It must be a property of the GRID and not of the species'
+// own mesh: carpet entries sharing a grid interlock tile by tile, so two states
+// with different canopy heights would step against each other and expose bare
+// ground along every boundary. 0.38 * 0.18 m = 6.8 cm happens to be the mean
+// capitulum apex of all three Sphagnum meshes (0.0677 / 0.0512 / 0.0533 m for a
+// 0.74 fraction of their own boxes), i.e. the surface the baked views show.
+const CARPET_LIFT_FRAC: f32 = 0.38;
 
 struct EntryInfo {
   planes: array<vec4f, 6>, // world-space frustum planes (nx,ny,nz,d), normalized
@@ -26,7 +35,8 @@ struct EntryInfo {
   bucket_r: vec4f,         // outer radius (m) of the four front-to-back draw buckets
   bucket_base: vec4f,      // first instance slot of each bucket
   bucket_cap: vec4f,       // instance capacity of each bucket
-  shape: vec4f,            // cull sphere radius, core radius (near fade), view tint, _pad
+  shape: vec4f,            // cull sphere radius, core radius (near fade), view tint, carpet normal detail
+  carpet: vec4f,           // carpet crop inset (fraction of the tile), _pad x3
 }
 
 /** One surviving plant. 16 B — the cull pass writes it, the draw reads it. */

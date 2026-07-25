@@ -17,8 +17,15 @@ export const PARAMS = {
    * secant-3tap = + secant (false-position) solve between the two taps.
    */
   reliefMode: p.enum('secant-3tap', ['flat-1tap', 'linear-2tap', 'secant-3tap'] as const),
-  /** View-cell selection: per-pixel stochastic (dithered bilinear) or nearest. */
-  viewSelect: p.enum('nearest', ['stochastic', 'nearest'] as const),
+  /**
+   * View-cell selection: per-pixel stochastic (dithered bilinear) or nearest.
+   * Scattered plants only — a carpet tile has exactly one baked view.
+   * (The option order matters: it is the index the shader reads. It used to be
+   * declared the other way round from the shader's encoding, so 'nearest'
+   * selected stochastic and vice versa; the default below preserves what the
+   * experiment has always actually rendered.)
+   */
+  viewSelect: p.enum('stochastic', ['stochastic', 'nearest'] as const),
   /**
    * Method-specific inspector (albedo/normals/lighting/coverage/depth are the
    * harness-global `view` selector — this only shows state unique to relief):
@@ -32,10 +39,17 @@ export default defineExperiment({
   id: '008-relief-tap',
   title: 'Secant relief cards',
   description:
-    'Depth-augmented impostor cards: 25 baked ortho views with heightfields; fragments solve the eye-ray/heightfield intersection with a fixed 3-tap secant scheme (no marching) and write true frag_depth.',
+    'Depth-augmented impostor cards: 25 baked ortho views with heightfields; fragments solve the eye-ray/heightfield intersection with a fixed 3-tap secant scheme (no marching) and write true frag_depth. Carpet species get the same solve on one cropped, mipmapped zenith tile over a ground-parallel, terrain-conformed quad.',
   status: 'working',
   harnessApi: HARNESS_API,
-  species: ['calamagrostis-canescens', 'elymus-repens', 'poa-pratensis'],
+  species: [
+    'calamagrostis-canescens',
+    'elymus-repens',
+    'poa-pratensis',
+    'spaghnum-palustre-wet-vigorous',
+    'spaghnum-palustre-late-season',
+    'spaghnum-palustre-sun-exposed',
+  ],
   params: PARAMS,
   load: () => import('./main.ts'),
 })

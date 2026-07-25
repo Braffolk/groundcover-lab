@@ -211,17 +211,28 @@ interface TileSpec {
   /** Conservative world-space bounds of one tile's geometry (for instancing). */
   gMin: [number, number]
   gMax: [number, number]
+  /**
+   * The tile is a SURFACE (wider than it is tall — a cushion/mat) rather than
+   * foliage standing off the ground. Set from the mesh alone: topH < tileT.
+   * Sphagnum is 0.09m tall over a 0.18m tile (0.5); the grasses are 1.18m over
+   * 0.52m (2.3). For a surface the stored normal is derived from the captured
+   * HEIGHT FIELD instead of from the mean of the first-hit leaf normals — see
+   * surfaceNormals().
+   */
+  surfaceLike: boolean
 }
 
 function tileSpecFor(mesh: GcMesh): TileSpec {
   const h = mesh.header
   if (h.tileSize[0] > 0 && h.tileSize[1] > 0) {
+    const topH = Math.max(h.topH, h.boundsMax[1])
     return {
       tileT: h.tileSize[0],
-      topH: Math.max(h.topH, h.boundsMax[1]),
+      topH,
       copies: [{ x: 0, z: 0, yaw: 0, scale: 1 }],
       gMin: [h.boundsMin[0], h.boundsMin[2]],
       gMax: [h.boundsMax[0], h.boundsMax[2]],
+      surfaceLike: topH < h.tileSize[0],
     }
   }
   // Finite specimen (poa): compose a synthetic periodic tile. Fixed bake seed:
@@ -248,6 +259,7 @@ function tileSpecFor(mesh: GcMesh): TileSpec {
     copies,
     gMin: [-r, -r],
     gMax: [T + r, T + r],
+    surfaceLike: h.boundsMax[1] * 1.3 < T,
   }
 }
 
@@ -434,6 +446,7 @@ export async function bakeSpecies(
     rbAttr.unmap()
 
     const { a, b } = reduceCapture(albBytes, attrBytes)
+    if (spec.surfaceLike) surfaceNormals(b, spec, d)
     binA.push(a)
     binB.push(b)
     onNote(`${speciesId}: bin ${bin + 1}/${BINS * BINS} (${count} tile instances)`)
@@ -497,6 +510,93 @@ function reduceCapture(alb: Uint8Array, attr: Uint8Array): { a: Uint8Array<Array
   dilate(a, b)
   return { a, b }
 }
+
+/**
+ * Replace the stored normal of a SURFACE-LIKE tile (a cushion/mat) with the
+ * normal of its captured HEIGHT FIELD, and store the lightly smoothed height.
+ *
+ * Why: at 0.18m/256 texels the Sphagnum capture is 0.70mm per texel, which is
+ * roughly ONE branch leaf. The 16 supersampled first-hit normals inside a texel
+ * therefore belong to 16 differently-oriented leaves and their mean is
+ * ill-conditioned: measured over the top bin, normal.y had mean 0.002 (a
+ * ground-hugging cushion averaging to no up component at all) and was
+ * decorrelated from its neighbour at 82% of the white-noise level — i.e. the
+ * shading normal was static, so `light_surface()` produced per-pixel noise and
+ * the mat read as flat grain with no cushion relief whatsoever.
+ *
+ * The HEIGHT channel, by contrast, is real structure: sd 8.2mm with only 48% of
+ * white-noise neighbour difference, and 71% of that sd survives an 8x8 (5.6mm)
+ * box — capitulum scale. So the aggregate surface is well defined even though
+ * the individual leaf normals are not, and its gradient is the normal that
+ * makes the cushions visible.
+ *
+ * The capture is parameterised by the ray's GROUND intersection, so a texel's
+ * world position is p = uv*tileT + (h/d.y)*d.xz: the (u,v) grid is sheared by
+ * the bin direction, and the shear is undone here before differencing (for the
+ * top bin d.xz = 0 and this reduces to the plain height gradient).
+ *
+ * Foliage tiles (topH >= tileT: all three grasses) are left alone — a blade
+ * canopy has no aggregate surface, its height field IS noise (calamagrostis:
+ * sd 285mm, 28% lag-1) and the first-hit leaf normal is the right answer there.
+ */
+function surfaceNormals(b: Uint8Array, spec: TileSpec, d: V3): void {
+  const R = TILE_RES
+  const texel = spec.tileT / R
+  const wrap = (i: number): number => ((i % R) + R) % R
+  // Height in metres, then two [1,2,1] passes (sigma ~1 texel = 0.7mm, far
+  // below the 5-10mm capitulum scale) to remove the residual per-texel jitter.
+  const h = new Float32Array(R * R)
+  for (let i = 0; i < R * R; i++) h[i] = (b[i * 4]! / 255) * spec.topH
+  const tmp = new Float32Array(R * R)
+  for (let pass = 0; pass < 2; pass++) {
+    for (let y = 0; y < R; y++) {
+      for (let x = 0; x < R; x++) {
+        tmp[y * R + x] = (h[y * R + wrap(x - 1)]! + 2 * h[y * R + x]! + h[y * R + wrap(x + 1)]!) / 4
+      }
+    }
+    for (let y = 0; y < R; y++) {
+      for (let x = 0; x < R; x++) {
+        h[y * R + x] = (tmp[wrap(y - 1) * R + x]! + 2 * tmp[y * R + x]! + tmp[wrap(y + 1) * R + x]!) / 4
+      }
+    }
+  }
+  // Central difference over +/-2 texels (1.4mm baseline) — a facet of a
+  // capitulum, not a single leaf.
+  const L = 2
+  const inv = 1 / (2 * L * texel)
+  for (let y = 0; y < R; y++) {
+    for (let x = 0; x < R; x++) {
+      const o = (y * R + x) * 4
+      const dhu = (h[y * R + wrap(x + L)]! - h[y * R + wrap(x - L)]!) * inv
+      const dhv = (h[wrap(y + L) * R + x]! - h[wrap(y - L) * R + x]!) * inv
+      // Un-shear: dp/du = (1 + dh/du * d.x/d.y, dh/du, dh/du * d.z/d.y) * texel
+      const kx = d[0] / d[1]
+      const kz = d[2] / d[1]
+      const tu: V3 = [1 + dhu * kx, dhu, dhu * kz]
+      const tv: V3 = [dhv * kx, dhv, 1 + dhv * kz]
+      // Where the surface is steeper than the view elevation the (u,v) -> world
+      // map FOLDS (that is a silhouette: the ray grazes past a bump onto the
+      // patch behind it) and the Jacobian determinant, which reduces to
+      // 1 + grad(h).d.xz/d.y, flips sign — so the cross product comes out
+      // inverted, not the surface. Restoring the orientation with sign(det)
+      // takes the grazing bins from "normal.y mean 0.53, sd 0.60, 20% of texels
+      // facing DOWNWARD" to "mean 0.75, sd 0.27, none below zero".
+      const sg = 1 + dhu * kx + dhv * kz < 0 ? -1 : 1
+      // tv x tu (this order points +Y up for a flat tile).
+      const n = norm3([
+        sg * (tv[1] * tu[2] - tv[2] * tu[1]),
+        sg * (tv[2] * tu[0] - tv[0] * tu[2]),
+        sg * (tv[0] * tu[1] - tv[1] * tu[0]),
+      ])
+      const [eu, ev] = octEncode(n)
+      b[o] = Math.round(clamp01(h[y * R + x]! / spec.topH) * 255)
+      b[o + 1] = Math.round(eu * 255)
+      b[o + 2] = Math.round(ev * 255)
+    }
+  }
+}
+
+const clamp01 = (v: number): number => Math.min(1, Math.max(0, v))
 
 /** Flood covered colors/attrs into empty texels (keeps alpha 0) — stops halo
  * artifacts when linear filtering crosses coverage edges. */
@@ -673,18 +773,32 @@ export async function loadOrBakeSpecies(
   onNote: (s: string) => void,
 ): Promise<BtfArtifact> {
   const key = `btf-v${BAKE_VERSION}-${speciesId}`
-  try {
-    // assetUrl(): production builds live under a base path, so a root-absolute
-    // fetch would 404 there (CLAUDE.md).
-    const res = await fetch(assetUrl(`/mesh/baked/${ctx.id}/${key}.bin`))
-    if (res.ok) {
-      const buf = await res.arrayBuffer()
-      if (buf.byteLength > HEADER_BYTES && new Uint32Array(buf, 0, 1)[0] === MAGIC) {
-        return unpackArtifact(buf)
+  // Committed artifacts are ~19.7MB each and a stand can want five of them, and
+  // a single flaky read used to fall straight through to a fresh bake — which
+  // for a 19.8M-triangle Sphagnum tile is minutes of GPU per species, silently.
+  // So: retry, and validate the FULL length (a truncated body would otherwise
+  // pass the magic check and then throw out of unpackArtifact's views).
+  const expected = HEADER_BYTES + 2 * [0, 1, 2, 3].reduce((s, l) => s + levelBytes(l), 0)
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      // assetUrl(): production builds live under a base path, so a root-absolute
+      // fetch would 404 there (CLAUDE.md).
+      const res = await fetch(assetUrl(`/mesh/baked/${ctx.id}/${key}.bin`))
+      if (res.ok) {
+        const buf = await res.arrayBuffer()
+        if (buf.byteLength === expected && new Uint32Array(buf, 0, 1)[0] === MAGIC) {
+          return unpackArtifact(buf)
+        }
+        // The dev server answers a missing file with 200 + index.html, which is
+        // the expected miss on the first ever run — not worth retrying.
+        if (buf.byteLength < HEADER_BYTES || new Uint32Array(buf, 0, 1)[0] !== MAGIC) break
+        onNote(`${speciesId}: artifact truncated (${buf.byteLength}/${expected}) — retry ${attempt + 1}/3`)
+      } else {
+        onNote(`${speciesId}: artifact fetch ${res.status} — retry ${attempt + 1}/3`)
       }
+    } catch (err) {
+      onNote(`${speciesId}: artifact fetch failed (${String(err)}) — retry ${attempt + 1}/3`)
     }
-  } catch {
-    /* fall through to bake */
   }
   onNote(`${speciesId}: no committed artifact — baking in-browser`)
   const packed = await bakeSpecies(ctx, speciesId, onNote)

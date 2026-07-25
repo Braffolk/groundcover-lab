@@ -6,9 +6,9 @@ import {
   bakedArtifact,
   commitBake,
   speciesById,
+  standEntrySlots,
   SCATTER_CELL_SIZE,
   SCATTER_MAX_DENSITY,
-  SCATTER_MAX_PER_CELL,
 } from '@harness'
 import type { Experiment, ExperimentContext, FrameInfo, ViewTargets } from '@harness'
 import type { PARAMS } from './manifest.ts'
@@ -24,6 +24,17 @@ import type { PARAMS } from './manifest.ts'
 
 const BAKE_VERSION = 6
 const MAX_REGION_RADIUS = 80
+/**
+ * Instance-list ceiling for a carpet entry. A carpet has carpetDiv² slots per
+ * 4m cell (484 for the bog moss at life size), so the region-wide slot count is
+ * ~4x the scatter budget's and sizing for "every node in the region survives"
+ * would cost 20MB per species for a list that never fills: the entries
+ * PARTITION the wetness axis (~a third of the nodes each) and the frustum cull
+ * keeps only what is on screen. 200k tiles is 6600 m² of closed mat at 30.25
+ * tiles/m² — more than any standard camera sees inside a 56m region (topdown
+ * from 42m: ~4000 m²) — and the cull drops overflow instead of corrupting.
+ */
+const CARPET_MAX_INSTANCES = 200_000
 
 /**
  * The 8-sided frustum proxy: 32 triangles over 18 DISTINCT vertices — 8
@@ -56,6 +67,9 @@ interface SpeciesGpu {
 interface EntryGpu {
   entryIndex: number
   speciesId: string
+  /** Slots per scatter cell for this entry — carpetDiv², or the scatter budget. */
+  slots: number
+  isCarpet: boolean
   gpu: SpeciesGpu
   infoBuf: GPUBuffer
   cullBuf: GPUBuffer
@@ -146,7 +160,6 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
   })
 
   const maxSide = Math.ceil((2 * MAX_REGION_RADIUS) / SCATTER_CELL_SIZE) + 1
-  const maxSlots = maxSide * maxSide * SCATTER_MAX_PER_CELL
 
   const indexBuf = ctx.res.createBuffer(
     { label: `${ctx.id}/proxy-idx`, size: PROXY_INDICES.byteLength, usage: GPUBufferUsage.INDEX | GPUBufferUsage.COPY_DST },
@@ -157,20 +170,31 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
   const entries: EntryGpu[] = await Promise.all(
     ctx.stand.species.map(async (e, entryIndex): Promise<EntryGpu> => {
       const gpu = await loadSpecies(e.species)
-      // The instance list only ever holds slots that EXIST, and a slot exists
-      // with probability density/SCATTER_MAX_DENSITY — sizing it for "every
-      // one of the 128 candidate slots per cell survives" wastes 2-3x the
-      // biggest buffer in the budget. Over ~2e5 Bernoulli slots the count is
-      // within a few hundred of its mean, so mean + 15% + 4k is unreachable
-      // (and the cull shader drops overflow gracefully anyway).
-      const slotFrac = Math.min(e.density, SCATTER_MAX_DENSITY) / SCATTER_MAX_DENSITY
-      const instanceCap = Math.ceil(maxSlots * slotFrac * 1.15) + 4096
+      // SLOTS TO EVALUATE vs INSTANCES TO STORE are two different numbers.
+      // Every slot must be visited (standEntrySlots, never SCATTER_MAX_PER_CELL
+      // — a carpet has carpetDiv² of them), but the list only holds survivors.
+      // A scattered slot exists with probability density/SCATTER_MAX_DENSITY and
+      // over ~2e5 Bernoulli trials the count sits within a few hundred of its
+      // mean, so mean + 15% + 4k is unreachable. A carpet node instead exists
+      // iff this entry's wetness interval claims it (~wetWidth of the nodes,
+      // but the wetness field is smooth over 12m so one zone can dominate a
+      // region — hence the 2x share and the hard ceiling).
+      const slots = standEntrySlots(e)
+      const isCarpet = (e.carpetDiv ?? 0) > 0
+      const regionSlots = maxSide * maxSide * slots
+      const share = isCarpet
+        ? Math.min(1, (e.wetWidth ?? 1) * 2)
+        : Math.min(e.density, SCATTER_MAX_DENSITY) / SCATTER_MAX_DENSITY
+      const instanceCap = Math.min(
+        Math.ceil(regionSlots * share * 1.15) + 4096,
+        isCarpet ? CARPET_MAX_INSTANCES : Number.MAX_SAFE_INTEGER,
+      )
       const infoBuf = ctx.res.createBuffer(
         { label: `${ctx.id}/info-${entryIndex}`, size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST },
         { species: e.species, tag: 'info' },
       )
       const cullBuf = ctx.res.createBuffer(
-        { label: `${ctx.id}/cull-${entryIndex}`, size: 48, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST },
+        { label: `${ctx.id}/cull-${entryIndex}`, size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST },
         { species: e.species, tag: 'cull-cfg' },
       )
       const instanceBuf = ctx.res.createBuffer(
@@ -205,7 +229,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
           { binding: 4, resource: sampler },
         ],
       })
-      return { entryIndex, speciesId: e.species, gpu, infoBuf, cullBuf, instanceBuf, indirectBuf, cullBg, renderBg }
+      return { entryIndex, speciesId: e.species, slots, isCarpet, gpu, infoBuf, cullBuf, instanceBuf, indirectBuf, cullBg, renderBg }
     }),
   )
 
@@ -234,7 +258,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
   const unsubscribe = ctx.shaders.onReload(build)
 
   const infoData = new Float32Array(16)
-  const cullData = new Float32Array(12)
+  const cullData = new Float32Array(16)
   // indexCount, instanceCount, firstIndex, baseVertex, firstInstance
   const indirectReset = new Uint32Array([PROXY_INDICES.length, 0, 0, 0, 0])
   const cellMin = Math.floor(-ctx.stand.radius / SCATTER_CELL_SIZE)
@@ -253,11 +277,18 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       const f = entry.gpu.field.fit
       infoData[0] = f.r0; infoData[1] = f.r1; infoData[2] = f.h; infoData[3] = f.sideLen
       infoData[4] = f.capB; infoData[5] = f.capT; infoData[6] = f.axisY; infoData[7] = R
-      infoData[8] = f.axisX; infoData[9] = f.axisZ; infoData[10] = ctx.params.coverage
+      infoData[8] = f.axisX; infoData[9] = f.axisZ
+      // A carpet wants its own alpha reference: a chord through a moss cushion
+      // returns coverage ~1 in the tile's middle and tails off over its last
+      // centimetre, so the grass reference eats that centimetre and leaves a
+      // hairline crack lattice in ground that should be closed.
+      infoData[10] = entry.isCarpet ? ctx.params.carpetCoverage : ctx.params.coverage
       infoData[11] = ctx.params.entrySmooth ? 1 : 0
       infoData[12] = entry.entryIndex
       infoData[13] = ctx.params.debugChart ? 1 : 0
-      infoData[14] = f.rb; infoData[15] = 0
+      infoData[14] = f.rb
+      // Carpet-only: pull the per-bin leaf normal towards the mat's macro normal.
+      infoData[15] = entry.isCarpet ? ctx.params.carpetNormalMix : 0
       device.queue.writeBuffer(entry.infoBuf, 0, infoData)
     }
   }
@@ -265,11 +296,22 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
   const writeCull = (R: number, originCellX: number, originCellZ: number): void => {
     for (const entry of entries) {
       const f = entry.gpu.field.fit
-      const cullRad = f.rb + Math.hypot(f.axisX, f.axisZ)
+      // Distance from the scatter node to the proxy's own centre: the mesh
+      // origin offset, less the half-tile recentering a carpet applies (see
+      // render.wgsl). Recentering also shrinks this from 13cm to 8mm.
+      const halfTile = entry.isCarpet ? (speciesById(entry.speciesId).tileM ?? 0) * 0.5 : 0
+      const cullRad =
+        f.rb + Math.hypot(f.axisX - halfTile, f.axisZ - halfTile) + Math.abs(f.axisY)
       cullData[0] = originCellX; cullData[1] = originCellZ; cullData[2] = side; cullData[3] = ctx.seed
       cullData[4] = entry.entryIndex; cullData[5] = R; cullData[6] = cullRad
       cullData[7] = cellMin; cullData[8] = cellMax
-      cullData[9] = 0; cullData[10] = 0; cullData[11] = 0
+      cullData[9] = entry.slots
+      // Only a swaying species needs sway headroom on its cull sphere; moss is
+      // rigid, and a 0.5m margin on a 0.09m mat is 30x its own radius.
+      cullData[10] = ctx.stand.species[entry.entryIndex]!.sway > 0.01 ? 0.5 : 0
+      cullData[11] = f.h
+      cullData[12] = entry.isCarpet ? ctx.params.carpetLift : 0
+      cullData[13] = 0; cullData[14] = 0; cullData[15] = 0
       device.queue.writeBuffer(entry.cullBuf, 0, cullData)
     }
   }
@@ -300,15 +342,16 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
 
     encode(enc: GPUCommandEncoder, _frame: FrameInfo, targets: ViewTargets): void {
       // One thread per candidate scatter slot of the camera-bounded region —
-      // bounded by regionRadius, never by the stand's plant count.
-      const groups = Math.ceil((side * side * SCATTER_MAX_PER_CELL) / 64)
-
+      // bounded by regionRadius, never by the stand's plant count. The slot
+      // count is PER ENTRY (a carpet has carpetDiv² = 484 of them, 3.8x the
+      // scatter budget); driving this from SCATTER_MAX_PER_CELL rendered 6 of
+      // the mat's 22 grid rows.
       const cpass = ctx.timing.computePass(enc, 'cull')
       cpass.setPipeline(cullPipeline)
       cpass.setBindGroup(0, ctx.frame.bindGroup)
       for (const entry of entries) {
         cpass.setBindGroup(1, entry.cullBg)
-        cpass.dispatchWorkgroups(groups)
+        cpass.dispatchWorkgroups(Math.ceil((side * side * entry.slots) / 64))
       }
       cpass.end()
 

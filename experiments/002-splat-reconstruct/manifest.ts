@@ -25,8 +25,15 @@ export default defineExperiment({
     'Plants baked to ~2.5k anisotropic covariance splats (16B each, 5 LODs); half-res dithered splat pass + depth-affinity screen-space reconstruction turns the sparse point cloud back into continuous lit foliage.',
   status: 'working',
   harnessApi: HARNESS_API,
-  species: ['calamagrostis-canescens', 'elymus-repens', 'poa-pratensis'],
+  species: [
+    'calamagrostis-canescens',
+    'elymus-repens',
+    'poa-pratensis',
+    'spaghnum-palustre-wet-vigorous',
+    'spaghnum-palustre-late-season',
+    'spaghnum-palustre-sun-exposed',
+  ],
   params: PARAMS,
-  bakeVersion: 1,
+  bakeVersion: 2,
   load: () => import('./main.ts'),
 })

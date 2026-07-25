@@ -379,8 +379,31 @@ export interface MipLevel {
   data: Uint8Array
 }
 
-/** Average-of-8 mips. Premultiplied albedo makes plain averaging correct. */
-export function buildMips3D(nx: number, ny: number, nz: number, base: Uint8Array, levels: number): MipLevel[] {
+/**
+ * Average-of-8 mips. Premultiplied albedo makes plain averaging correct.
+ *
+ * `round` fixes a signed-bias bug that only bites the offset-encoded aux
+ * texture: writing a float into a Uint8Array TRUNCATES, so every level drifts
+ * down by up to one count — and 128 there means EXACTLY ZERO, so a region whose
+ * leaf normals cancel (i.e. most of a moss cushion) lands at 126-127 in all
+ * three channels and renormalizes into a confident unit vector pointing
+ * down-left-back. Deeper chains make it worse. Rounding makes the error
+ * zero-mean; the dead zone in decode_normal() catches the rest.
+ *
+ * Off by default ON PURPOSE: it also perturbs the premultiplied colour/coverage
+ * chain by <=1 count, which flips alpha-test decisions in the far field, and the
+ * `default` stand has to stay bit-identical. Carpet species opt in. The same bias
+ * demonstrably affects the grasses (see NOTES.md for the measured delta) — that
+ * is a one-flag change for whoever owns that call.
+ */
+export function buildMips3D(
+  nx: number,
+  ny: number,
+  nz: number,
+  base: Uint8Array,
+  levels: number,
+  round = false,
+): MipLevel[] {
   const out: MipLevel[] = []
   let sw = nx
   let sh = ny
@@ -415,10 +438,11 @@ export function buildMips3D(nx: number, ny: number, nz: number, base: Uint8Array
             }
           }
           const di = (x + dw * (y + dh * z)) * 4
-          dst[di] = r / cnt
-          dst[di + 1] = g / cnt
-          dst[di + 2] = b / cnt
-          dst[di + 3] = a / cnt
+          const bias = round ? 0.5 : 0
+          dst[di] = r / cnt + bias
+          dst[di + 1] = g / cnt + bias
+          dst[di + 2] = b / cnt + bias
+          dst[di + 3] = a / cnt + bias
         }
       }
     }

@@ -17,7 +17,16 @@ export const RF_SLAB = 64
 export const RF_ATLAS = RF_VIEWS * RF_SLAB
 const SS = 4
 const SRC_RES = RF_SLAB * SS
-const BAKE_VERSION = 1
+/**
+ * v2 fixed two bake bugs that had been in the artifact since the start:
+ *  1. the instance anchor was subtracted twice (once into bounds_min/max on the
+ *     CPU, again in bake-view.wgsl), so every species sat off-centre in its
+ *     slab and the ortho frustum clipped up to half of it — the moss lost
+ *     exactly half of every tile, which read as tile-sized holes in the mat;
+ *  2. the slab covered the bounding SPHERE, so a flat carpet tile spent 70% of
+ *     its vertical texels on empty air. Each view now fits the baked BOX.
+ */
+const BAKE_VERSION = 2
 const MAGIC = 0x31544c52 // 'RLT1'
 const HEADER_BYTES = 64
 const ATLAS_BYTES = RF_ATLAS * RF_ATLAS * 4
@@ -26,8 +35,19 @@ export interface RayField {
   center: [number, number, number]
   radius: number
   topH: number
+  /** Half-extents of the baked box (anchored mesh space) — the slab fit. */
+  half: [number, number, number]
   surf: Uint8Array
   geom: Uint8Array
+}
+
+/**
+ * Half-size of the slab along `ax` for a box of half-extents `half` (its
+ * support function). Mirror of rf_extent() in rayfield-common.wgsl — both sides
+ * must agree or the runtime samples a differently scaled slab.
+ */
+export function rfExtent(ax: [number, number, number], half: [number, number, number]): number {
+  return (Math.abs(ax[0]) * half[0] + Math.abs(ax[1]) * half[1] + Math.abs(ax[2]) * half[2]) * 1.02
 }
 
 /** TS mirror of rf_oct_decode() in rayfield-common.wgsl. */
@@ -129,6 +149,7 @@ function parseRayField(data: ArrayBuffer): RayField {
     center: [dv.getFloat32(16, true), dv.getFloat32(20, true), dv.getFloat32(24, true)],
     radius: dv.getFloat32(28, true),
     topH: dv.getFloat32(32, true),
+    half: [dv.getFloat32(36, true), dv.getFloat32(40, true), dv.getFloat32(44, true)],
     surf: new Uint8Array(data, HEADER_BYTES, ATLAS_BYTES),
     geom: new Uint8Array(data, HEADER_BYTES + ATLAS_BYTES, ATLAS_BYTES),
   }
@@ -172,6 +193,11 @@ async function bakeRayField(
     if (r2 > r2max) r2max = r2
   }
   const radius = Math.sqrt(r2max) * 1.005
+  const half: [number, number, number] = [
+    (bmax[0] - bmin[0]) / 2,
+    (bmax[1] - bmin[1]) / 2,
+    (bmax[2] - bmin[2]) / 2,
+  ]
 
   // --- transient GPU resources (destroyed before returning) ---
   const temp: (GPUBuffer | GPUTexture)[] = []
@@ -199,7 +225,7 @@ async function bakeRayField(
 
     const viewUbo = track(
       ctx.res.createBuffer(
-        { label: `${ctx.id}/bake-view-ubo`, size: 112, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST },
+        { label: `${ctx.id}/bake-view-ubo`, size: 96, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST },
         tag,
       ),
     )
@@ -304,7 +330,7 @@ async function bakeRayField(
       ],
     })
 
-    const ubo = new ArrayBuffer(112)
+    const ubo = new ArrayBuffer(96)
     const uf = new Float32Array(ubo)
     const dsData = new Uint32Array(4)
     const srcSurfView = srcSurf.createView()
@@ -315,14 +341,16 @@ async function bakeRayField(
       for (let vx = 0; vx < RF_VIEWS; vx++) {
         const dv = octDecode((vx + 0.5) / RF_VIEWS, (vy + 0.5) / RF_VIEWS)
         const { r, u } = viewBasis(dv)
+        // Fit this view's slab to the box, not to the bounding sphere.
         uf.set(bmin, 0)
-        uf[3] = radius
+        uf[3] = rfExtent(r, half)
         uf.set(bmax, 4)
+        uf[7] = rfExtent(u, half)
         uf.set(r, 8)
+        uf[11] = rfExtent(dv, half)
         uf.set(u, 12)
         uf.set(dv, 16)
         uf.set(center, 20)
-        uf.set(anchor, 24)
         device.queue.writeBuffer(viewUbo, 0, ubo)
         dsData[0] = vx * RF_SLAB
         dsData[1] = vy * RF_SLAB
@@ -388,6 +416,9 @@ async function bakeRayField(
     head.setFloat32(24, center[2], true)
     head.setFloat32(28, radius, true)
     head.setFloat32(32, h.topH, true)
+    head.setFloat32(36, half[0], true)
+    head.setFloat32(40, half[1], true)
+    head.setFloat32(44, half[2], true)
     new Uint8Array(out, HEADER_BYTES).set(new Uint8Array(readback.getMappedRange()))
     readback.unmap()
     return out

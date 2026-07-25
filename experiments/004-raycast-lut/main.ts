@@ -1,7 +1,7 @@
 import cullSrc from './shaders/cull.wgsl'
 import impostorSrc from './shaders/impostor.wgsl'
 import { loadRayField, RF_ATLAS, type RayField } from './bake.ts'
-import { SCATTER_CELL_SIZE } from '@harness'
+import { SCATTER_CELL_SIZE, standEntrySlots } from '@harness'
 import type { Experiment, ExperimentContext, FrameInfo, ViewTargets } from '@harness'
 import type { PARAMS } from './manifest.ts'
 
@@ -16,12 +16,26 @@ import type { PARAMS } from './manifest.ts'
 
 const MAX_DIST_CAP = 96 // must match PARAMS.maxDist max — sizes the buffers
 const CULL_UBO_BYTES = 128
-const DRAW_UBO_BYTES = 48
+const DRAW_UBO_BYTES = 64
+const CULL_WG = 128 // must match @workgroup_size in cull.wgsl
+/**
+ * Upper bound on the share of a carpet's grid nodes one wetness zone can claim
+ * inside the culled disc. The bog's three Sphagnum states partition the wetness
+ * axis into thirds, but the field is not uniformly distributed: measured over
+ * the ±96m bog at seed 42 the global split is 16/50/34% and the worst 80m disc
+ * anywhere in the stand reaches 63%. 0.85 leaves room for other seeds and
+ * terrains while keeping the instance buffer at 8B/tile inside the budget.
+ */
+const CARPET_ZONE_SHARE = 0.85
 
 interface EntryState {
   speciesId: string
   rayField: RayField
   capacity: number
+  /** u32 words per instance record — 2 for a carpet tile, 8 for a scattered plant. */
+  stride: number
+  /** Workgroups in z, so that EVERY slot of a cell is visited (carpet_div² of them). */
+  dispatchZ: number
   cullUbo: GPUBuffer
   drawUbo: GPUBuffer
   cullBind: GPUBindGroup
@@ -126,12 +140,33 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
   const entries: EntryState[] = ctx.stand.species.map((standEntry, entryIndex) => {
     const speciesId = standEntry.species
     const rayField = rayFields.get(speciesId)!
+    const carpetDiv = standEntry.carpetDiv ?? 0
+    // Slots per 4m cell — carpet_div² for a mat (484 on the bog), which is
+    // deliberately MORE than SCATTER_MAX_PER_CELL. Every one must be visited.
+    const slots = standEntrySlots(standEntry)
+    const dispatchZ = Math.ceil(slots / CULL_WG)
+    // Two different numbers: `slots` drives enumeration, `capacity` only has to
+    // hold the expected survivors.
     const density = Math.min(standEntry.density, 8)
-    const capacity = Math.ceil(Math.PI * MAX_DIST_CAP * MAX_DIST_CAP * density * 1.15)
+    const capacity =
+      carpetDiv > 0
+        ? Math.ceil(
+            Math.PI *
+              MAX_DIST_CAP *
+              MAX_DIST_CAP *
+              ((carpetDiv * carpetDiv) / (SCATTER_CELL_SIZE * SCATTER_CELL_SIZE)) *
+              CARPET_ZONE_SHARE,
+          )
+        : Math.ceil(Math.PI * MAX_DIST_CAP * MAX_DIST_CAP * density * 1.15)
+    // A carpet tile stores its grid node (cell + slot + 90° yaw index) in 8
+    // bytes and rebuilds everything else; a scattered plant keeps its 32B
+    // record. At life size the moss needs 4x as many instances as an oversized
+    // mat, and 8B/tile is what keeps that inside the VRAM budget.
+    const stride = carpetDiv > 0 ? 2 : 8
     const plants = ctx.res.createBuffer(
       {
         label: `${ctx.id}/plants-${entryIndex}-${speciesId}`,
-        size: capacity * 32,
+        size: capacity * stride * 4,
         usage: GPUBufferUsage.STORAGE,
       },
       { species: speciesId, tag: 'culled-instances' },
@@ -157,6 +192,8 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       speciesId,
       rayField,
       capacity,
+      stride,
+      dispatchZ,
       cullUbo,
       drawUbo,
       cullBind: device.createBindGroup({
@@ -204,14 +241,19 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       drawData[1] = rf.center[1]
       drawData[2] = rf.center[2]
       drawData[3] = rf.radius
-      drawData[4] = rf.topH
-      drawData[5] = maxDist
-      drawData[6] = ctx.params.fadeBand
-      drawData[7] = ctx.params.heightAO
-      drawData[8] = entryIndex
-      drawData[9] = ctx.params.swayMul
-      drawData[10] = ctx.params.showCells ? 1 : 0
-      drawData[11] = 0
+      // Baked box half-extents: the per-view slab fit AND the sheared quad bound.
+      drawData[4] = rf.half[0]
+      drawData[5] = rf.half[1]
+      drawData[6] = rf.half[2]
+      drawData[7] = rf.topH
+      drawData[8] = maxDist
+      drawData[9] = ctx.params.fadeBand
+      drawData[10] = ctx.params.heightAO
+      drawData[11] = entryIndex
+      drawData[12] = ctx.params.swayMul
+      drawData[13] = ctx.params.showCells ? 1 : 0
+      drawData[14] = entry.stride
+      drawData[15] = ctx.params.matCov
       device.queue.writeBuffer(entry.drawUbo, 0, drawData)
     })
   }
@@ -276,6 +318,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         cullF32[27] = rf.topH
         cullF32[28] = ctx.params.fadeBand
         cullF32[29] = ctx.params.swayMul
+        cullF32[30] = Math.hypot(rf.half[0], rf.half[1], rf.half[2])
         device.queue.writeBuffer(entry.cullUbo, 0, cullData)
       })
     },
@@ -286,7 +329,9 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       cull.setBindGroup(0, ctx.frame.bindGroup)
       for (const entry of entries) {
         cull.setBindGroup(1, entry.cullBind)
-        cull.dispatchWorkgroups(cellsX, cellsZ, 1)
+        // z spans the entry's slots per cell: 1 workgroup for a scattered
+        // entry (128 slots), 4 for the bog carpet (484).
+        cull.dispatchWorkgroups(cellsX, cellsZ, entry.dispatchZ)
       }
       cull.end()
 

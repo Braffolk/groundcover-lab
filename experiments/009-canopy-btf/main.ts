@@ -1,6 +1,6 @@
 import shaderSrc from './shaders/canopy.wgsl'
 import { ATLAS_PX, LEVELS, loadOrBakeSpecies, type BtfArtifact } from './bake.ts'
-import { speciesById, type Experiment, type ExperimentContext, type FrameInfo, type ViewTargets } from '@harness'
+import { SCATTER_CELL_SIZE, type Experiment, type ExperimentContext, type FrameInfo, type ViewTargets } from '@harness'
 import type { PARAMS } from './manifest.ts'
 
 /**
@@ -16,7 +16,14 @@ import type { PARAMS } from './manifest.ts'
 
 const GRID_CELLS = 128
 const SPACING = 2
-const MAX_ENTRIES = 4
+/**
+ * Entry slots in the uniform + the fragment's entry loop. The bog stand has
+ * FIVE entries (three zoned Sphagnum states + calamagrostis + a trace of poa),
+ * so a 4-entry limit silently dropped one species. 6 = the whole catalog.
+ */
+const MAX_ENTRIES = 6
+/** Texture slots in the bind group — one per UNIQUE species of the stand. */
+const MAX_SLOTS = 6
 /** Order must match the `inspect` branch in shaders/canopy.wgsl. */
 const INSPECT_MODES = ['off', 'bin', 'lod', 'layer'] as const
 /** Densities the community tiles are treated as representing (plants/m²). */
@@ -70,11 +77,16 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
     textures.set(sid, tex)
   }
 
-  // Texture slot per CATALOG species index; unused slots alias slot 0's
-  // texture (never sampled — the entry loop only touches present species).
+  // Texture slot per UNIQUE SPECIES OF THIS STAND, not per catalog index: the
+  // catalog now holds 6 species (moss is index 3-5) while only 3 slots existed,
+  // so every Sphagnum entry fell through to slot 0 and sampled the
+  // CALAMAGROSTIS atlas — the moss rendered as 18cm-periodic grass streaks.
+  // Unused slots alias slot 0 (never sampled: the entry loop only touches
+  // species the stand actually contains).
   const fallback = textures.get(unique[0]!)!
-  const slotTex: GPUTexture[] = [0, 1, 2].map((slot) => {
-    for (const sid of unique) if (speciesById(sid).index === slot) return textures.get(sid)!
+  const slotOf = new Map<string, number>(unique.slice(0, MAX_SLOTS).map((sid, i) => [sid, i]))
+  const slotTex: GPUTexture[] = Array.from({ length: MAX_SLOTS }, (_, slot) => {
+    for (const [sid, s] of slotOf) if (s === slot) return textures.get(sid)!
     return fallback
   })
 
@@ -88,7 +100,10 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
     addressModeV: 'clamp-to-edge',
   })
 
-  const UNIFORM_FLOATS = 188 // 12 header + 4*12 entries + 32*4 bin dirs
+  // 16 header + 6*12 entries + 32*4 bin dirs (entries at float 16, dirs at 88).
+  const ENTRY_BASE = 16
+  const DIRS_BASE = ENTRY_BASE + MAX_ENTRIES * 12
+  const UNIFORM_FLOATS = DIRS_BASE + 32 * 4
   const uniformBuf = ctx.res.createBuffer(
     { label: `${ctx.id}/uniforms`, size: UNIFORM_FLOATS * 4, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST },
     { tag: 'params' },
@@ -98,10 +113,12 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
     label: `${ctx.id}/bgl`,
     entries: [
       { binding: 0, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
-      { binding: 1, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d-array' } },
-      { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d-array' } },
-      { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float', viewDimension: '2d-array' } },
-      { binding: 4, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
+      ...slotTex.map((_, i) => ({
+        binding: 1 + i,
+        visibility: GPUShaderStage.FRAGMENT,
+        texture: { sampleType: 'float' as GPUTextureSampleType, viewDimension: '2d-array' as GPUTextureViewDimension },
+      })),
+      { binding: 1 + MAX_SLOTS, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
     ],
   })
   const bindGroup = device.createBindGroup({
@@ -109,10 +126,8 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
     layout: bgl,
     entries: [
       { binding: 0, resource: { buffer: uniformBuf } },
-      { binding: 1, resource: slotTex[0]!.createView({ dimension: '2d-array' }) },
-      { binding: 2, resource: slotTex[1]!.createView({ dimension: '2d-array' }) },
-      { binding: 3, resource: slotTex[2]!.createView({ dimension: '2d-array' }) },
-      { binding: 4, resource: sampler },
+      ...slotTex.map((tex, i) => ({ binding: 1 + i, resource: tex.createView({ dimension: '2d-array' as const }) })),
+      { binding: 1 + MAX_SLOTS, resource: sampler },
     ],
   })
 
@@ -136,25 +151,50 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
   // writeBuffer below only touches the 12-float header.
   const uniforms = new Float32Array(UNIFORM_FLOATS)
   // Bin directions are identical across species by construction.
-  uniforms.set(artifacts.get(unique[0]!)!.meta.dirs, 60)
+  uniforms.set(artifacts.get(unique[0]!)!.meta.dirs, DIRS_BASE)
   uniforms[2] = SPACING
   uniforms[3] = GRID_CELLS
   uniforms[4] = ctx.stand.radius
+  uniforms[12] = ctx.seed // scatter seed — the wetness field is seed-dependent
   let shellTop = 0.4
   entries.forEach((e, i) => {
     const art = artifacts.get(e.species)!
-    const sMean = (e.scaleMin + e.scaleMax) / 2
-    shellTop = Math.max(shellTop, art.meta.topH * e.scaleMax)
-    const o = 12 + i * 12
+    const div = e.carpetDiv ?? 0
+    // CARPET: the entry's own scaleMin/scaleMax are placeholders the harness
+    // overrides (stands.ts carpetScale(), mirrored into stand_table.scale_min
+    // but NOT into ctx.stand) — 1.7-2.5 for the bog moss, where the real scale
+    // is 1.01. The defining quantity is the grid step: div tiles per 4m cell,
+    // each tile exactly filling its step. So the tile PERIOD is the step, and
+    // the implied uniform scale is step/tileSize. Never height_scale, and never
+    // the raw scale range.
+    const step = div > 0 ? SCATTER_CELL_SIZE / div : 0
+    const sMean = div > 0 ? step / art.meta.tileSize : (e.scaleMin + e.scaleMax) / 2
+    const sMax = div > 0 ? sMean : e.scaleMax
+    shellTop = Math.max(shellTop, art.meta.topH * sMax)
+    const o = ENTRY_BASE + i * 12
     uniforms[o] = art.meta.tileSize * sMean
     uniforms[o + 1] = art.meta.topH * sMean
-    uniforms[o + 2] = sMean
+    // Carpet grid step (m), 0 for a scattered entry. The fragment shader uses
+    // it to find the mat node under the pixel and ask which zoned state owns it.
+    uniforms[o + 2] = step
     uniforms[o + 3] = e.sway
-    uniforms[o + 4] = Math.min(1.3, Math.max(0.3, e.density / (REF_DENSITY[e.species] ?? 3)))
-    uniforms[o + 5] = speciesById(e.species).index
+    // A carpet's coverage comes from its grid, not from `density` (which is 8,
+    // i.e. meaningless for a mat) — so it is exactly 1.
+    uniforms[o + 4] = div > 0 ? 1 : Math.min(1.3, e.density / (REF_DENSITY[e.species] ?? 3))
+    uniforms[o + 5] = slotOf.get(e.species) ?? 0
     uniforms[o + 6] = art.meta.avgColor[0]
     uniforms[o + 7] = art.meta.avgColor[1]
     uniforms[o + 8] = art.meta.avgColor[2]
+    // How much this species lies into the ground (stand's slope_align; 1 for a
+    // carpet). Rotates the baked aggregate normal into the terrain frame.
+    uniforms[o + 9] = e.slopeAlign ?? (div > 0 ? 1 : 0)
+    // Habitat band. Carpet: the half-open wetness interval [lo, hi) that claims
+    // a grid node. Scattered: (centre, width) of the soft acceptance falloff.
+    // wet_b == 0 means "no band" for both.
+    const wc = e.wetCenter ?? 0
+    const ww = e.wetWidth ?? 0
+    uniforms[o + 10] = div > 0 ? wc - ww / 2 : wc
+    uniforms[o + 11] = div > 0 ? wc + ww / 2 : ww
   })
   uniforms[5] = shellTop + 0.05
   uniforms[6] = entries.length

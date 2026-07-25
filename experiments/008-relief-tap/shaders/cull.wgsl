@@ -6,6 +6,15 @@
 // scatter twin for one stand entry and appends surviving plants to that
 // entry's instance buffer, bumping its indirect draw count. 100 plants or
 // 1 billion: the dispatch is identical.
+//
+// One thread per (cell, slot). The slot count comes from `cp.slots`, i.e.
+// standEntrySlots(entry) on the CPU, and is NOT SCATTER_MAX_PER_CELL: a carpet
+// entry has carpet_div^2 slots per cell — 484 for the bog's life-size Sphagnum,
+// deliberately over the 128-slot scatter budget. The previous version made one
+// workgroup of 128 invocations per cell and used the local invocation index as
+// the slot, so it evaluated slots 0..127 of 484 and rendered the first ~6 of 22
+// tile rows in every cell: a mat of 1 m stripes with 3 m of bare peat between
+// them, which reads exactly like a placement bug.
 
 struct CullParams {
   base_cell: vec2i,
@@ -16,14 +25,16 @@ struct CullParams {
   capacity: u32,
   sphere_y: f32,   // plant bound-sphere center height, mesh units (× scale)
   sphere_r: f32,   // plant bound-sphere radius incl. center xz offset (× scale)
-  _p0: f32,
-  _p1: f32,
-  _p2: f32,
+  slots: u32,      // candidate slots per cell for THIS entry (carpet_div^2 or 128)
+  side_x: u32,     // cells per row in the dispatch window
+  side_z: u32,
 }
 @group(1) @binding(0) var<uniform> cp: CullParams;
 // Indirect draw args, 4 u32 per stand entry: [6, instanceCount, 0, 0].
 @group(1) @binding(1) var<storage, read_write> draw_args: array<atomic<u32>>;
-// 2 vec4 per plant: [x, y, z, yaw], [scale, entry, phase, 0].
+// Scattered plant: 2 vec4 — [x, y, z, yaw], [scale, entry, phase, 0].
+// Carpet tile:     1 vec4 — [x, y, z, yaw]. Constant scale and no wind phase,
+// so the other 16 bytes would store nothing.
 @group(1) @binding(2) var<storage, read_write> plants: array<vec4f>;
 
 // Sphere-vs-frustum test with planes extracted from view_proj (WebGPU clip
@@ -43,8 +54,16 @@ fn frustum_visible(c: vec3f, r: f32) -> bool {
 }
 
 @compute @workgroup_size(128)
-fn cs_cull(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) slot: u32) {
-  let cell = cp.base_cell + vec2i(i32(wg.x), i32(wg.y));
+fn cs_cull(@builtin(global_invocation_id) gid: vec3u) {
+  let slots = cp.slots;
+  let idx = gid.x;
+  if (idx >= cp.side_x * cp.side_z * slots) {
+    return;
+  }
+  let slot = idx % slots;
+  let cell_lin = idx / slots;
+  let cell = cp.base_cell + vec2i(i32(cell_lin % cp.side_x), i32(cell_lin / cp.side_x));
+
   // Mirror Scatter.region(): every cell whose span overlaps the stand aabb
   // contributes all of its candidates (no per-plant position clamp).
   let lo = i32(floor(-cp.stand_r / SCATTER_CELL_SIZE));
@@ -65,14 +84,18 @@ fn cs_cull(@builtin(workgroup_id) wg: vec3u, @builtin(local_invocation_index) sl
     return;
   }
   let counter = cp.entry_index * 4u + 1u;
-  let idx = atomicAdd(&draw_args[counter], 1u);
-  if (idx >= cp.capacity) {
+  let out = atomicAdd(&draw_args[counter], 1u);
+  if (out >= cp.capacity) {
     // Over-capacity threads take back their +1 so the count converges to
     // `capacity` instead of running past the buffer.
     atomicSub(&draw_args[counter], 1u);
     return;
   }
-  let base = idx * 2u;
-  plants[base] = vec4f(c.pos, c.yaw);
-  plants[base + 1u] = vec4f(c.scale, f32(cp.entry_index), c.phase, 0.0);
+  if (stand_table[cp.entry_index].carpet_div > 0.0) {
+    plants[out] = vec4f(c.pos, c.yaw);
+  } else {
+    let base = out * 2u;
+    plants[base] = vec4f(c.pos, c.yaw);
+    plants[base + 1u] = vec4f(c.scale, f32(cp.entry_index), c.phase, 0.0);
+  }
 }

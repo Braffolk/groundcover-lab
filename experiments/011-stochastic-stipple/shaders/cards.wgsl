@@ -32,6 +32,28 @@ struct CardUni {
   densify: f32,
   stoch_start: f32,
   stoch_full: f32,
+  // --- carpet (mat) path; carpet_flag = 0 leaves every card path untouched ---
+  carpet_flag: u32,
+  carpet_cells: u32,   // block half-width in scatter cells around the camera
+  carpet_slots: u32,   // carpet_div^2 — NEVER SCATTER_MAX_PER_CELL
+  carpet_shells: u32,  // relief shells per tile (index count = 6 * shells)
+  tile_scale: f32,     // mesh -> world factor for the tile (entry scale)
+  moss_h_min: f32,     // height range stored in the tile's height channel
+  moss_h_range: f32,
+  moss_radius: f32,    // tile draw radius; the mean field carries past it
+  cover_ref: f32,      // carpet alpha reference (a mat must stay closed)
+  shell_r: f32,        // distance at which the first relief shell drops out
+  cam_above: f32,      // camera height over the ground (shell LOD in 3D)
+  relief: f32,         // weight of the height-field normal perturbation
+  lift: f32,           // concavity lift over the coarse drawn terrain mesh
+  _cpad0: f32,
+  _cpad1: f32,
+  _cpad2: f32,
+  // Per-shell (height threshold, placement height), both in the baked height
+  // field's normalized units. Equal-AREA bands of the cushion top surface, so
+  // no shell sits in empty air; x = 0 for shell 0, which therefore covers the
+  // whole tile and keeps the mat closed whatever the shell LOD drops.
+  shells_tab: array<vec4f, 6>,
 }
 
 @group(1) @binding(0) var<uniform> card_uni: CardUni;
@@ -60,8 +82,113 @@ fn kill_vertex() -> VOut {
   return out;
 }
 
+/**
+ * CARPET (mat) vertex path — used when stand_table[i].carpet_div > 0.
+ *
+ * None of the card machinery applies to a 0.18m periodic cushion tile: a
+ * camera-facing quad breaks the lattice, stochastic thinning would punch holes
+ * in a surface that must stay closed, and width amplification would change the
+ * tile scale the stand fixed. So a carpet tile is drawn as what it is: a
+ * grid-snapped, ground-parallel, per-vertex terrain-conforming square at the
+ * exact grid step, yawed only by the scatter's quarter turns (applied to the
+ * TEXTURE, since a quarter turn maps the square onto itself and neighbours must
+ * keep sharing corners).
+ *
+ * Thickness comes from a stack of nested shells: shell k sits in the k-th band
+ * of the baked cushion height field and keeps only the texels whose cushion top
+ * reaches that band, so the stack is a quantized height field with real
+ * silhouette, real parallax and solid depth. Shell 0 covers every texel, so no
+ * shell LOD can ever open the mat.
+ */
+fn vs_carpet(vi: u32, ii: u32) -> VOut {
+  let entry = stand_table[card_uni.entry_index];
+  let slots = card_uni.carpet_slots;
+  let cells = card_uni.carpet_cells;
+  let w_cells = 2u * cells;
+  let cell_idx = ii / slots;
+  let slot = ii % slots;
+  let cell = card_uni.cam_cell + vec2i(i32(cell_idx % w_cells) - i32(cells), i32(cell_idx / w_cells) - i32(cells));
+
+  // The grid node is pure arithmetic — no hashes, no terrain — so distance and
+  // shell rejection happen before any placement work is paid for.
+  let div = u32(entry.carpet_div);
+  let step = SCATTER_CELL_SIZE / entry.carpet_div;
+  let g = vec2f(f32(slot % div), f32(slot / div));
+  let node = vec2f(cell) * SCATTER_CELL_SIZE + (g + 0.5) * step;
+  let d = distance(frame.camera_pos.xz, node);
+  if (d > card_uni.moss_radius) { return kill_vertex(); }
+  if (abs(node.x) > card_uni.stand_radius || abs(node.y) > card_uni.stand_radius) { return kill_vertex(); }
+  // Relief shells collapse with distance (each higher shell dies ~40% nearer
+  // than the one below); the mat itself never thins. The metric is the 3D
+  // distance — from 40m up a tile is 2px and its relief is not worth a draw,
+  // even though it is directly below the camera.
+  let layer = vi / 4u;
+  let d3 = length(vec2f(d, card_uni.cam_above));
+  if (layer > 0u && d3 > card_uni.shell_r * pow(0.6, f32(layer - 1u))) { return kill_vertex(); }
+
+  // Existence is the stand's business: the shared twin resolves which of the
+  // competing carpet entries owns this node from the wetness partition.
+  let sp = scatter_candidate(card_uni.seed, card_uni.entry_index, cell, slot);
+  if (!sp.exists) { return kill_vertex(); }
+
+  // Footprint from the species' periodic tile size, never from height_scale.
+  let fp = select(step, entry.footprint_m * entry.scale_min, entry.footprint_m > 0.0);
+  var corners = array<vec2f, 4>(
+    vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(-1.0, 1.0), vec2f(1.0, 1.0),
+  );
+  let c = corners[vi % 4u];
+  let corner_xz = node + c * (0.5 * fp);
+  // Ladder rung 3: every corner gets its own height from ONE bilinear fetch.
+  // Neighbouring tiles share corner positions exactly, so the mat stays C0
+  // continuous — a per-tile plane fit would crack at every shared edge.
+  let ts = terrain_sample(corner_xz);
+  let cyaw = cos(sp.yaw);
+  let syaw = sin(sp.yaw);
+  let local = vec2f(cyaw * c.x + syaw * c.y, cyaw * c.y - syaw * c.x);
+  let shell = card_uni.shells_tab[layer];
+  let shell_h = card_uni.moss_h_min + shell.y * card_uni.moss_h_range;
+  let align = clamp(entry.slope_align, 0.0, 1.0);
+  var base_h = ts.x;
+  var up = normalize(mix(
+    vec3f(0.0, 1.0, 0.0),
+    vec3f(ts.y, sqrt(max(1.0 - ts.y * ts.y - ts.z * ts.z, 0.0)), ts.z),
+    align,
+  ));
+  if (card_uni.lift > 0.0) {
+    // The base pass draws the terrain as a COARSE triangle mesh (1m quads),
+    // whose chords bridge every concavity of the finer bilinear heightmap that
+    // terrain_sample() returns — measured up to 7.2cm above it, 3cm+ over 1.6%
+    // of the area. A mat conformed to the true surface therefore sinks INTO the
+    // drawn ground in hollows, and where the gap exceeds the cushion height it
+    // is swallowed whole — a hazard every per-vertex-conforming renderer
+    // inherits. Lift by the local concavity: the plane fit's mean height (which
+    // is what a chord across the hollow approximates) minus the point height.
+    // Per CORNER, so neighbours still agree and the mat stays continuous, and
+    // it assumes nothing about the base pass's tessellation. Mean lift is 4mm.
+    let pf = terrain_plane_fit(corner_xz, 0.5);
+    base_h += card_uni.lift * max(0.0, pf.h - ts.x);
+    up = normalize(mix(vec3f(0.0, 1.0, 0.0), pf.up, align));
+  }
+  // Offset along the GROUND normal, not straight up, so a cushion on a slope
+  // stands out of the slope. slope_align says how much the species conforms.
+  let world = vec3f(corner_xz.x, base_h, corner_xz.y) + up * (shell_h * card_uni.tile_scale);
+
+  var out: VOut;
+  out.pos = frame.view_proj * vec4f(world, 1.0);
+  out.uv = local * 0.5 + 0.5;
+  out.world = world;
+  out.pid = 0u;
+  // z = the shell's lower height bound in the baked height field's units.
+  out.yaw_gs = vec4f(cyaw, syaw, shell.x, 0.0);
+  out.axes = vec4f(0.0);
+  out.top_vf = vec2f(0.0);
+  out.ring_id = layer;
+  return out;
+}
+
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VOut {
+  if (card_uni.carpet_flag == 1u) { return vs_carpet(vi, ii); }
   // --- ring lookup (<= 6 iterations) ---
   var r = 0u;
   loop {
@@ -202,8 +329,83 @@ fn top_uv(uv_t: vec2f, axes: vec4f, cy: f32, sy: f32) -> vec2f {
   return vec2f(cy * wxz.x + sy * wxz.y, -sy * wxz.x + cy * wxz.y) + 0.5;
 }
 
+/**
+ * CARPET fragment path. The tile texture is a top-down capture of the tile's
+ * own period: rgb = albedo*coverage / a = coverage, plus (normal, height) in
+ * the second texture, both premultiplied so the mip chain averages statistics.
+ *
+ * Two hard tests, no dither anywhere: coverage against a carpet-specific
+ * reference (a mat must stay a solid depth-writing occluder — the technique's
+ * stochastic realization is for thinning ensembles of separate plants, not for
+ * a closed surface), and the cushion height against this shell's band.
+ */
+fn fs_carpet(in: VOut) -> vec4f {
+  let uv = in.uv;
+  let gx = dpdx(uv);
+  let gy = dpdy(uv);
+  let alb = textureSampleGrad(atlas_albedo, atlas_samp, uv, gx, gy);
+  let cov = alb.a;
+  if (cov < card_uni.cover_ref) { discard; }
+  let nh = textureSampleGrad(atlas_normal, atlas_samp, uv, gx, gy);
+  // Cushion top height at this texel, coverage-weighted (mip-safe).
+  let h0 = nh.a / cov;
+  if (h0 < in.yaw_gs.z) { discard; }
+
+  let entry = stand_table[card_uni.entry_index];
+  let albedo = alb.rgb / cov;
+  var n_l = nh.rgb / cov * 2.0 - 1.0;
+  n_l = select(n_l, vec3f(0.0, 1.0, 0.0), dot(n_l, n_l) < 1e-4);
+  n_l = normalize(n_l);
+
+  // Cushion-scale relief from the baked height field. The leaf-scale normals
+  // average toward straight up as the mip level rises (that is what an average
+  // of a two-sided leaf canopy IS), so a mat 1m away lights as a flat sheet
+  // with fine noise. The height field mips into the CUSHION shape, and its
+  // gradient — taken one screen pixel apart, so the scale always follows what
+  // the screen can resolve — puts the dome shading back.
+  if (card_uni.relief > 0.0) {
+    let step_uv = max(max(max(abs(gx.x), abs(gx.y)), max(abs(gy.x), abs(gy.y))), 1.0 / 512.0);
+    let hu = textureSampleGrad(atlas_normal, atlas_samp, uv + vec2f(step_uv, 0.0), gx, gy);
+    let hv = textureSampleGrad(atlas_normal, atlas_samp, uv + vec2f(0.0, step_uv), gx, gy);
+    let cu = textureSampleGrad(atlas_albedo, atlas_samp, uv + vec2f(step_uv, 0.0), gx, gy).a;
+    let cv = textureSampleGrad(atlas_albedo, atlas_samp, uv + vec2f(0.0, step_uv), gx, gy).a;
+    // Normalized height per uv unit -> world slope. The tile scale cancels:
+    // (h_range*scale) / (footprint*scale).
+    let k = card_uni.moss_h_range / max(entry.footprint_m, 1e-3) / step_uv;
+    let du = (hu.a / max(cu, 1e-3) - h0) * k;
+    let dv = (hv.a / max(cv, 1e-3) - h0) * k;
+    let g = clamp(vec2f(du, dv), vec2f(-3.0), vec2f(3.0)) * card_uni.relief;
+    n_l = normalize(n_l + vec3f(-g.x, 0.0, -g.y));
+  }
+
+  // Ground frame per fragment: the mat lights as the slope it lies on.
+  // slope_align says HOW MUCH the species conforms (1 for a carpet).
+  let ts = terrain_sample(in.world.xz);
+  let tn = vec3f(ts.y, sqrt(max(1.0 - ts.y * ts.y - ts.z * ts.z, 0.0)), ts.z);
+  let align = clamp(entry.slope_align, 0.0, 1.0);
+  let up = normalize(mix(vec3f(0.0, 1.0, 0.0), tn, align));
+  var tang = vec3f(in.yaw_gs.x, 0.0, -in.yaw_gs.y);
+  let proj = tang - up * dot(up, tang);
+  tang = select(vec3f(1.0, 0.0, 0.0), normalize(proj), dot(proj, proj) > 1e-6);
+  let n_w = normalize(tang * n_l.x + up * n_l.y + cross(tang, up) * n_l.z);
+
+  var color = light_surface(albedo, n_w, in.world);
+  if (debug_mode() == DEBUG_OFF) {
+    color = apply_fog(color, in.world);
+    if (card_uni.debug_rings == 1u) {
+      var shell_tints = array<vec3f, 6>(
+        vec3f(0.2, 0.3, 1.0), vec3f(0.2, 1.0, 0.6), vec3f(1.0, 1.0, 0.2),
+        vec3f(1.0, 0.5, 0.1), vec3f(1.0, 0.2, 0.2), vec3f(1.0, 1.0, 1.0),
+      );
+      color = mix(color, shell_tints[min(in.ring_id, 5u)], 0.55);
+    }
+  }
+  return vec4f(debug_shade(color, albedo, n_w, cov, in.world), 1.0);
+}
+
 @fragment
 fn fs_main(in: VOut) -> @location(0) vec4f {
+  if (card_uni.carpet_flag == 1u) { return fs_carpet(in); }
   let cy = in.yaw_gs.x;
   let sy = in.yaw_gs.y;
   let gamma = in.yaw_gs.z;

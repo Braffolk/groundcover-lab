@@ -3,12 +3,17 @@ import splatSrc from './shaders/splat.wgsl'
 import depthInitSrc from './shaders/depthinit.wgsl'
 import compositeSrc from './shaders/composite.wgsl'
 import {
-  BUCKET_BASES,
+  BUCKET_BASES_CARPET,
+  BUCKET_BASES_SCATTER,
+  BUCKET_COUNT,
+  BUCKET_SPLATS,
   LOD_COUNTS,
+  LOD_LEVELS,
   LOD_OFFSETS,
   TOTAL_RECORDS,
   TOTAL_SPLATS,
   bakeSpeciesSplats,
+  farLevelSummary,
   isValidSplatBake,
   parseSplatBake,
   type SplatBake,
@@ -18,6 +23,7 @@ import {
   bakedArtifact,
   commitBake,
   speciesById,
+  standEntrySlots,
   type Experiment,
   type ExperimentContext,
   type FrameInfo,
@@ -29,9 +35,11 @@ import type { PARAMS } from './manifest.ts'
  * Splat cloud + screen-space reconstruction.
  *
  * Each species bakes once into ~2.5k anisotropic covariance splats (16B each,
- * 5 LOD levels, ~41KB total). Per frame: (1) a compute pass procedurally
- * culls the stand's scatter inside a fixed camera-centered cell window into
- * per-(entry,LOD) plant buckets — work is window-bounded, never
+ * 5 LOD levels, ~41KB total), drawn in 6 distance buckets — the 5 baked levels
+ * plus a carpet-only far level of one ground-parallel disc per tile. Per frame:
+ * (1) a compute pass, ONE DISPATCH PER STAND ENTRY, procedurally culls the
+ * stand's scatter inside a fixed camera-centered cell window into
+ * per-(entry,bucket) plant buckets — work is window-bounded, never
  * plant-count-bounded; (2) indirect draws scatter dithered elliptical splats
  * into a HALF-RES buffer (albedo+height, normal+viewdepth) depth-tested
  * against downsampled scene depth; (3) a full-res reconstruction pass gathers
@@ -40,12 +48,22 @@ import type { PARAMS } from './manifest.ts'
  */
 
 const RINGS = [3, 7, 16, 36] as const
+/**
+ * Bucket 4 -> 5 ring, in the same size-relative units as RINGS: 106 puts it at
+ * ~25m for a life-size 0.18m moss tile, i.e. where the tile is ~2px. An upright
+ * plant has ring_scale 1, so 106m is past fade_end and it never reaches bucket 5.
+ */
+const RING4 = 106
 const FADE_END = 80
-const LODS = LOD_COUNTS.length
+/** Draw buckets = 5 baked LOD levels + the carpet-only far level. */
+const LODS = BUCKET_COUNT
+const PARAMS_BYTES = 80
 const RECORD_BYTES = 16
 /** drawIndexedIndirect args: indexCount, instanceCount, firstIndex, baseVertex, firstInstance. */
 const DRAW_ARGS_BYTES = 20
 const DRAWINFO_STRIDE = 256
+/** Threads per cull workgroup; the slot dimension is tiled by this. */
+const CULL_WG = 128
 const COLOR_FMT: GPUTextureFormat = 'rgba8unorm'
 const AUX_FMT: GPUTextureFormat = 'rgba16float'
 const DEPTH_FMT: GPUTextureFormat = 'depth32float'
@@ -90,7 +108,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
   for (const entry of entries) {
     const species = speciesById(entry.species)
     if (bakes.has(species.meshId)) continue
-    const key = `splats-v1-${species.meshId}`
+    const key = `splats-v2-${species.meshId}`
     let fresh = false
     let data = await bakedArtifact({ expId: ctx.id, key }, async () => {
       fresh = true
@@ -125,14 +143,20 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
   }
 
   // --- Frame-persistent buffers -------------------------------------------
+  // Sized from the stand, never from a hardcoded entry count: the bog stand has
+  // five entries (three moss states + two grasses), not three.
   const countsBuf = ctx.res.createBuffer(
-    { label: `${ctx.id}/bucket-counts`, size: 64, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST },
+    {
+      label: `${ctx.id}/bucket-counts`,
+      size: entryCount * LODS * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    },
     { tag: 'cull' },
   )
   const indirectBuf = ctx.res.createBuffer(
     {
       label: `${ctx.id}/indirect`,
-      size: 3 * LODS * DRAW_ARGS_BYTES,
+      size: entryCount * LODS * DRAW_ARGS_BYTES,
       usage: GPUBufferUsage.INDIRECT | GPUBufferUsage.STORAGE,
     },
     { tag: 'cull' },
@@ -156,7 +180,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
     device.queue.writeBuffer(quadIndexBuf, 0, idx)
   }
   const paramsBuf = ctx.res.createBuffer(
-    { label: `${ctx.id}/params`, size: 64, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST },
+    { label: `${ctx.id}/params`, size: PARAMS_BYTES, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST },
     { tag: 'params' },
   )
   const recordBufs = entries.map((entry, e) =>
@@ -169,6 +193,30 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       { species: entry.species, tag: 'plant-records' },
     ),
   )
+
+  // Slots the scatter actually offers per 4m cell for each entry. A CARPET has
+  // carpet_div² of them (484 for the bog moss) — deliberately over
+  // SCATTER_MAX_PER_CELL, so enumerating 128 would render a quarter of the mat.
+  const entrySlots = entries.map((entry) => standEntrySlots(entry))
+  // Per-entry cull uniform (entry index + slot count), one 256B-aligned slot
+  // each so each entry's bind group can point at its own offset.
+  const cullInfoBuf = ctx.res.createBuffer(
+    {
+      label: `${ctx.id}/cull-info`,
+      size: entryCount * DRAWINFO_STRIDE,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    },
+    { tag: 'cull' },
+  )
+  {
+    const data = new ArrayBuffer(entryCount * DRAWINFO_STRIDE)
+    const dv = new DataView(data)
+    entries.forEach((_entry, e) => {
+      dv.setUint32(e * DRAWINFO_STRIDE + 0, e, true)
+      dv.setUint32(e * DRAWINFO_STRIDE + 4, entrySlots[e]!, true)
+    })
+    device.queue.writeBuffer(cullInfoBuf, 0, data)
+  }
 
   // Static per-(entry,lod) draw info, addressed via dynamic offsets.
   const drawInfoBuf = ctx.res.createBuffer(
@@ -184,7 +232,14 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
     const dv = new DataView(data)
     entries.forEach((entry, e) => {
       const bake = bakes.get(speciesById(entry.species).meshId)!
+      const far = farLevelSummary(bake)
+      // Record layout differs between a carpet and a scattered entry — see
+      // BUCKET_CAPS_* in bake.ts.
+      const bases = entry.carpetDiv && entry.carpetDiv > 0 ? BUCKET_BASES_CARPET : BUCKET_BASES_SCATTER
       for (let l = 0; l < LODS; l++) {
+        // Bucket 5 has no baked level of its own: it is built from `far` below,
+        // so its splat offset just aliases the coarsest baked level.
+        const isFar = l >= LOD_LEVELS
         const o = (e * LODS + l) * DRAWINFO_STRIDE
         dv.setFloat32(o + 0, bake.boundsMin[0], true)
         dv.setFloat32(o + 4, bake.boundsMin[1], true)
@@ -195,10 +250,16 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         dv.setFloat32(o + 24, bake.boundsExt[2], true)
         dv.setFloat32(o + 28, bake.maxRa, true)
         dv.setFloat32(o + 32, bake.maxRb, true)
-        dv.setUint32(o + 48, LOD_OFFSETS[l]!, true)
-        dv.setUint32(o + 52, LOD_COUNTS[l]!, true)
-        dv.setUint32(o + 56, BUCKET_BASES[l]!, true)
+        dv.setFloat32(o + 36, isFar ? 1 : 0, true)
+        dv.setFloat32(o + 40, far.meanY, true)
+        dv.setUint32(o + 48, LOD_OFFSETS[Math.min(l, LOD_LEVELS - 1)]!, true)
+        dv.setUint32(o + 52, BUCKET_SPLATS[l]!, true)
+        dv.setUint32(o + 56, bases[l]!, true)
         dv.setUint32(o + 60, e, true)
+        dv.setFloat32(o + 64, far.color[0], true)
+        dv.setFloat32(o + 68, far.color[1], true)
+        dv.setFloat32(o + 72, far.color[2], true)
+        dv.setFloat32(o + 76, far.cvar, true)
       }
     })
     device.queue.writeBuffer(drawInfoBuf, 0, data)
@@ -211,15 +272,15 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
       { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
       { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
-      { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform', minBindingSize: 8 } },
     ],
   })
   const finalizeBGL = device.createBindGroupLayout({
     label: `${ctx.id}/finalize`,
     entries: [
-      { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
-      { binding: 6, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
+      { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'uniform' } },
+      { binding: 4, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'read-only-storage' } },
+      { binding: 5, visibility: GPUShaderStage.COMPUTE, buffer: { type: 'storage' } },
     ],
   })
   const splatBGL = device.createBindGroupLayout({
@@ -228,7 +289,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       {
         binding: 0,
         visibility: GPUShaderStage.VERTEX,
-        buffer: { type: 'uniform', hasDynamicOffset: true, minBindingSize: 64 },
+        buffer: { type: 'uniform', hasDynamicOffset: true, minBindingSize: 80 },
       },
       { binding: 1, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
       { binding: 2, visibility: GPUShaderStage.VERTEX, buffer: { type: 'read-only-storage' } },
@@ -249,23 +310,25 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
     ],
   })
 
-  const cullBG = device.createBindGroup({
-    label: `${ctx.id}/cull`,
-    layout: cullBGL,
-    entries: [
-      { binding: 0, resource: { buffer: paramsBuf } },
-      { binding: 1, resource: { buffer: countsBuf } },
-      { binding: 2, resource: { buffer: recordBufs[0]! } },
-      { binding: 3, resource: { buffer: recordBufs[Math.min(1, entryCount - 1)]! } },
-      { binding: 4, resource: { buffer: recordBufs[Math.min(2, entryCount - 1)]! } },
-    ],
-  })
+  const cullBGs = entries.map((_entry, e) =>
+    device.createBindGroup({
+      label: `${ctx.id}/cull-${e}`,
+      layout: cullBGL,
+      entries: [
+        { binding: 0, resource: { buffer: paramsBuf } },
+        { binding: 1, resource: { buffer: countsBuf } },
+        { binding: 2, resource: { buffer: recordBufs[e]! } },
+        { binding: 3, resource: { buffer: cullInfoBuf, offset: e * DRAWINFO_STRIDE, size: 8 } },
+      ],
+    }),
+  )
   const finalizeBG = device.createBindGroup({
     label: `${ctx.id}/finalize`,
     layout: finalizeBGL,
     entries: [
-      { binding: 5, resource: { buffer: countsBuf } },
-      { binding: 6, resource: { buffer: indirectBuf } },
+      { binding: 0, resource: { buffer: paramsBuf } },
+      { binding: 4, resource: { buffer: countsBuf } },
+      { binding: 5, resource: { buffer: indirectBuf } },
     ],
   })
   const splatBGs = entries.map((entry, e) =>
@@ -273,7 +336,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       label: `${ctx.id}/splat-${e}`,
       layout: splatBGL,
       entries: [
-        { binding: 0, resource: { buffer: drawInfoBuf, offset: 0, size: 64 } },
+        { binding: 0, resource: { buffer: drawInfoBuf, offset: 0, size: 80 } },
         { binding: 1, resource: { buffer: recordBufs[e]! } },
         { binding: 2, resource: { buffer: splatBufs.get(speciesById(entry.species).meshId)! } },
         { binding: 3, resource: { buffer: paramsBuf } },
@@ -428,7 +491,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
   }
 
   // --- Per-frame state ------------------------------------------------------
-  const paramsData = new ArrayBuffer(64)
+  const paramsData = new ArrayBuffer(PARAMS_BYTES)
   const pdv = new DataView(paramsData)
   let dimX = 0
   let dimZ = 0
@@ -469,6 +532,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       pdv.setFloat32(52, p.gapFill, true)
       pdv.setFloat32(56, cellPad, true)
       pdv.setUint32(60, p.reconstruct ? 1 : 0, true)
+      pdv.setFloat32(64, RING4 * p.detail, true)
       device.queue.writeBuffer(paramsBuf, 0, paramsData)
     },
 
@@ -481,11 +545,16 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         const cull = ctx.timing.computePass(enc, 'cull')
         cull.setPipeline(cullPipeline)
         cull.setBindGroup(0, ctx.frame.bindGroup)
-        cull.setBindGroup(1, cullBG)
-        cull.dispatchWorkgroups(dimX, dimZ)
+        // One dispatch per stand entry: the z dimension covers that entry's own
+        // slot count, so a carpet enumerates all 484 of its grid nodes while a
+        // scattered entry still costs a single 128-thread group per cell.
+        for (let e = 0; e < entryCount; e++) {
+          cull.setBindGroup(1, cullBGs[e]!)
+          cull.dispatchWorkgroups(dimX, dimZ, Math.ceil(entrySlots[e]! / CULL_WG))
+        }
         cull.setPipeline(finalizePipeline)
         cull.setBindGroup(1, finalizeBG)
-        cull.dispatchWorkgroups(1)
+        cull.dispatchWorkgroups(Math.ceil((entryCount * LODS) / 64))
         cull.end()
       }
 
@@ -508,9 +577,9 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       if (active) {
         splat.setPipeline(splatPipeline)
         splat.setIndexBuffer(quadIndexBuf, 'uint16')
-        // LOD-major, i.e. near-to-far: LOD n covers a strictly nearer ring than
-        // LOD n+1, so the nearest plants of every species lay down depth first
-        // and early-z rejects the field behind them instead of shading it.
+        // Bucket-major, i.e. near-to-far: bucket n covers a strictly nearer ring
+        // than bucket n+1, so the nearest plants of every species lay down depth
+        // first and early-z rejects the field behind them instead of shading it.
         for (let l = 0; l < LODS; l++) {
           for (let e = 0; e < entryCount; e++) {
             const i = e * LODS + l

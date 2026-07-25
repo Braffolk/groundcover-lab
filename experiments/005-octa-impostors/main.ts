@@ -1,8 +1,18 @@
+import carpetSrc from './shaders/carpet.wgsl'
 import cullSrc from './shaders/cull.wgsl'
+import cullCarpetSrc from './shaders/cull_carpet.wgsl'
 import impostorSrc from './shaders/impostor.wgsl'
 import mipgenSrc from './shaders/mipgen.wgsl'
 import { GRID_N, N_VIEWS, TILE, buildViewFrames, loadSpeciesViewSet, type ViewSet } from './bake.ts'
-import { SCATTER_CELL_SIZE, type Experiment, type ExperimentContext, type FrameInfo, type ViewTargets } from '@harness'
+import {
+  SCATTER_CELL_SIZE,
+  standEntrySlots,
+  type Experiment,
+  type ExperimentContext,
+  type FrameInfo,
+  type StandSpecies,
+  type ViewTargets,
+} from '@harness'
 import type { PARAMS } from './manifest.ts'
 
 /**
@@ -28,7 +38,19 @@ const MIP_LEVELS = 5 // 128 -> 8 px tiles
 const BUCKETS = 4
 /** Outer radii (m) of the front-to-back draw buckets; the last is regionRadius. */
 const BUCKET_EDGES = [6, 18, 50]
-const INFO_FLOATS = 56 // 14 vec4 — keep in sync with struct EntryInfo
+const INFO_FLOATS = 60 // 15 vec4 — keep in sync with struct EntryInfo
+/** Lanes per cull workgroup; a carpet cell needs ceil(slots / this) of them. */
+const CULL_LANES = 128
+/**
+ * Fraction of a bucket's grid nodes one carpet entry can own. The three
+ * Sphagnum states PARTITION the wetness field, so each owns roughly a third of
+ * the mat on average — but the field is not uniform, and a single hummock or
+ * hollow can be claimed almost entirely by one state. Measured worst case over
+ * six camera positions on the bog stand: 1.00 / 1.00 / 0.61 / 0.68 by bucket.
+ * The near buckets are small enough to be pathological; the far ones average
+ * over many wetness cells, which is exactly where the memory is.
+ */
+const CARPET_BUCKET_SHARE = [1, 1, 0.8, 0.85]
 
 interface SpeciesGpu {
   set: ViewSet
@@ -39,13 +61,22 @@ interface SpeciesGpu {
 
 interface EntryGpu {
   speciesId: string
+  /** stand_table[i].carpet_div > 0: a tiled mat, drawn by the carpet pipeline. */
+  carpet: boolean
   infoBuffer: GPUBuffer
   indirectBuffer: GPUBuffer
   cullBindGroup: GPUBindGroup
   drawBindGroups: GPUBindGroup[]
   /** EntryInfo staging, with every species-constant slot filled at init. */
   info: Float32Array<ArrayBuffer>
-  dispatch: [number, number]
+  /**
+   * Slot chunks per cell = ceil(standEntrySlots / CULL_LANES). 1 for a
+   * scattered entry, 4 for the bog carpet's 484 slots — driving this from
+   * SCATTER_MAX_PER_CELL would render a quarter of the mat.
+   */
+  chunks: number
+  /** Workgroups: cells in x, cells in z, slot chunks. */
+  dispatch: [number, number, number]
 }
 
 export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Experiment> {
@@ -95,7 +126,10 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
 
   const entries: EntryGpu[] = ctx.stand.species.map((standEntry, entryIndex) => {
     const gpu = speciesGpu.get(standEntry.species)!
-    const bucketCap = bucketCapacities(Math.min(standEntry.density, 8))
+    const carpet = (standEntry.carpetDiv ?? 0) > 0
+    // 4 B per carpet tile (a packed grid node), 16 B per scattered plant.
+    const stride = carpet ? 4 : 16
+    const bucketCap = carpet ? carpetCapacities(standEntry, ctx.stand.radius) : bucketCapacities(Math.min(standEntry.density, 8))
     const bucketBase: number[] = []
     let total = 0
     for (const cap of bucketCap) {
@@ -111,8 +145,8 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       { species: standEntry.species, tag: 'entry-info' },
     )
     const instBuffer = ctx.res.createBuffer(
-      { label: `${ctx.id}/instances-${entryIndex}`, size: total * 16, usage: GPUBufferUsage.STORAGE },
-      { species: standEntry.species, tag: 'culled-instances' },
+      { label: `${ctx.id}/instances-${entryIndex}`, size: total * stride, usage: GPUBufferUsage.STORAGE },
+      { species: standEntry.species, tag: carpet ? 'culled-tiles' : 'culled-instances' },
     )
     const indirectBuffer = ctx.res.createBuffer(
       {
@@ -142,7 +176,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         layout: drawBgl,
         entries: [
           { binding: 0, resource: { buffer: infoBuffer } },
-          { binding: 1, resource: { buffer: instBuffer, offset: bucketBase[b]! * 16, size: cap * 16 } },
+          { binding: 1, resource: { buffer: instBuffer, offset: bucketBase[b]! * stride, size: cap * stride } },
           { binding: 2, resource: { buffer: gpu.viewTable } },
           { binding: 3, resource: albedoView },
           { binding: 4, resource: normalView },
@@ -167,43 +201,63 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
 
     return {
       speciesId: standEntry.species,
+      carpet,
       infoBuffer,
       indirectBuffer,
       cullBindGroup,
       drawBindGroups,
       info,
-      dispatch: [0, 0],
+      chunks: Math.ceil(standEntrySlots(standEntry) / CULL_LANES),
+      dispatch: [0, 0, 0],
     }
   })
 
+  const anyCarpet = entries.some((e) => e.carpet)
   let cullPipeline!: GPUComputePipeline
+  let cullCarpetPipeline: GPUComputePipeline | null = null
   let blendPipeline!: GPURenderPipeline
   let nearestPipeline!: GPURenderPipeline
+  let carpetBlendPipeline: GPURenderPipeline | null = null
+  let carpetNearestPipeline: GPURenderPipeline | null = null
   const build = (): void => {
+    const cullLayout = device.createPipelineLayout({
+      label: `${ctx.id}/cull-pl`,
+      bindGroupLayouts: [ctx.frame.layout, cullBgl],
+    })
     cullPipeline = device.createComputePipeline({
       label: `${ctx.id}/cull`,
-      layout: device.createPipelineLayout({
-        label: `${ctx.id}/cull-pl`,
-        bindGroupLayouts: [ctx.frame.layout, cullBgl],
-      }),
+      layout: cullLayout,
       compute: { module: ctx.shaders.module(cullSrc), entryPoint: 'cs_cull' },
     })
-    const module = ctx.shaders.module(impostorSrc)
     const layout = device.createPipelineLayout({
       label: `${ctx.id}/draw-pl`,
       bindGroupLayouts: [ctx.frame.layout, drawBgl],
     })
-    const mkDraw = (entryPoint: string): GPURenderPipeline =>
+    const mkDraw = (module: GPUShaderModule, vs: string, fs: string): GPURenderPipeline =>
       device.createRenderPipeline({
-        label: `${ctx.id}/${entryPoint}`,
+        label: `${ctx.id}/${fs}`,
         layout,
-        vertex: { module, entryPoint: 'vs_main' },
-        fragment: { module, entryPoint, targets: [{ format: ctx.colorFormat }] },
+        vertex: { module, entryPoint: vs },
+        fragment: { module, entryPoint: fs, targets: [{ format: ctx.colorFormat }] },
         primitive: { topology: 'triangle-list', cullMode: 'none' },
         depthStencil: { format: ctx.depthFormat, depthCompare: 'less', depthWriteEnabled: true },
       })
-    blendPipeline = mkDraw('fs_blend3')
-    nearestPipeline = mkDraw('fs_nearest')
+    const impostorModule = ctx.shaders.module(impostorSrc)
+    blendPipeline = mkDraw(impostorModule, 'vs_main', 'fs_blend3')
+    nearestPipeline = mkDraw(impostorModule, 'vs_main', 'fs_nearest')
+    // Carpet species get their own pipelines rather than a branch in the plant
+    // shader: different instance record, different geometry, different alpha
+    // rule — and the upright path then stays bit-for-bit what it was.
+    if (anyCarpet) {
+      cullCarpetPipeline = device.createComputePipeline({
+        label: `${ctx.id}/cull-carpet`,
+        layout: cullLayout,
+        compute: { module: ctx.shaders.module(cullCarpetSrc), entryPoint: 'cs_cull_carpet' },
+      })
+      const carpetModule = ctx.shaders.module(carpetSrc)
+      carpetBlendPipeline = mkDraw(carpetModule, 'vs_carpet', 'fs_carpet_blend3')
+      carpetNearestPipeline = mkDraw(carpetModule, 'vs_carpet', 'fs_carpet_nearest')
+    }
   }
   build()
   const unsubscribe = ctx.shaders.onReload(build)
@@ -233,23 +287,34 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         info.set(planes, 0)
         info.set([x0, z0, sideX, sideZ], 24)
         info[30] = R
-        info[31] = ctx.params.alphaRef
+        // A mat is a closed surface and must not dissolve with distance: the
+        // mip chain pulls a tile's coverage toward its own mean, so the grass
+        // reference would drop whole distant tiles out and punch holes in the
+        // carpet. The genuinely empty texels (the gaps down to the peat) still
+        // open at a low reference.
+        info[31] = entry.carpet ? ctx.params.carpetAlphaRef : ctx.params.alphaRef
         info.set([Math.min(BUCKET_EDGES[0]!, R), Math.min(BUCKET_EDGES[1]!, R), Math.min(BUCKET_EDGES[2]!, R), R], 40)
         info[54] = ctx.params.viewTint ? 1 : 0
+        info[55] = ctx.params.carpetNormalDetail
+        info[56] = ctx.params.carpetCropInset
         device.queue.writeBuffer(entry.infoBuffer, 0, info)
         device.queue.writeBuffer(entry.indirectBuffer, 0, indirectReset)
-        entry.dispatch = [sideX, sideZ]
+        entry.dispatch = [sideX, sideZ, entry.chunks]
       }
     },
 
     encode(enc: GPUCommandEncoder, _frame: FrameInfo, targets: ViewTargets): void {
       const cull = ctx.timing.computePass(enc, 'cull')
-      cull.setPipeline(cullPipeline)
       cull.setBindGroup(0, ctx.frame.bindGroup)
+      let cullCarpet: boolean | null = null
       for (const entry of entries) {
         if (entry.dispatch[0] === 0 || entry.dispatch[1] === 0) continue
+        if (entry.carpet !== cullCarpet) {
+          cull.setPipeline(entry.carpet ? cullCarpetPipeline! : cullPipeline)
+          cullCarpet = entry.carpet
+        }
         cull.setBindGroup(1, entry.cullBindGroup)
-        cull.dispatchWorkgroups(entry.dispatch[0], entry.dispatch[1])
+        cull.dispatchWorkgroups(entry.dispatch[0], entry.dispatch[1], entry.dispatch[2])
       }
       cull.end()
 
@@ -257,12 +322,22 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         colorAttachments: [{ view: targets.colorView, loadOp: 'load', storeOp: 'store' }],
         depthStencilAttachment: { view: targets.depthView, depthLoadOp: 'load', depthStoreOp: 'store' },
       })
-      pass.setPipeline(ctx.params.viewBlend === 'nearest' ? nearestPipeline : blendPipeline)
+      const nearest = ctx.params.viewBlend === 'nearest'
+      const plantPipeline = nearest ? nearestPipeline : blendPipeline
+      const matPipeline = nearest ? carpetNearestPipeline : carpetBlendPipeline
       pass.setBindGroup(0, ctx.frame.bindGroup)
       // Near bucket first: alpha-tested cards write solid depth, so the
-      // nearest plants become occluders for everything drawn after them.
+      // nearest plants become occluders for everything drawn after them. The
+      // carpet is part of that: a mat at a low alpha reference is nearly
+      // solid, so it occludes the tiles behind it instead of leaking overdraw.
+      let bound: GPURenderPipeline | null = null
       for (let b = 0; b < BUCKETS; b++) {
         for (const entry of entries) {
+          const want = entry.carpet ? matPipeline! : plantPipeline
+          if (want !== bound) {
+            pass.setPipeline(want)
+            bound = want
+          }
           pass.setBindGroup(1, entry.drawBindGroups[b]!)
           pass.drawIndirect(entry.indirectBuffer, b * 16)
         }
@@ -289,6 +364,28 @@ function bucketCapacities(density: number): number[] {
     const area = Math.PI * (edges[j + 1]! ** 2 - edges[j]! ** 2)
     // Round to 16 records so every bucket base is 256B aligned (bind offsets).
     caps.push(Math.ceil((density * area * 1.15 + 2048) / 16) * 16)
+  }
+  return caps
+}
+
+/**
+ * Tile capacity per distance bucket for a CARPET entry. A carpet's count comes
+ * from its GRID, never from `density`: carpetDiv² nodes per scatter cell, of
+ * which this entry's wetness interval claims some share. The annulus is also
+ * clipped to the stand's own square — on the ±96 m bog the far bucket would
+ * otherwise be sized for a 128 m region that holds no plants.
+ */
+function carpetCapacities(entry: StandSpecies, standRadius: number): number[] {
+  const nodesPerM2 = entry.carpetDiv! ** 2 / SCATTER_CELL_SIZE ** 2
+  const edges = [0, ...BUCKET_EDGES, REGION_MAX]
+  const standArea = (2 * standRadius) ** 2
+  const caps: number[] = []
+  for (let j = 0; j < BUCKETS; j++) {
+    const inner = Math.PI * edges[j]! ** 2
+    const area = Math.min(Math.PI * edges[j + 1]! ** 2, standArea) - Math.min(inner, standArea)
+    // Round to 64 records: at 4 B each that keeps every bucket base 256B
+    // aligned for the per-bucket bind-group window.
+    caps.push(Math.ceil((Math.max(area, 0) * nodesPerM2 * CARPET_BUCKET_SHARE[j]! + 4096) / 64) * 64)
   }
   return caps
 }

@@ -1,5 +1,6 @@
 #include "src/wgsl/hash.wgsl"
 #include "src/wgsl/terrain.wgsl"
+#include "src/wgsl/scatter.wgsl"
 #include "src/wgsl/wind.wgsl"
 #include "src/wgsl/lighting.wgsl"
 #include "src/wgsl/debug.wgsl"
@@ -12,10 +13,14 @@
 
 struct CarpetUni {
   colors: array<vec4f, 4>, // rgb = species mean albedo, w = cumulative weight
+  // Habitat band of each entry: x = wet_center, y = wet_width, z = 1 for a
+  // carpet (zoned) entry. On a stand whose ground cover is zoned, the mean
+  // field is a FUNCTION OF THE WETNESS FIELD, not of a patch hash.
+  zones: array<vec4f, 4>,
   n_entries: u32,
   seed: u32,
+  zoned: u32,
   _pa: u32,
-  _pb: u32,
   inner_r: f32,
   outer_r: f32,
   canopy_h: f32,
@@ -69,17 +74,37 @@ fn fs_main(in: VOut) -> @location(0) vec4f {
   // Species mottle: 2.5m patches pick a species by stand coverage weight.
   let mcell = vec2i(floor(in.world.xz / 2.5));
   let mh = hash3(carpet_uni.seed ^ 0x5bd1u, bitcast<u32>(mcell.x), bitcast<u32>(mcell.y));
-  let sel = hash_f32(mh);
   var tint = carpet_uni.colors[0].rgb;
-  var prev = 0.0;
-  for (var i = 0u; i < 4u; i = i + 1u) {
-    if (i < carpet_uni.n_entries) {
-      let cw = carpet_uni.colors[i].w;
-      if (sel >= prev && sel < cw) { tint = carpet_uni.colors[i].rgb; }
-      prev = cw;
+  if (carpet_uni.zoned == 1u) {
+    // Zoned ground cover (the bog's three Sphagnum states): blend the entries'
+    // mean colours by how near the local wetness is to each band centre. The
+    // far field then agrees with the drawn mat by construction, instead of
+    // breaking into a hash checkerboard of species patches — which is exactly
+    // what it did when the mat stopped at 20m instead of 54m.
+    let w = scatter_wetness(carpet_uni.seed, in.world.xz);
+    var acc = vec3f(0.0);
+    var wsum = 0.0;
+    for (var i = 0u; i < 4u; i = i + 1u) {
+      let z = carpet_uni.zones[i];
+      if (i < carpet_uni.n_entries && z.z > 0.5) {
+        let k = max(0.0, 1.0 - abs(w - z.x) / max(z.y, 1e-3));
+        acc += carpet_uni.colors[i].rgb * k;
+        wsum += k;
+      }
     }
+    tint = select(tint, acc / max(wsum, 1e-4), wsum > 1e-4);
+  } else {
+    let sel = hash_f32(mh);
+    var prev = 0.0;
+    for (var i = 0u; i < 4u; i = i + 1u) {
+      if (i < carpet_uni.n_entries) {
+        let cw = carpet_uni.colors[i].w;
+        if (sel >= prev && sel < cw) { tint = carpet_uni.colors[i].rgb; }
+        prev = cw;
+      }
+    }
+    tint = tint * (0.82 + 0.30 * hash_f32(hash2(mh, 7u)));
   }
-  tint = tint * (0.82 + 0.30 * hash_f32(hash2(mh, 7u)));
 
   // Canopy normal statistics: terrain normal pulled upward, hash-perturbed.
   let tn = terrain_normal(in.world.xz);

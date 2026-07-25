@@ -4,22 +4,27 @@
 // hit along dv through that slab offset). Rasterization here is exactly the
 // "precomputed raycast" loophole: the depth test resolves each ray bundle to
 // its first hit, offline, once.
+//
+// The frustum is fitted to the baked BOX for this direction (ext_r/ext_u/ext_d
+// = the box's support along each slab axis), not to its bounding sphere, so no
+// cell wastes texels on empty margin.
 
 struct BakeView {
+  // Already ANCHORED on the CPU: xz origin at the tile/specimen pivot. Do not
+  // subtract the anchor again here — doing that shifted every species' content
+  // off-centre in its slab and let the ortho frustum clip up to half of it.
   bounds_min: vec3f,
-  radius: f32,
+  ext_r: f32,
   bounds_max: vec3f,
-  _p0: f32,
+  ext_u: f32,
   r_ax: vec3f,
-  _p1: f32,
+  ext_d: f32,
   u_ax: vec3f,
   _p2: f32,
   dv: vec3f,
   _p3: f32,
   center: vec3f,
   _p4: f32,
-  anchor: vec2f,
-  _p5: vec2f,
 }
 @group(0) @binding(0) var<uniform> bv: BakeView;
 
@@ -34,14 +39,12 @@ struct VOut {
 fn vs_bake(@location(0) a0: vec4<u32>, @location(1) a1: vec4<u32>) -> VOut {
   let q = vec3f(f32(a0.x), f32(a0.y), f32(a0.z)) / 65535.0;
   let local = bv.bounds_min + q * (bv.bounds_max - bv.bounds_min);
-  // Anchored space: xz origin at the plant/tile anchor (instance pivot).
-  let a = local - vec3f(bv.anchor.x, 0.0, bv.anchor.y);
-  let rel = a - bv.center;
-  let z01 = (dot(rel, bv.dv) + bv.radius) / (2.0 * bv.radius);
+  let rel = local - bv.center;
+  let z01 = (dot(rel, bv.dv) + bv.ext_d) / (2.0 * bv.ext_d);
   var out: VOut;
   // Clip y is negated so texture v grows with +u_ax slab coordinate — the
   // runtime sampler then needs no flip.
-  out.pos = vec4f(dot(rel, bv.r_ax) / bv.radius, -dot(rel, bv.u_ax) / bv.radius, z01, 1.0);
+  out.pos = vec4f(dot(rel, bv.r_ax) / bv.ext_r, -dot(rel, bv.u_ax) / bv.ext_u, z01, 1.0);
   out.color = vec3f(f32(a0.w), f32(a1.x), f32(a1.y)) / 65535.0;
   out.oct = vec2f(f32(a1.z), f32(a1.w)) / 65535.0;
   out.height01 = clamp(

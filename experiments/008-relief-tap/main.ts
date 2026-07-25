@@ -1,30 +1,42 @@
 import cullSrc from './shaders/cull.wgsl'
 import reliefSrc from './shaders/relief.wgsl'
-import { ATLAS, GRID, loadSpeciesViews, TILE, type BakedViews } from './bake.ts'
-import { SCATTER_CELL_SIZE } from '@harness'
+import { loadSpeciesBake, type SpeciesBake } from './bake.ts'
+import { SCATTER_CELL_SIZE, standEntrySlots } from '@harness'
 import type { Experiment, ExperimentContext, FrameInfo, ViewTargets } from '@harness'
 import type { PARAMS } from './manifest.ts'
 
 /**
- * Secant relief cards. Each species is baked once into a 5x5 hemi-octahedral
- * fan of depth-augmented orthographic captures (albedo+coverage, signed
- * heightfield, baked normals). At runtime a GPU cull pass materializes only
- * the plants within maxDist of the camera from the shared scatter twin
- * (fixed-size dispatch — plant-count independent), and every plant is a
- * single card whose fragments intersect the eye ray with the selected view's
- * heightfield using a FIXED 3-tap secant scheme — no loops, no marching —
- * then write the reconstructed hit as real frag_depth.
+ * Secant relief cards.
+ *
+ * Scattered plants: each species is baked into a 5x5 hemi-octahedral fan of
+ * depth-augmented orthographic captures (albedo+coverage, signed heightfield,
+ * baked normals) and drawn as one camera-facing card whose fragments intersect
+ * the eye ray with the selected view's heightfield using a FIXED 3-tap secant
+ * scheme — no loops, no marching — then write the reconstructed hit as real
+ * frag_depth.
+ *
+ * Carpet species (stand carpetDiv > 0, e.g. Sphagnum): the same relief solve,
+ * but over ONE zenith capture cropped to the periodic tile, on a ground-
+ * parallel tile-sized quad that is terrain-conformed per vertex. See
+ * shaders/relief.wgsl and bake.ts for why a mat wants the whole budget spent on
+ * that single view.
+ *
+ * Either way a GPU cull pass materializes only the plants within maxDist of the
+ * camera from the shared scatter twin (fixed-size dispatch — plant-count
+ * independent).
  */
 
 const MAX_DIST_CAP = 88 // must match PARAMS.maxDist max — sizes the buffers
 const RELIEF_MODES = ['flat-1tap', 'linear-2tap', 'secant-3tap'] as const
-const VIEW_MODES = ['nearest', 'stochastic'] as const
+const VIEW_MODES = ['stochastic', 'nearest'] as const
 const INSPECT_MODES = ['off', 'height', 'view-cell'] as const
 
 interface EntryState {
   speciesId: string
-  views: BakedViews
+  bake: SpeciesBake
   capacity: number
+  /** Candidate slots per scatter cell — carpetDiv^2 for a mat, else 128. */
+  slots: number
   cullUbo: GPUBuffer
   drawUbo: GPUBuffer
   cullBind: GPUBindGroup
@@ -37,15 +49,22 @@ interface EntryState {
 export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Experiment> {
   const { device } = ctx
 
-  // --- bake the per-species view sets and upload the atlases ----------------
-  const uniqueSpecies = [...new Set(ctx.stand.species.map((e) => e.species))]
-  const baked = new Map<string, { views: BakedViews; albedo: GPUTexture; geom: GPUTexture }>()
-  for (const speciesId of uniqueSpecies) {
-    const views = await loadSpeciesViews(ctx, speciesId)
+  // --- bake the per-species representations and upload them ------------------
+  // A species is baked as a CARPET if the active stand lays it out as one; the
+  // two bakes have completely different budget splits (bake.ts).
+  const carpetOf = new Map<string, boolean>()
+  for (const entry of ctx.stand.species) {
+    carpetOf.set(entry.species, (entry.carpetDiv ?? 0) > 0)
+  }
+  const baked = new Map<string, { bake: SpeciesBake; albedo: GPUTexture; geom: GPUTexture }>()
+  for (const [speciesId, isCarpet] of carpetOf) {
+    const bake = await loadSpeciesBake(ctx, speciesId, isCarpet)
+    const mips = bake.albedoLevels.length
     const albedo = ctx.res.createTexture(
       {
         label: `${ctx.id}/${speciesId}/albedo`,
-        size: [ATLAS, ATLAS],
+        size: [bake.px, bake.px],
+        mipLevelCount: mips,
         format: 'rgba8unorm',
         usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
       },
@@ -54,26 +73,48 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
     const geom = ctx.res.createTexture(
       {
         label: `${ctx.id}/${speciesId}/geom`,
-        size: [ATLAS, ATLAS],
+        size: [bake.px, bake.px],
+        mipLevelCount: bake.geomLevels.length,
         format: 'rgba16float',
         usage: GPUTextureUsage.TEXTURE_BINDING | GPUTextureUsage.COPY_DST,
       },
       { species: speciesId, tag: 'relief-geom' },
     )
-    device.queue.writeTexture(
-      { texture: albedo },
-      views.albedo as unknown as BufferSource,
-      { bytesPerRow: ATLAS * 4, rowsPerImage: ATLAS },
-      [ATLAS, ATLAS],
-    )
-    device.queue.writeTexture(
-      { texture: geom },
-      views.geom as unknown as BufferSource,
-      { bytesPerRow: ATLAS * 8, rowsPerImage: ATLAS },
-      [ATLAS, ATLAS],
-    )
-    baked.set(speciesId, { views, albedo, geom })
+    bake.albedoLevels.forEach((data, level) => {
+      const n = Math.max(1, bake.px >> level)
+      device.queue.writeTexture(
+        { texture: albedo, mipLevel: level },
+        data as unknown as BufferSource,
+        { bytesPerRow: n * 4, rowsPerImage: n },
+        [n, n],
+      )
+    })
+    bake.geomLevels.forEach((data, level) => {
+      const n = Math.max(1, bake.px >> level)
+      device.queue.writeTexture(
+        { texture: geom, mipLevel: level },
+        data as unknown as BufferSource,
+        { bytesPerRow: n * 8, rowsPerImage: n },
+        [n, n],
+      )
+    })
+    baked.set(speciesId, { bake, albedo, geom })
   }
+
+  // Carpet tiles only: REPEAT because the cropped tile is exactly periodic;
+  // mipmapped because a single view has no neighbouring cells to bleed into;
+  // ANISOTROPIC because a ground mat is looked at at grazing angles almost all
+  // the time, and an isotropic level chosen for the long axis of that footprint
+  // collapses the whole field into per-tile mean colours.
+  const carpetSampler = device.createSampler({
+    label: `${ctx.id}/carpet-sampler`,
+    addressModeU: 'repeat',
+    addressModeV: 'repeat',
+    magFilter: 'linear',
+    minFilter: 'linear',
+    mipmapFilter: 'linear',
+    maxAnisotropy: 16,
+  })
 
   // --- shared buffers -------------------------------------------------------
   const entryCount = ctx.stand.species.length
@@ -102,24 +143,44 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
       { binding: 1, visibility: GPUShaderStage.VERTEX | GPUShaderStage.FRAGMENT, buffer: { type: 'uniform' } },
       { binding: 2, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
       { binding: 3, visibility: GPUShaderStage.FRAGMENT, texture: { sampleType: 'float' } },
+      { binding: 4, visibility: GPUShaderStage.FRAGMENT, sampler: { type: 'filtering' } },
     ],
   })
 
   let cullPipeline!: GPUComputePipeline
-  let drawPipeline!: GPURenderPipeline
+  let cardPipeline!: GPURenderPipeline
+  let carpetPipeline!: GPURenderPipeline
   const build = (): void => {
     cullPipeline = device.createComputePipeline({
       label: `${ctx.id}/cull`,
       layout: device.createPipelineLayout({ label: `${ctx.id}/cull`, bindGroupLayouts: [ctx.frame.layout, cullBgl] }),
       compute: { module: ctx.shaders.module(cullSrc), entryPoint: 'cs_cull' },
     })
-    drawPipeline = device.createRenderPipeline({
+    const layout = device.createPipelineLayout({
+      label: `${ctx.id}/draw`,
+      bindGroupLayouts: [ctx.frame.layout, drawBgl],
+    })
+    const module = ctx.shaders.module(reliefSrc)
+    const common = {
+      layout,
+      primitive: { topology: 'triangle-list' as const, cullMode: 'none' as const },
+      depthStencil: {
+        format: ctx.depthFormat,
+        depthCompare: 'less' as const,
+        depthWriteEnabled: true,
+      },
+    }
+    cardPipeline = device.createRenderPipeline({
+      ...common,
       label: `${ctx.id}/relief-cards`,
-      layout: device.createPipelineLayout({ label: `${ctx.id}/draw`, bindGroupLayouts: [ctx.frame.layout, drawBgl] }),
-      vertex: { module: ctx.shaders.module(reliefSrc), entryPoint: 'vs_main' },
-      fragment: { module: ctx.shaders.module(reliefSrc), entryPoint: 'fs_main', targets: [{ format: ctx.colorFormat }] },
-      primitive: { topology: 'triangle-list', cullMode: 'none' },
-      depthStencil: { format: ctx.depthFormat, depthCompare: 'less', depthWriteEnabled: true },
+      vertex: { module, entryPoint: 'vs_main' },
+      fragment: { module, entryPoint: 'fs_main', targets: [{ format: ctx.colorFormat }] },
+    })
+    carpetPipeline = device.createRenderPipeline({
+      ...common,
+      label: `${ctx.id}/relief-carpet`,
+      vertex: { module, entryPoint: 'vs_carpet' },
+      fragment: { module, entryPoint: 'fs_carpet', targets: [{ format: ctx.colorFormat }] },
     })
   }
   build()
@@ -129,10 +190,31 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
   const entries: EntryState[] = ctx.stand.species.map((standEntry, entryIndex) => {
     const speciesId = standEntry.species
     const b = baked.get(speciesId)!
-    const density = Math.min(standEntry.density, 8)
-    const capacity = Math.ceil(Math.PI * MAX_DIST_CAP * MAX_DIST_CAP * density * 1.15)
+    const isCarpet = b.bake.carpet
+    // EVERY slot must be evaluated (a carpet has carpet_div^2 of them, over the
+    // 128-slot scatter budget), but capacity only has to hold the expected
+    // survivors.
+    const slots = standEntrySlots(standEntry)
+    const area = Math.PI * MAX_DIST_CAP * MAX_DIST_CAP
+    let capacity: number
+    if (isCarpet) {
+      // The bog's three moss states PARTITION the wetness axis, so an entry
+      // nominally claims `wetWidth` of the grid nodes. But wetness is damped on
+      // slopes, so over steep ground the distribution collapses toward 0 and the
+      // driest zone claims far more than its nominal third — hence the flat
+      // headroom on top of the width. Sizing all three for all 484 slots instead
+      // would waste ~3x (only one entry can own a node).
+      const accept = Math.min(1, (standEntry.wetWidth ?? 1) * 1.25 + 0.35)
+      capacity = Math.ceil((area * slots * accept) / (SCATTER_CELL_SIZE * SCATTER_CELL_SIZE))
+    } else {
+      capacity = Math.ceil(area * Math.min(standEntry.density, 8) * 1.15)
+    }
     const plants = ctx.res.createBuffer(
-      { label: `${ctx.id}/plants-${entryIndex}-${speciesId}`, size: capacity * 32, usage: GPUBufferUsage.STORAGE },
+      {
+        label: `${ctx.id}/plants-${entryIndex}-${speciesId}`,
+        size: capacity * (isCarpet ? 16 : 32),
+        usage: GPUBufferUsage.STORAGE,
+      },
       { species: speciesId, tag: 'culled-instances' },
     )
     const cullUbo = ctx.res.createBuffer(
@@ -145,8 +227,9 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
     )
     return {
       speciesId,
-      views: b.views,
+      bake: b.bake,
       capacity,
+      slots,
       cullUbo,
       drawUbo,
       lastDraw: new Float32Array(24).fill(NaN),
@@ -167,6 +250,7 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
           { binding: 1, resource: { buffer: drawUbo } },
           { binding: 2, resource: b.albedo.createView() },
           { binding: 3, resource: b.geom.createView() },
+          { binding: 4, resource: carpetSampler },
         ],
       }),
     }
@@ -200,7 +284,14 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
 
       device.queue.writeBuffer(drawArgs, 0, drawArgsReset)
       entries.forEach((entry, entryIndex) => {
-        const v = entry.views
+        const v = entry.bake
+        // A carpet quad is centred on its grid node and spans the tile square,
+        // so its bound is the tile's half diagonal plus its height — not the
+        // source mesh's off-origin bounding sphere.
+        const sphereY = v.carpet ? v.topH * 0.5 : v.center[1]
+        const sphereR = v.carpet
+          ? v.radius * Math.SQRT2 + v.topH
+          : v.radius + Math.hypot(v.center[0], v.center[2])
         cullI32[0] = c0x
         cullI32[1] = c0z
         cullU32[2] = entryIndex
@@ -208,8 +299,11 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         cullF32[4] = maxDist
         cullF32[5] = ctx.stand.radius
         cullU32[6] = entry.capacity
-        cullF32[7] = v.center[1]
-        cullF32[8] = v.radius + Math.hypot(v.center[0], v.center[2])
+        cullF32[7] = sphereY
+        cullF32[8] = sphereR
+        cullU32[9] = entry.slots
+        cullU32[10] = cellsX
+        cullU32[11] = cellsZ
         device.queue.writeBuffer(entry.cullUbo, 0, cullData)
 
         drawData[0] = v.center[0]
@@ -220,9 +314,9 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         drawData[5] = v.halfExt[1]
         drawData[6] = v.halfExt[2]
         drawData[7] = v.topH
-        drawData[8] = GRID
-        drawData[9] = TILE
-        drawData[10] = ATLAS
+        drawData[8] = v.grid
+        drawData[9] = v.px / v.grid
+        drawData[10] = v.px
         drawData[11] = maxDist
         drawData[12] = ctx.params.fadeBand
         drawData[13] = ctx.params.covThresh
@@ -233,6 +327,8 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         drawData[18] = Math.max(0, VIEW_MODES.indexOf(ctx.params.viewSelect))
         drawData[19] = entry.capacity
         drawData[20] = Math.max(0, INSPECT_MODES.indexOf(ctx.params.inspect))
+        drawData[21] = v.hMean
+        drawData[22] = v.hSigma
         // Nothing in here depends on the camera or on time — upload only when
         // a param (or the bake) actually changed it.
         let dirty = false
@@ -256,7 +352,9 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         cull.setBindGroup(0, ctx.frame.bindGroup)
         for (const entry of entries) {
           cull.setBindGroup(1, entry.cullBind)
-          cull.dispatchWorkgroups(cellsX, cellsZ, 1)
+          // One thread per (cell, slot): a carpet entry simply takes more
+          // workgroups per cell than a scattered one.
+          cull.dispatchWorkgroups(Math.ceil((cellsX * cellsZ * entry.slots) / 128))
         }
       }
       cull.end()
@@ -265,9 +363,14 @@ export async function create(ctx: ExperimentContext<typeof PARAMS>): Promise<Exp
         colorAttachments: [{ view: targets.colorView, loadOp: 'load', storeOp: 'store' }],
         depthStencilAttachment: { view: targets.depthView, depthLoadOp: 'load', depthStoreOp: 'store' },
       })
-      pass.setPipeline(drawPipeline)
       pass.setBindGroup(0, ctx.frame.bindGroup)
+      let active: GPURenderPipeline | null = null
       entries.forEach((entry, entryIndex) => {
+        const want = entry.bake.carpet ? carpetPipeline : cardPipeline
+        if (want !== active) {
+          pass.setPipeline(want)
+          active = want
+        }
         pass.setBindGroup(1, entry.drawBind)
         pass.drawIndirect(drawArgs, entryIndex * 16)
       })

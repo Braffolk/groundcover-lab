@@ -8,6 +8,11 @@ export const PARAMS = {
   rMid: p.num(38, { min: 10, max: 60, step: 1 }),
   rRegion: p.num(64, { min: 24, max: 96, step: 4 }),
   alphaThresh: p.num(0.35, { min: 0.05, max: 0.9, step: 0.01 }),
+  // Carpet species (stand_table.carpet_div > 0, i.e. the bog's Sphagnum) use a
+  // HARD alpha reference instead of the dithered one, and their own
+  // sky-visibility floor — see shaders/slices.wgsl.
+  carpetAlpha: p.num(0.3, { min: 0.02, max: 0.9, step: 0.01 }),
+  carpetOcc: p.num(0.55, { min: 0.2, max: 1, step: 0.01 }),
   sigma: p.num(1.4, { min: 0.2, max: 4, step: 0.05 }),
   lodBias: p.num(0, { min: -2, max: 2, step: 0.1 }),
   axisBiasY: p.num(1.15, { min: 0.5, max: 2, step: 0.05 }),
