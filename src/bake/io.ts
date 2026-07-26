@@ -1,6 +1,6 @@
 import { HAS_DEV_SINK } from '../util/env.ts'
 import { assetUrl } from '../util/paths.ts'
-import { bakeCacheGet, bakeCachePut } from './cache.ts'
+import { bakeCacheGet, bakeCachePruneOther, bakeCachePut } from './cache.ts'
 
 /**
  * Per-experiment bake flow. An experiment's baked artifact format is entirely
@@ -32,13 +32,36 @@ export interface BakeContext {
   onProgress?: (fraction: number, note?: string) => void
 }
 
+/**
+ * Revision of the SHARED code every bake reads through — bump it and every
+ * OPFS-cached artifact in every browser is invalidated at once.
+ *
+ * An experiment folds its own `bakeVersion` into `ctx.key`, but it cannot fold
+ * in a harness change, and a stale cache silently wins over corrected code:
+ * that is exactly what happened when the GCMESH1 octahedral normal decode was
+ * corrected (2026-07-26) — every bake that had ever decoded a source normal was
+ * wrong, and every one of them would have been served from OPFS anyway.
+ * Committed files under mesh/baked/ are NOT namespaced by this (their paths are
+ * quoted in NOTES.md and bench results); invalidate those by deleting them.
+ *
+ *   r1  original
+ *   r2  GCMESH1 source normals: stored pair is (x, y) and the derived component
+ *       is z, not y (src/wgsl/gcmesh.wgsl, decodeGcMeshNormal)
+ */
+const SHARED_BAKE_REV = 'r2'
+
 /** OPFS key. 'bin' keeps the historical spelling so no cache needs migrating. */
 function cacheKey(ctx: BakeContext): string {
   const ext = ctx.ext ?? 'bin'
-  return ext === 'bin' ? `${ctx.expId}__${ctx.key}` : `${ctx.expId}__${ctx.key}__${ext}`
+  const base = ext === 'bin' ? `${ctx.expId}__${ctx.key}` : `${ctx.expId}__${ctx.key}__${ext}`
+  return `${SHARED_BAKE_REV}__${base}`
 }
 
+let pruned: Promise<void> | null = null
+
 export async function bakedArtifact(ctx: BakeContext, bake: () => Promise<ArrayBuffer>): Promise<ArrayBuffer> {
+  // Once per session, evict artifacts from earlier shared revisions.
+  pruned ??= bakeCachePruneOther(`${SHARED_BAKE_REV}__`)
   const fullKey = cacheKey(ctx)
   const cached = await bakeCacheGet(fullKey)
   if (cached) return cached

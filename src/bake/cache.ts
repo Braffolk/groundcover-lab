@@ -36,6 +36,27 @@ export async function bakeCachePut(key: string, data: ArrayBuffer): Promise<void
   }
 }
 
+/**
+ * Drop every cached artifact whose name does not start with `prefix` — the
+ * one-shot GC for a shared-revision bump. Without it a bump would silently
+ * strand the previous revision's artifacts in OPFS forever (they are hundreds of
+ * megabytes), since nothing ever reads them again. Best-effort: a failure here
+ * only wastes space.
+ */
+export async function bakeCachePruneOther(prefix: string): Promise<void> {
+  const dir = await bakeDir()
+  if (!dir) return
+  try {
+    const stale: string[] = []
+    for await (const name of (dir as unknown as { keys(): AsyncIterable<string> }).keys()) {
+      if (!name.startsWith(prefix)) stale.push(name)
+    }
+    for (const name of stale) await dir.removeEntry(name).catch(() => {})
+  } catch {
+    /* no iteration support, or a concurrent writer — harmless */
+  }
+}
+
 export async function bakeCacheClear(): Promise<void> {
   try {
     const root = await navigator.storage.getDirectory()

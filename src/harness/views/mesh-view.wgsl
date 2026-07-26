@@ -1,5 +1,8 @@
 // Standalone shader for the raw GCMESH1 inspector (no scene includes — the
-// inspector is tooling, not an experiment).
+// inspector is tooling, not an experiment). The one include is the shared
+// source-normal decode: this view is where "the convention was validated
+// visually" was claimed, so it above all must not carry a private copy.
+#include "src/wgsl/gcmesh.wgsl"
 
 struct U {
   view_proj: mat4x4f,
@@ -18,17 +21,6 @@ struct VOut {
   @location(1) normal: vec3f,
 }
 
-fn oct_decode(e: vec2f) -> vec3f {
-  let f = e * 2.0 - 1.0;
-  var n = vec3f(f.x, 1.0 - abs(f.x) - abs(f.y), f.y);
-  if (n.y < 0.0) {
-    let sx = select(-1.0, 1.0, f.x >= 0.0);
-    let sz = select(-1.0, 1.0, f.y >= 0.0);
-    n = vec3f((1.0 - abs(f.y)) * sx, n.y, (1.0 - abs(f.x)) * sz);
-  }
-  return normalize(n);
-}
-
 @vertex
 fn vs_main(
   @location(0) a0: vec4<u32>, // x, y, z, r  (quantized u16)
@@ -45,7 +37,7 @@ fn vs_main(
   var out: VOut;
   out.pos = u.view_proj * vec4f(pos, 1.0);
   out.color = vec3f(f32(a0.w), f32(a1.x), f32(a1.y)) / 65535.0;
-  out.normal = oct_decode(vec2f(f32(a1.z), f32(a1.w)) / 65535.0);
+  out.normal = gcmesh_normal_decode_u16(a1.z, a1.w);
   return out;
 }
 

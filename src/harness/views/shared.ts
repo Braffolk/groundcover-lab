@@ -168,10 +168,13 @@ export function previewSummary(app: LabApp): string {
   if (!isMaterialStage(stage)) return 'no preview object'
   const m = stage.geometry.mesh
   const wrap = m.uvPeriod.map((p, i) => (p > 0 ? `${'uv'[i]} wraps @${p.toFixed(2)}m` : `${'uv'[i]} open`)).join(' · ')
+  // uvEdge, not uvPeriod, is what says whether a uv range ENDS the surface — the
+  // one thing a displacing material may clip against.
+  const edges = m.uvEdge.map((e, i) => `${'uv'[i]} ${e}`).join(' · ')
   return (
     `${m.title} · ${formatCount(m.indexCount / 3)} tris · uv in metres ` +
     `[${m.uvBounds.min[0].toFixed(2)},${m.uvBounds.min[1].toFixed(2)}]–` +
-    `[${m.uvBounds.max[0].toFixed(2)},${m.uvBounds.max[1].toFixed(2)}] · ${wrap}`
+    `[${m.uvBounds.max[0].toFixed(2)},${m.uvBounds.max[1].toFixed(2)}] · ${wrap} · edge: ${edges}`
   )
 }
 
