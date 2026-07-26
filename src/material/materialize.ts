@@ -180,7 +180,20 @@ export async function materializeNode<S extends ParamSchema>(input: MaterializeI
   const png = await bakedArtifact({ expId: input.expId, key, ext: 'png', ...(input.onProgress && { onProgress: input.onProgress }) }, async () => {
     ran = true
     input.onProgress?.(0.3, `materializing ${node.node.id} (${width}x${height})`)
-    runMaterializePass(input, generated, texture, width, height)
+    runMaterializePass({
+      device: input.device,
+      shaders: input.shaders,
+      frameLayout: input.frameLayout,
+      frameBindGroup: input.frameBindGroup,
+      sampler: input.sampler,
+      uniformBuffer: input.uniformBuffer,
+      uniformSize: uniformLayout(input.schema).size,
+      generated,
+      dependencies: input.dependencies,
+      target: texture,
+      width,
+      height,
+    })
     const read = await readTexture(device, texture, { exempt: res.exempt.bind(res) })
     const bytes = await encodePng({ width, height, channels: 4, bitDepth: 8, data: read.data })
     return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer
@@ -219,14 +232,33 @@ export async function materializeNode<S extends ParamSchema>(input: MaterializeI
   }
 }
 
-function runMaterializePass<S extends ParamSchema>(
-  input: MaterializeInput<S>,
-  generated: MaterializeModule,
-  target: GPUTexture,
-  width: number,
-  height: number,
-): void {
-  const { device } = input
+/**
+ * Everything the generated `cs_materialize` entry point needs to run once.
+ *
+ * Split out from `materializeNode` because the bake cache is the ONLY thing
+ * that separates "materialize this node" from "evaluate this node into a
+ * texture" — the material inspector runs the very same pass for a LIVE node,
+ * and must not write a PNG under a key claiming the node was materialized.
+ */
+export interface MaterializePassInput {
+  device: GPUDevice
+  shaders: ShaderRegistry
+  frameLayout: GPUBindGroupLayout
+  frameBindGroup: GPUBindGroup
+  sampler: GPUSampler
+  uniformBuffer: GPUBuffer
+  /** Bytes of the material's uniform struct (`uniformLayout(schema).size`). */
+  uniformSize: number
+  generated: MaterializeModule
+  /** Texture for each texture-mode dependency, by node id. */
+  dependencies: Map<string, GPUTexture>
+  target: GPUTexture
+  width: number
+  height: number
+}
+
+export function runMaterializePass(input: MaterializePassInput): void {
+  const { device, generated, target, width, height } = input
   const module = input.shaders.module(generated)
 
   const entries: GPUBindGroupLayoutEntry[] = [
@@ -245,7 +277,7 @@ function runMaterializePass<S extends ParamSchema>(
 
   const bindEntries: GPUBindGroupEntry[] = [
     { binding: 0, resource: target.createView({ baseMipLevel: 0, mipLevelCount: 1 }) },
-    { binding: 1, resource: { buffer: input.uniformBuffer, size: uniformLayout(input.schema).size } },
+    { binding: 1, resource: { buffer: input.uniformBuffer, size: input.uniformSize } },
     { binding: 2, resource: input.sampler },
   ]
   generated.dependencies.forEach((dep, i) => {

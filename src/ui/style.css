@@ -307,7 +307,9 @@ code,
 
 /* One heading treatment, shared by plain headings and group disclosures. */
 .browser h2,
-.browser .group > summary {
+.material h2,
+.browser .group > summary,
+.material .group > summary {
   font-size: 13px;
   text-transform: uppercase;
   letter-spacing: 0.1em;
@@ -316,17 +318,20 @@ code,
   padding-bottom: 6px;
 }
 
-.browser h2 {
+.browser h2,
+.material h2 {
   margin: 26px 0 0;
 }
 
 /* ---------- collapsible taxonomy groups (arbitrary depth) ---------- */
 
-.browser .group {
+.browser .group,
+.material .group {
   margin-top: 26px;
 }
 
-.browser .group > summary {
+.browser .group > summary,
+.material .group > summary {
   display: flex;
   align-items: center;
   gap: 8px;
@@ -335,31 +340,38 @@ code,
   list-style: none;
 }
 
-.browser .group > summary::-webkit-details-marker {
+.browser .group > summary::-webkit-details-marker,
+.material .group > summary::-webkit-details-marker {
   display: none;
 }
 
 /* Text marker, never an icon font or an emoji. */
-.browser .group > summary::before {
+.browser .group > summary::before,
+.material .group > summary::before {
   content: '▸';
   width: 10px;
   color: var(--dim);
 }
 
-.browser .group[open] > summary::before {
+.browser .group[open] > summary::before,
+.material .group[open] > summary::before {
   content: '▾';
 }
 
 .browser .group > summary:hover,
-.browser .group > summary:hover::before {
+.browser .group > summary:hover::before,
+.material .group > summary:hover,
+.material .group > summary:hover::before {
   color: var(--text);
 }
 
-.browser .group > summary:hover {
+.browser .group > summary:hover,
+.material .group > summary:hover {
   border-bottom-color: var(--border-strong);
 }
 
-.browser .group > summary .count {
+.browser .group > summary .count,
+.material .group > summary .count {
   color: var(--dim);
   font-size: 11px;
 }
@@ -471,6 +483,15 @@ code,
 
 .card .foot .spacer {
   flex: 1;
+}
+
+/* The id never wraps onto a second line — it truncates, so a card with an
+   extra action (a material's "inspect") keeps one-line feet. */
+.card .foot code {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .card .select-btn {
@@ -610,6 +631,374 @@ code,
 
 .delta.worse {
   color: var(--dim);
+}
+
+/* ---------- material inspector (#/material/<id>) ----------
+   Four panes over one material, in the same monochrome primitives as the
+   browser: 1px borders, --border-strong on hover, inverted fill for the
+   selection, and no colour anywhere. The left column scrolls through graph →
+   channels → generated WGSL → validator report; the right column keeps the
+   live preview and the selected node's texture in view. */
+
+.material {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 430px;
+}
+
+.mat-left {
+  padding: 0 20px 26px;
+  overflow: auto;
+  min-width: 0;
+}
+
+.mat-right {
+  border-left: 1px solid var(--border);
+  padding: 0 14px 26px;
+  overflow: auto;
+  background: var(--panel);
+}
+
+/* ---------- live preview ---------- */
+
+.mat-preview {
+  position: relative;
+  margin-top: 14px;
+  aspect-ratio: 16 / 10;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+}
+
+.mat-preview canvas {
+  width: 100%;
+  height: 100%;
+  display: block;
+  touch-action: none;
+}
+
+.mat-toolbar {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+
+.mat-toolbar label {
+  color: var(--muted);
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+
+.mat-toolbar select {
+  min-width: 0;
+}
+
+.mat-params {
+  margin-top: 10px;
+}
+
+/* ---------- graph ---------- */
+
+.mat-graph {
+  margin-top: 12px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  overflow: auto;
+  max-height: 60vh;
+}
+
+.mat-graph-stage {
+  position: relative;
+}
+
+.mat-edges {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.mat-edges path {
+  fill: none;
+  stroke: var(--border-strong);
+  stroke-width: 1;
+}
+
+.mat-edges path.active {
+  stroke: var(--text);
+  stroke-width: 2;
+}
+
+.mat-node {
+  position: absolute;
+  width: 202px;
+  height: 76px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  padding: 5px 8px;
+  overflow: hidden;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.mat-node:hover {
+  border-color: var(--border-strong);
+}
+
+/* Emphasis is inverted fill, never colour. */
+.mat-node.selected {
+  background: var(--text);
+  border-color: var(--text);
+  color: #000;
+}
+
+/* A variant of a discrete blend: declared, but only resident when active. */
+.mat-node.owned {
+  border-style: dashed;
+}
+
+.mat-node .id {
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mat-node .meta {
+  font-size: 10px;
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.mat-node.selected .meta {
+  color: #444;
+}
+
+.mat-node .tags {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  margin-top: auto;
+}
+
+.mat-node .tag {
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: 9px;
+  letter-spacing: 0.04em;
+  padding: 0 4px;
+  border: 1px solid var(--border-strong);
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.mat-node .tag.mode {
+  color: var(--text);
+}
+
+.mat-node.selected .tag {
+  border-color: #000;
+  color: #000;
+}
+
+/* ---------- channels ---------- */
+
+.mat-channels {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.mat-chan {
+  display: flex;
+  gap: 10px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  padding: 8px;
+  cursor: pointer;
+  min-width: 0;
+}
+
+.mat-chan:hover {
+  border-color: var(--border-strong);
+}
+
+.mat-chan .thumb {
+  width: 72px;
+  height: 72px;
+  flex: none;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  image-rendering: pixelated;
+}
+
+.mat-chan .body {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.mat-chan .name {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.mat-chan .hint {
+  font-size: 10px;
+  overflow-wrap: anywhere;
+}
+
+/* ---------- node inspector ---------- */
+
+.mat-node-pane {
+  margin-top: 6px;
+}
+
+.mat-canvas-box {
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  margin-top: 10px;
+  aspect-ratio: 1 / 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+
+.mat-canvas {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  display: block;
+}
+
+.mat-canvas.pixelated {
+  image-rendering: pixelated;
+}
+
+.mat-controls {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+.mat-controls button {
+  font-size: 11px;
+  padding: 2px 8px;
+}
+
+.mat-row {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+  border-bottom: 1px solid var(--border);
+  padding: 3px 0;
+}
+
+.mat-row .k {
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  flex: none;
+  width: 116px;
+}
+
+.mat-row .v {
+  flex: 1;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.mat-numbers {
+  margin-top: 10px;
+}
+
+.mat-probe {
+  margin-top: 8px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  padding: 6px 8px;
+  white-space: pre-wrap;
+  min-height: 54px;
+  color: var(--text);
+}
+
+.mat-levels {
+  margin-top: 14px;
+}
+
+.mat-levels table,
+.mat-report table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 11px;
+  margin-top: 6px;
+}
+
+.mat-levels th,
+.mat-levels td,
+.mat-report th,
+.mat-report td {
+  border-bottom: 1px solid var(--border);
+  padding: 3px 6px;
+  text-align: right;
+  white-space: nowrap;
+}
+
+.mat-levels th,
+.mat-report th {
+  color: var(--muted);
+  font-weight: normal;
+}
+
+.mat-levels td:first-child,
+.mat-levels th:first-child,
+.mat-report td:first-child,
+.mat-report th:first-child {
+  text-align: left;
+}
+
+.mat-report td.msg {
+  text-align: left;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+/* An error row: a stronger border, never a colour. */
+.mat-report tr.err td {
+  border-bottom-color: var(--border-strong);
+  color: var(--text);
+}
+
+.mat-report {
+  margin-top: 10px;
+}
+
+/* ---------- generated WGSL ---------- */
+
+.mat-wgsl {
+  margin: 8px 0 0;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  max-height: 60vh;
+  overflow: auto;
+  white-space: pre;
+  font-size: 11px;
+  line-height: 1.45;
 }
 
 /* ---------- ab wipe divider ---------- */

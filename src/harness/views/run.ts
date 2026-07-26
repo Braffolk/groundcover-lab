@@ -184,6 +184,14 @@ export async function runView(root: HTMLElement, state: HashState): Promise<View
             : { seed: String(seed), stand: choice.stand!.id },
         )
       }),
+    )
+    // The material inspector: the node graph and every intermediate texture.
+    if (isMaterial) {
+      toolbar.append(button('inspect', () => {
+        location.hash = buildHash(['material', id], { obj: currentPreviewObject(app) })
+      }))
+    }
+    toolbar.append(
       // The stand picker is meaningless for a material — it shows the preview
       // object instead, which is the material's equivalent partition.
       isMaterial ? previewObjectPicker(app) : standPicker(choice.stand!),

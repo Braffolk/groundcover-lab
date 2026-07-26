@@ -65,6 +65,9 @@ export { MATERIALIZE_FORMAT, bakeKeyFor } from './materialize.ts'
 export {
   allMaterialReports,
   materialReport,
+  nodeReportsOf,
+  onMaterialReport,
+  type MaterialNodeReport,
   type MaterialReport,
   type MaterializationRecord,
 } from './report.ts'

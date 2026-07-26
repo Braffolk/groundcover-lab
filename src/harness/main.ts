@@ -13,6 +13,7 @@ import type { View } from './views/shared.ts'
  *   #/bench/<id>            benchmark runner
  *   #/results               bench results table
  *   #/mesh/<meshId>         raw source-mesh inspector
+ *   #/material/<id>         material graph + channel inspector
  */
 // Under a deploy base path, rewrite root-absolute asset fetches made by code
 // the harness does not own (experiments fetching their own bakes). No-op in dev.
@@ -51,6 +52,9 @@ async function route(): Promise<void> {
         break
       case 'mesh':
         view = await (await import('./views/mesh.ts')).meshView(root, state)
+        break
+      case 'material':
+        view = await (await import('./views/material.ts')).materialView(root, state)
         break
       default:
         location.hash = '#/'

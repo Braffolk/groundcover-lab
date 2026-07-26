@@ -100,6 +100,7 @@ export {
   type MaterialIssue,
   type MaterialNode,
   type MaterialNodeKind,
+  type MaterialNodeReport,
   type MaterialReport,
   type MaterializationRecord,
   type NodeMode,

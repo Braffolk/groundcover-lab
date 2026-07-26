@@ -343,6 +343,11 @@ function experimentCard(
   foot.appendChild(el('span', 'spacer'))
   const selectBtn = button('compare', () => onToggleSelect(entry.id), 'select-btn')
   if (m) {
+    // A material's node graph and every intermediate texture are inspectable —
+    // that page is the reason the graph is declarative, so it gets a door here.
+    if (entry.kind === 'material') {
+      foot.appendChild(button('inspect', () => navigate(['material', entry.id]), 'select-btn'))
+    }
     foot.appendChild(selectBtn)
     const open = (): void => navigate(['run', entry.id])
     thumb.addEventListener('click', open)

@@ -3,35 +3,69 @@ import { HAS_DEV_SINK } from '../util/env.ts'
 import type { LabApp } from './loop.ts'
 
 /**
- * Deterministic frame capture — reads back the offscreen color target (NOT
- * the canvas, whose buffer is cleared after presentation) and encodes a PNG.
- * `maxWidth` downscales (thumbnails); omit for full resolution (goldens).
- *
- * The readback itself (256-byte row alignment, unpadding, BGRA swizzle) lives
- * in src/gpu/image.ts so bakes and materials share one copy of it.
+ * Encode an ImageData as a PNG blob, optionally downscaled to `maxWidth`.
+ * Shared by the frame/texture capture paths and by anything that already has
+ * pixels (the material inspector builds its own from a node's mip level).
  */
-export async function captureViewPng(app: LabApp, viewIndex = 0, maxWidth?: number): Promise<Blob> {
-  const view = app.views[viewIndex]
-  if (!view) throw new Error('no view to capture')
-  const { device } = app.gpu
-  const { width, height } = view.color
-
-  const image = await readTextureRgba8(device, view.color, {
-    forceOpaque: true,
-    exempt: (fn) => app.tracker.exempt(fn),
-  })
-
-  const canvas = new OffscreenCanvas(width, height)
+export async function imageDataToPngBlob(image: ImageData, maxWidth?: number): Promise<Blob> {
+  const canvas = new OffscreenCanvas(image.width, image.height)
   canvas.getContext('2d')!.putImageData(image, 0, 0)
-  if (maxWidth !== undefined && width > maxWidth) {
-    const scale = maxWidth / width
-    const scaled = new OffscreenCanvas(Math.round(width * scale), Math.round(height * scale))
+  if (maxWidth !== undefined && image.width > maxWidth) {
+    const scale = maxWidth / image.width
+    const scaled = new OffscreenCanvas(Math.round(image.width * scale), Math.round(image.height * scale))
     const ctx2d = scaled.getContext('2d')!
     ctx2d.imageSmoothingQuality = 'high'
     ctx2d.drawImage(canvas, 0, 0, scaled.width, scaled.height)
     return scaled.convertToBlob({ type: 'image/png' })
   }
   return canvas.convertToBlob({ type: 'image/png' })
+}
+
+export interface CaptureTextureOptions {
+  /** Downscale to this width (thumbnails); omit for full resolution. */
+  maxWidth?: number
+  mipLevel?: number
+  /** Force alpha to 255 — a frame target's alpha is not meaningful. */
+  forceOpaque?: boolean
+  /** Suppress the VRAM tracker's warning for the staging buffer. */
+  exempt?: <T>(fn: () => T) => T
+}
+
+/**
+ * Read any 8-bit colour texture back and encode it as a PNG.
+ *
+ * The readback itself (256-byte row alignment, unpadding, BGRA swizzle) lives
+ * in src/gpu/image.ts so bakes and materials share one copy of it — which also
+ * means this is rgba8/bgra8 only. A material node's texture can be r8unorm or
+ * float; the material inspector decodes those itself and comes back through
+ * `imageDataToPngBlob`.
+ */
+export async function captureTexturePng(
+  device: GPUDevice,
+  texture: GPUTexture,
+  opts: CaptureTextureOptions = {},
+): Promise<Blob> {
+  const image = await readTextureRgba8(device, texture, {
+    ...(opts.mipLevel !== undefined && { mipLevel: opts.mipLevel }),
+    ...(opts.forceOpaque !== undefined && { forceOpaque: opts.forceOpaque }),
+    ...(opts.exempt && { exempt: opts.exempt }),
+  })
+  return imageDataToPngBlob(image, opts.maxWidth)
+}
+
+/**
+ * Deterministic frame capture — reads back the offscreen color target (NOT
+ * the canvas, whose buffer is cleared after presentation) and encodes a PNG.
+ * `maxWidth` downscales (thumbnails); omit for full resolution (goldens).
+ */
+export async function captureViewPng(app: LabApp, viewIndex = 0, maxWidth?: number): Promise<Blob> {
+  const view = app.views[viewIndex]
+  if (!view) throw new Error('no view to capture')
+  return captureTexturePng(app.gpu.device, view.color, {
+    ...(maxWidth !== undefined && { maxWidth }),
+    forceOpaque: true,
+    exempt: (fn) => app.tracker.exempt(fn),
+  })
 }
 
 /**

@@ -33,13 +33,15 @@ import {
   MATERIAL_SAMPLER_BINDING,
   MATERIAL_UNIFORM_BINDING,
   resolveGraph,
+  viewUvDependencies,
   type ResolvedGraph,
   type ResolvedNode,
 } from './resolve.ts'
 import { generateMainModule, subtreeOf, uniformLayout, writeUniforms, type GeneratedModule } from './codegen.ts'
 import { loadNodeImage } from './images.ts'
 import { materializeNode, type MaterializeResult } from './materialize.ts'
-import { publishMaterialReport, type MaterialReport, type MaterializationRecord } from './report.ts'
+import { clearMaterialInstance, publishMaterialInstance, type MaterialTextureSlot } from './instance.ts'
+import { nodeReportsOf, publishMaterialReport, type MaterialReport, type MaterializationRecord } from './report.ts'
 import { formatIssues, type MaterialDef, type MaterialGraph, type MaterialIssue } from './types.ts'
 import { validateCompilation, validateGeneratedMain, validateMaterial } from './validate.ts'
 
@@ -108,6 +110,7 @@ export async function createMaterialExperiment<S extends ParamSchema>(
 
   let built: Built | null = null
   let generation = 0
+  let instanceGeneration = 0
   let disposed = false
 
   /**
@@ -269,6 +272,27 @@ export async function createMaterialExperiment<S extends ParamSchema>(
     })
     const issues = [...report.issues]
     if (!report.ok) {
+      // Publish before throwing. `create()` failing is exactly when someone
+      // needs the issue list, and a stack trace in a fatal overlay is a worse
+      // place to read it than the material page's report panel.
+      publishMaterialReport({
+        id: ctx.id,
+        ok: false,
+        moduleId: '',
+        code: '',
+        channels: Object.entries(graph.channels).map(([channel, nodeId]) => ({
+          channel,
+          nodeId,
+          mode: resolved.byId.get(nodeId)?.mode ?? 'live',
+          type: resolved.byId.get(nodeId)?.node.spec.type ?? 'f32',
+        })),
+        nodes: nodeReportsOf(resolved),
+        viewUv: graph.viewUv.kind,
+        viewUvNodes: viewUvDependencies(graph),
+        issues,
+        materializations: [],
+        textureBytes: 0,
+      })
       throw new Error(`material "${ctx.id}" failed validation:\n${formatIssues(issues.filter((i) => i.level === 'error'))}`)
     }
 
@@ -328,6 +352,7 @@ export async function createMaterialExperiment<S extends ParamSchema>(
     const vram = b.slots.reduce((sum, s) => sum + textureBytesOf(s.texture), 0)
     const report: MaterialReport = {
       id: ctx.id,
+      ok: !b.issues.some((i) => i.level === 'error'),
       moduleId: b.module.id,
       code: b.module.code,
       channels: Object.entries(b.graph.channels).map(([channel, nodeId]) => ({
@@ -336,18 +361,38 @@ export async function createMaterialExperiment<S extends ParamSchema>(
         mode: b.resolved.byId.get(nodeId)?.mode ?? 'live',
         type: b.resolved.byId.get(nodeId)?.node.spec.type ?? 'f32',
       })),
-      nodes: [...b.resolved.byId.values()].map((r) => ({
-        id: r.node.id,
-        kind: r.node.kind,
-        mode: r.mode,
-        ...(r.source && { source: r.source }),
-        ...(r.ownedBy && { ownedBy: r.ownedBy }),
-      })),
+      nodes: nodeReportsOf(b.resolved),
       viewUv: b.graph.viewUv.kind,
+      viewUvNodes: viewUvDependencies(b.graph),
       issues: b.issues,
       materializations: b.materializations,
       textureBytes: vram,
     }
+    // The GPU handles go out beside the data, never inside it — see
+    // instance.ts. An inspector needs both; a headless script needs only the
+    // first, and must stay able to JSON it.
+    publishMaterialInstance({
+      id: ctx.id,
+      generation: ++instanceGeneration,
+      device,
+      shaders: ctx.shaders,
+      res: ctx.res,
+      frame: ctx.frame,
+      sampler,
+      uniformBuffer,
+      schema: def.params,
+      values: ctx.params,
+      resolved: b.resolved,
+      slots: b.slots.map(
+        (s): MaterialTextureSlot => ({
+          nodeId: s.node.node.id,
+          sourceNodeId: sourceNodeOf(b.resolved, s.node).node.id,
+          binding: s.node.binding!,
+          texture: s.texture,
+          ...(s.variant !== undefined && { variant: s.variant }),
+        }),
+      ),
+    })
     publishMaterialReport(report)
     if (import.meta.env.DEV) {
       const warnings = b.issues.filter((i) => i.level === 'warning')
@@ -493,6 +538,9 @@ export async function createMaterialExperiment<S extends ParamSchema>(
     dispose(): void {
       disposed = true
       unsubscribe()
+      // The report is data and survives (a headless script may still want it);
+      // the GPU handles do not — ctx.res is about to destroy every texture.
+      clearMaterialInstance(ctx.id)
       // Textures and buffers are destroyed by the harness via ctx.res.
     },
   }
