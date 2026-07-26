@@ -1,6 +1,5 @@
 import '../ui/style.css'
 import { currentState, onHashChange } from '../url/state.ts'
-import { installAssetBaseShim } from '../util/paths.ts'
 import { browserView } from './views/browser.ts'
 import { runView } from './views/run.ts'
 import type { View } from './views/shared.ts'
@@ -17,7 +16,6 @@ import type { View } from './views/shared.ts'
  */
 // Under a deploy base path, rewrite root-absolute asset fetches made by code
 // the harness does not own (experiments fetching their own bakes). No-op in dev.
-installAssetBaseShim()
 
 const root = document.getElementById('app')!
 

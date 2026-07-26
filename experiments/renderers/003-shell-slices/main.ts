@@ -1,6 +1,6 @@
 import slicesSrc from './shaders/slices.wgsl'
 import farshellSrc from './shaders/farshell.wgsl'
-import { SCATTER_CELL_SIZE, commitBake, speciesById } from '@harness'
+import { SCATTER_CELL_SIZE, assetUrl, commitBake, speciesById } from '@harness'
 import type { Aabb2, Experiment, ExperimentContext, FrameInfo, StandSpecies, ViewTargets } from '@harness'
 import {
   BAKE_VERSION,
@@ -71,7 +71,7 @@ async function loadValidatedArtifact(
   key: string,
   bake: () => Promise<ArrayBuffer>,
 ): Promise<ArrayBuffer> {
-  const committed = await fetch(`/mesh/baked/${expId}/${key}.bin`).catch(() => null)
+  const committed = await fetch(assetUrl(`/mesh/baked/${expId}/${key}.bin`)).catch(() => null)
   if (committed?.ok) {
     const buf = await committed.arrayBuffer()
     if (isVolume(buf)) return buf

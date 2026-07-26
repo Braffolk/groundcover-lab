@@ -1,6 +1,6 @@
 import strandsSrc from './shaders/strands.wgsl'
 import farshellSrc from './shaders/farshell.wgsl'
-import { SCATTER_CELL_SIZE, SCATTER_MAX_PER_CELL, SPECIES, commitBake, speciesById } from '@harness'
+import { SCATTER_CELL_SIZE, SCATTER_MAX_PER_CELL, SPECIES, assetUrl, commitBake, speciesById } from '@harness'
 import type { Experiment, ExperimentContext, FrameInfo, StandSpecies, ViewTargets } from '@harness'
 import {
   BAKE_VERSION,
@@ -99,7 +99,7 @@ async function loadValidatedArtifact(
   valid: (buf: ArrayBuffer | null) => boolean,
   bake: () => Promise<ArrayBuffer>,
 ): Promise<ArrayBuffer> {
-  const committed = await fetch(`/mesh/baked/${expId}/${key}.bin`).catch(() => null)
+  const committed = await fetch(assetUrl(`/mesh/baked/${expId}/${key}.bin`)).catch(() => null)
   if (committed?.ok) {
     const buf = await committed.arrayBuffer()
     if (valid(buf)) return buf
