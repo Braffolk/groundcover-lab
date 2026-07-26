@@ -120,8 +120,36 @@ recurring hazard, not the carpet specifics.
    "bit-identical twins" invariant was simply false for carpets. Now recorded as
    a deliberate non-fix in a `@deprecated` comment at both sites.
 2. ~~**`carpetScale()` is not exported from `@harness`.**~~ Same reason.
-4. **OPEN QUESTION: the GCMESH1 octahedral normal convention may be wrong in
-   shared code.** Two independent agents have now measured this. `GcMesh.normalAt()`
+4. **SETTLED (2026-07-26), and the shared decoder IS wrong.** Measured directly
+   against geometry, which needs no convention at all: decode the stored pair
+   three ways and compare each to the face normal computed from raw dequantized
+   POSITIONS, over 217,113 triangles sampled with a stride across the whole
+   calamagrostis mesh (a prefix would be one corner of one plant).
+
+   | derived axis | mean \|cos\| | mean cos | |
+   |---|---|---|---|
+   | x | 0.4225 | 0.0049 | |
+   | **y** | 0.5354 | −0.2683 | what `GcMesh.normalAt()` does |
+   | **z** | **0.7871** | −0.7309 | what 004-raycast-lut claimed |
+
+   Z-derived wins decisively, independently reproducing 004's 0.75-vs-0.57. A
+   vertex normal is a smoothed average, so |cos| below 1 is expected even when
+   right; 0.79 against 0.54 is not ambiguous.
+
+   Note the SIGN: mean cos is −0.73, i.e. the decoded normal is antiparallel to
+   the face normal under a counter-clockwise winding assumption. Flip the
+   winding and it is +0.73. So a consumer needs the axis AND the sign, and this
+   repo has already been bitten once by winding (the terrain was inverted early
+   on).
+
+   **Deliberately NOT fixed unilaterally.** `normalAt` and its WGSL twin feed the
+   bakes of at least ten experiments; correcting it changes the appearance of
+   every one of them and invalidates committed artifacts. That is an owner
+   decision, not a background cleanup. Reproduce with
+   `scratchpad/oct-normal-test.ts`.
+
+   ~~OPEN QUESTION: the GCMESH1 octahedral normal convention may be wrong in
+   shared code.~~ Two independent agents measured this. `GcMesh.normalAt()`
    (`src/mesh/gcmesh.ts`, commented "validated visually in the mesh inspector")
    derives **Y** from the two stored components; `experiments/renderers/004-raycast-lut/
    shaders/rayfield-common.wgsl` applies a y↔z swap and reports measuring the decoded
