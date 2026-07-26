@@ -10,10 +10,8 @@ rules for your kind.
 
 - **renderer** — draws the plants of a stand. The original kind; everything in
   "Renderer rules" applies.
-- **material** — a surface material, previewed on standard geometry. See
-  "Material rules". *(The graph/codegen half is NOT built yet: a material today
-  is an ordinary `Experiment` that draws the preview geometry with its own
-  shader. Do not invent a graph format ahead of it.)*
+- **material** — a surface material: a declarative channel graph plus two WGSL
+  stages, previewed on harness-owned geometry. See "Material rules".
 - **reference** — a stand-independent visual baseline (000-ground-truth).
 
 **Carpets are DEPRECATED.** A tiled ground mat is a *material*, not a species of
@@ -45,23 +43,58 @@ Forbidden: `src/**`, other experiments, `package.json`, any shared file. If the 
 
 ## Material rules
 
-> **PROVISIONAL — written mid-build.** The graph/codegen half of the material
-> system is not built yet. Three things here expire when it lands and must be
-> rewritten rather than patched: "a material is an ordinary `Experiment` that
-> draws the preview geometry with its own shader", "do not invent a graph
-> format", and the instruction to hand-write map sampling. Everything else —
-> the preview-geometry contract, uv in metres, the id/path rules, debug views,
-> the VRAM note — is about the *stage*, not the authoring model, and survives.
-> If you are reading this after the graph exists and this banner is still here,
-> the doc is stale; trust `src/material/` over this section.
-
 Everything in the shared core above binds you too — `@harness`-only imports,
 `ctx.res` for every allocation, determinism, `assetUrl()`, and **debug views are
 just as mandatory**. What differs:
 
+### How a material is authored
+
+- **A material is a GRAPH plus two WGSL stages.** Declare a `MaterialDef` and
+  return `createMaterialExperiment(ctx, def)`. You never write a pipeline, a
+  bind group, a mip plan or a `debug_shade` call — the generator owns all of
+  them, which is how debug views became *unskippable* rather than merely
+  mandatory.
+- **Graph for data, WGSL for behaviour.** Channel data is nodes; the view-uv
+  stage and the BRDF are authored WGSL with fixed signatures
+  (`material_surface`, `material_shade`). The BRDF is never nodes — read
+  `experiments/039-nd-moss/shaders/moss.wgsl` for why: it interleaves a
+  geometry-normal light wrap, a fuzz layer, AO folded into the sun term only,
+  and a subtraction that splits the shared lighting model in half. That is code,
+  not a diagram.
+- **Node kinds are frozen at five**: `image`, `procedural`, `filter`,
+  `combine`, `variantBlend`. `meshCapture` is deliberately absent (the meshes it
+  would capture were deleted). Do not add a kind — ask.
+- **Declare `TexelSemantics` once, on the node.** It drives the mip filter *and*
+  the generated decoder, which is what makes the coverage/premultiply trap
+  unrepresentable. Never hand-write a `rgb / a`.
+- **Your stage `.wgsl` must not `#include` anything.** The generator wraps
+  `material.wgsl` (frame + lighting + debug) around it; an include is a
+  duplicate-symbol error, and the validator says so by name.
+- **`materialize` is a caching decision, not a different result.** The same
+  generated `n_<id>_eval` runs live or baked. If the two disagree that is a bug
+  — measure it rather than picking the one that looks better. (One such bug is
+  already on record: a materialize pass encoded during `create()` baked a
+  zero-filled uniform and cached the wrong PNG under a key asserting it was
+  correct.)
+- **The bake cache key is the node's transitive subtree**, not the whole graph —
+  otherwise touching any node invalidates every expensive bake and nobody
+  iterates. Anything a node depends on that is NOT visible as `u.p.<name>` in
+  the generated text must be added to the key by hand; a `variantBlend`
+  selector is exactly this case.
+- Validation errors throw at `create()` and surface as "Failed to start"; the
+  full report is data on `globalThis.__materialReports`.
+
+### What the stage gives you
+
 - Declare it with `defineMaterial({...})` (sets `kind: 'material'` for you) and
   type your context `ExperimentContext<typeof PARAMS, MaterialContextExt>`. You
   get `ctx.preview` instead of `ctx.scene`/`ctx.stand` — there is no stand.
+- **The graph knows what the maps ARE, so declare it there, not in a comment.**
+  The measured Sphagnum maps are mesh-frame with +Y up — axis order (T,N,B), so
+  the map's GREEN is the surface normal — and the albedo is LINEAR, not sRGB.
+  Both were measured, not assumed. A map read with the conventional
+  tangent-space assumption tilts every fragment ~90 degrees and looks merely
+  "a bit off" rather than broken.
 - Live under `experiments/materials/<class>/<subject>/<nnn>-<slug>/`. Your id is
   the LAST path segment and must be unique across the whole tree.
 - **Materials are SHADERS of the preview geometry, never authors of it.** Draw

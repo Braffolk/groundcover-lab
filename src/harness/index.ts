@@ -45,6 +45,75 @@ export {
   type PreviewScene,
 } from '../scene/preview.ts'
 
+/**
+ * THE MATERIAL GRAPH. A material's CHANNEL DATA is a declarative typed graph
+ * (`MaterialGraph`) that the runtime resolves, executes, validates and bakes;
+ * its BEHAVIOUR — the view-uv stage and the BRDF — is authored WGSL with the
+ * fixed signatures in src/wgsl/material.wgsl.
+ *
+ * `createMaterialExperiment(ctx, def)` IS the material: it builds the graph,
+ * loads or materializes every texture, generates the WGSL (routing the
+ * fragment through `debug_shade` so a material cannot skip the debug views),
+ * validates it and returns an `Experiment`.
+ *
+ * Node kinds are FROZEN at five — image, procedural, filter, combine,
+ * variantBlend. `meshCapture` is deliberately absent: the source meshes it
+ * would capture were deleted and images are the data source now.
+ */
+export {
+  CHANNEL_COMPONENTS,
+  DEFERRED_NODE_KINDS,
+  MATERIALIZE_FORMAT,
+  MATERIAL_FIRST_TEXTURE_BINDING,
+  MATERIAL_SAMPLER_BINDING,
+  MATERIAL_UNIFORM_BINDING,
+  allMaterialReports,
+  bakeKeyFor,
+  createMaterialExperiment,
+  dependenciesOf,
+  formatIssues,
+  generateMainModule,
+  generateMaterializeModule,
+  hashText,
+  materialReport,
+  paramsUsedBy,
+  resolveGraph,
+  subtreeOf,
+  tilesPerMetre,
+  uniformLayout,
+  validateGeneratedMain,
+  validateMaterial,
+  wgslIdent,
+  wgslParamName,
+  writeUniforms,
+  type ChannelSpec,
+  type ChannelType,
+  type CombineNode,
+  type CombineOp,
+  type FilterNode,
+  type FilterOp,
+  type GeneratedModule,
+  type ImageNode,
+  type IssueLevel,
+  type MaterialDef,
+  type MaterialGraph,
+  type MaterialIssue,
+  type MaterialNode,
+  type MaterialNodeKind,
+  type MaterialReport,
+  type MaterializationRecord,
+  type NodeMode,
+  type ProceduralNode,
+  type ResolvedGraph,
+  type ResolvedNode,
+  type Scalar,
+  type TextureSource,
+  type UvTransform,
+  type ValidationReport,
+  type VariantBlendNode,
+  type ViewUvSpec,
+} from '../material/index.ts'
+
 export {
   p,
   paramDefaults,
@@ -99,6 +168,7 @@ export {
   readTexture,
   uploadImageBitmap,
   wgslDecoder,
+  wgslEncoder,
   wgslOctahedral,
   type DilateOptions,
   type MipCheckLevel,
