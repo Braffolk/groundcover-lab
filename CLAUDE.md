@@ -20,10 +20,28 @@ renderer in the repo independently mis-sized its enumeration loop and drew a
 quarter of the mat. The machinery still exists and is marked `@deprecated`; no
 stand uses it. Do not build anything new on it, and do not "fix" it.
 
+## Where experiments live
+
+`experiments/` is a TREE, one branch per kind, and the shape is uniform:
+
+```
+experiments/renderers/<nnn>-<slug>/                        renderers (and 000-ground-truth, _template)
+experiments/materials/<class>/<subject>/<nnn>-<slug>/       materials
+```
+
+**Your ID is the LAST path segment, never the path.** Discovery globs
+`experiments/**/manifest.ts` and validates `manifest.id` against the directory
+name; ratings, bench results and goldens are keyed by that id, so moving a
+branch of the tree never orphans them. Ids must be unique across the WHOLE tree
+(a collision is surfaced as a broken card, not silently merged), which is why
+`npm run new` allocates its number from a scan of the whole tree.
+
 ## Adding an experiment (the only sanctioned workflow)
 
-1. `npm run new -- your-slug` → creates `experiments/<nnn>-your-slug/` from `_template`.
-2. Edit ONLY files inside your experiment directory. Never renumber; your ID is the full directory name.
+1. `npm run new -- your-slug` → creates `experiments/renderers/<nnn>-your-slug/` from `_template`.
+   A material: `npm run new -- your-slug --kind material --group mosses/sphagnum`
+   → `experiments/materials/mosses/sphagnum/<nnn>-your-slug/`.
+2. Edit ONLY files inside your experiment directory. Never renumber; your ID is your directory's name.
 3. Run it: `npm run dev` → `http://localhost:5175/#/run/<your-id>`.
 
 Allowed write paths: your experiment dir, `mesh/baked/<your-id>/`, `results/` (new files only), `goldens/<your-id>/`. Exception inside your own dir: `rating.json` is the OWNER'S visual verdict — never create, edit, or delete it.
@@ -36,7 +54,7 @@ Forbidden: `src/**`, other experiments, `package.json`, any shared file. If the 
 - Allocate GPU memory only via `ctx.res` (the VRAM tracker) — pass `{ species }` so the 25MB/species budget bar in the HUD is meaningful. The budget is a strong default, not an absolute: stay within it in ~95% of cases; a genuinely novel method may exceed it when the results justify it — document the why and the actual numbers in `NOTES.md`.
 - Determinism: randomness only via the shared PCG hash (`@harness`), animation only from `frame.time`. Never `Math.random`/`Date.now` in render paths. The A/B diff view will expose you.
 - **Never fetch root-absolute URLs.** Production builds are served under a base path (`/groundcover-lab/`), so `fetch('/mesh/baked/...')` breaks there. Load your baked artifacts through `bakedArtifact()`, and resolve any other asset URL with `assetUrl()` from `@harness`.
-- **Debug views are mandatory, not optional.** There is ONE global selector (`frame.debug_mode`, the `view` dropdown in the runner/AB toolbar, URL `debug=`) with modes `off · albedo · normals · lighting · coverage · depth`. Every renderer must `#include "src/wgsl/debug.wgsl"` and route its final fragment through `debug_shade(shaded, albedo, normal_ws, coverage, world_pos)`, skipping fog unless `debug_mode() == DEBUG_OFF` (see `experiments/_template/shaders/main.wgsl`). A method whose normals or lighting cannot be inspected is a method nobody can trust — and if `normals` shows garbage or `lighting` is blown out, that is a bug in your renderer, not in the debug view. Real per-fragment normals and the shared `light_surface()` are required; unlit or uniformly bright output is a defect.
+- **Debug views are mandatory, not optional.** There is ONE global selector (`frame.debug_mode`, the `view` dropdown in the runner/AB toolbar, URL `debug=`) with modes `off · albedo · normals · lighting · coverage · depth`. Every renderer must `#include "src/wgsl/debug.wgsl"` and route its final fragment through `debug_shade(shaded, albedo, normal_ws, coverage, world_pos)`, skipping fog unless `debug_mode() == DEBUG_OFF` (see `experiments/renderers/_template/shaders/main.wgsl`). A method whose normals or lighting cannot be inspected is a method nobody can trust — and if `normals` shows garbage or `lighting` is blown out, that is a bug in your renderer, not in the debug view. Real per-fragment normals and the shared `light_surface()` are required; unlit or uniformly bright output is a defect.
 - **Experiments are RENDERERS of a stand, never placers.** The active stand (`ctx.stand`, URL `stand=<id>`, default `default`) is the harness-owned placement setup: which species, densities, scale ranges, sway, region. Stand + seed fully determines every plant instance via `ctx.scene.scatter` (TS buffers) or the bit-identical WGSL twin (`src/wgsl/scatter.wgsl` + `stand_table`). Render exactly the stand's plants — all its species entries, at their exact positions/scales. Your params may only affect HOW it is drawn, never what/where grows. Stands live in `src/scene/stands.ts` (shared code — don't touch); A/B and bench results are only comparable within one stand + seed.
 - The only sanctioned exception is `status: 'reference'` (e.g. 000-ground-truth): stand-independent visual baselines, shown in a separate browser row and clearly labeled. Don't add more without a reason as good as "the raw mesh is a community tile and physically cannot follow per-plant placement".
 - You MAY read the raw source mesh (`ctx` mesh catalog, GCMESH1) and invent any novel baked representation. Put baked artifacts in `mesh/baked/<your-id>/` via the bake flow; format is entirely yours.
@@ -57,7 +75,7 @@ just as mandatory**. What differs:
 - **Graph for data, WGSL for behaviour.** Channel data is nodes; the view-uv
   stage and the BRDF are authored WGSL with fixed signatures
   (`material_surface`, `material_shade`). The BRDF is never nodes — read
-  `experiments/039-nd-moss/shaders/moss.wgsl` for why: it interleaves a
+  `experiments/renderers/039-nd-moss/shaders/moss.wgsl` for why: it interleaves a
   geometry-normal light wrap, a fuzz layer, AO folded into the sun term only,
   and a subtraction that splits the shared lighting model in half. That is code,
   not a diagram.
@@ -170,4 +188,4 @@ After every large batch of experiment work (a wave of new experiments, or a majo
 - `src/harness/index.ts` — the public API you import; everything else in `src/` is internal.
 - `src/wgsl/*.wgsl` — shared WGSL includes (`#include "src/wgsl/frame.wgsl"` etc.).
 - `mesh/README.md` — GCMESH1 binary format spec (the canonical source-mesh format).
-- `experiments/000-ground-truth/` — brute-force reference render; A/B against it for visual fidelity (it is exempt from perf/VRAM rules; you are not).
+- `experiments/renderers/000-ground-truth/` — brute-force reference render; A/B against it for visual fidelity (it is exempt from perf/VRAM rules; you are not).

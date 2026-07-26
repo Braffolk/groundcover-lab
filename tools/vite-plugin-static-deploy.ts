@@ -6,8 +6,8 @@ import type { Plugin, ResolvedConfig } from 'vite'
  * Everything the deployed lab fetches at runtime that is NOT in the module
  * graph, copied into dist/ at build time:
  *
- *   experiments/<id>/thumbnail.png      browser cards
- *   experiments/<id>/rating.json        owner's visual verdict (display + sort)
+ *   experiments/**\/thumbnail.png       browser cards (tree walked at any depth)
+ *   experiments/**\/rating.json         owner's visual verdict (display + sort)
  *   results/*.json + results/index.json bench results table (index replaces
  *                                       the dev-only GET /__bench/list)
  *   mesh/baked/**                       committed baked artifacts (~256MB) —

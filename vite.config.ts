@@ -26,8 +26,11 @@ export default defineConfig(({ command, isPreview }) => ({
       // Artifacts written by the dev-sink endpoints (thumbnails, goldens,
       // bench results, bakes) must not trigger page reloads mid-session.
       ignored: [
-        '**/experiments/*/thumbnail.png',
-        '**/experiments/*/rating.json',
+        // Experiments are a tree (renderers/<id>, materials/<class>/<subject>/
+        // <attempt>), so these must match at ANY depth — a single-`*` glob
+        // stopped covering them the moment the hierarchy appeared.
+        '**/experiments/**/thumbnail.png',
+        '**/experiments/**/rating.json',
         '**/goldens/**',
         '**/results/**',
         '**/mesh/baked/**',

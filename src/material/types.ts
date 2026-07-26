@@ -11,7 +11,7 @@
  * stage (parallax/POM) and the BRDF — is authored WGSL with a fixed signature
  * that the generator pastes in.
  *
- * The BRDF is deliberately NOT nodes. `experiments/039-nd-moss/shaders/moss.wgsl`
+ * The BRDF is deliberately NOT nodes. `experiments/renderers/039-nd-moss/shaders/moss.wgsl`
  * is the reason: it interleaves a light wrap keyed off the GEOMETRY normal, a
  * fuzz layer keyed off dot(up, v), AO-Fresnel off the geometry normal again, an
  * `aperture = 2*ao*ao` micro-shadow folded into the sun term ONLY, an additive

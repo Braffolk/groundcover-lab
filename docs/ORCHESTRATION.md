@@ -46,10 +46,16 @@ context compaction). Facts and hard-won gotchas only — the rules that bind
 
 ## Project shape
 
-- Renderers are `experiments/<nnn>-<slug>/`, auto-discovered by
-  `import.meta.glob`. Scaffold with `npm run new -- <slug>`. **Pre-scaffold
-  directories yourself before launching a fleet** — parallel agents racing
-  `npm run new` collide on numbering.
+- `experiments/` is a tree, one branch per kind:
+  `experiments/renderers/<nnn>-<slug>/` and
+  `experiments/materials/<class>/<subject>/<nnn>-<slug>/`. Auto-discovered by
+  `import.meta.glob('/experiments/**/manifest.ts')`; an id is the LAST path
+  segment, and ratings / bench results / goldens are all keyed by that id, so
+  moving a branch never orphans them. Scaffold with `npm run new -- <slug>`
+  (`--kind material --group <class>/<subject>` for a material); the number comes
+  from a scan of the whole tree. **Pre-scaffold directories yourself before
+  launching a fleet** — parallel agents racing `npm run new` collide on
+  numbering.
 - `000-ground-truth` is the brute-force reference and is stand-independent, so
   it is excluded from every round and is not a usable A/B partner.
 - **`001-billboard-smoke` is the champion**: best looking AND fastest (~6 ms
@@ -117,8 +123,8 @@ recurring hazard, not the carpet specifics.
 4. **OPEN QUESTION: the GCMESH1 octahedral normal convention may be wrong in
    shared code.** Two independent agents have now measured this. `GcMesh.normalAt()`
    (`src/mesh/gcmesh.ts`, commented "validated visually in the mesh inspector")
-   derives **Y** from the two stored components; `experiments/004-raycast-lut/shaders/
-   rayfield-common.wgsl` applies a y↔z swap and reports measuring the decoded
+   derives **Y** from the two stored components; `experiments/renderers/004-raycast-lut/
+   shaders/rayfield-common.wgsl` applies a y↔z swap and reports measuring the decoded
    normals against face normals computed from raw vertex positions — mean |cos|
    **0.75 for a z-derived reading vs 0.57 for the y-derived one**. If that holds,
    every experiment using the shared decoder has subtly wrong normals, and
@@ -222,12 +228,30 @@ What changed on disk:
 - Species indices 3-5 are retired and must never be reused: the index goes into
   the GPU stand table and the catalog is append-only.
 
+## Deferred to the end of the materials plan
+
+- **Silhouette POM is unresolved, and my analysis of it is contested.** After
+  seeing 002's `silhouette` option carve the cube-sphere's chart seams (an
+  interior "tennis ball" pattern) while leaving the outer edge smooth, I claimed
+  uv-bounds SPOM structurally cannot alter a closed mesh's outer silhouette. The
+  owner disagrees and reports having seen a UE5 SPOM variant that cuts spheres
+  correctly — at the geometrically expected places, not at uv-island borders. So
+  treat my claim as WRONG until re-derived: there is an existence proof for the
+  behaviour we want, and the current implementation
+  (`r.clip = !hit || mat_uv_outside(...)` in `src/material/codegen.ts`) is the
+  thing to replace, not the thing to justify. Revisit with the owner's reference
+  in hand at the end of the plan; it is explicitly not a blocker before then.
+
 ## Owner decisions not yet executed
 
-- **The hierarchy must end up uniform.** The 40 existing renderers still sit at
-  `experiments/<nnn>-<slug>/` while materials are nested. Move them under
-  `experiments/renderers/` as part of the UI phase — ids are decoupled from
-  paths now, so ratings, bench results and goldens all survive the move.
+- ~~**The hierarchy must end up uniform.**~~ DONE (2026-07-26). All 40 renderers
+  (000-ground-truth and `_template` included) moved to
+  `experiments/renderers/<nnn>-<slug>/` with `git mv`; materials stay at
+  `experiments/materials/<class>/<subject>/<nnn>-<slug>/`. Nothing had to be
+  edited inside any experiment — ids come from the manifest, `RegistryEntry.dir`
+  comes from the glob path, and ratings/bench results/goldens are keyed by id.
+  The browser is now a recursive `<details>` tree driven by `entry.taxonomy` /
+  `entry.kind`, with per-grid sorting and collapse state in `?closed=`.
 - **The 25MB VRAM bar has no material-appropriate meaning.** It was calibrated
   for a plant species' baked representation; the first material measures 48MiB
   for one uncompressed 2048² albedo+normal+AO set (BC7/BC5/BC4 would be ~14MB).

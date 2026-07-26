@@ -28,7 +28,7 @@ export function devSink(): Plugin {
   }
 
   /**
-   * A repo-relative experiment directory, e.g. `experiments/001-billboard-smoke`
+   * A repo-relative experiment directory, e.g. `experiments/renderers/001-billboard-smoke`
    * or `experiments/materials/mosses/sphagnum/003-nd-fuzz`. Experiments gained a
    * hierarchy, so this has to admit `/` — which means it must be validated
    * segment by segment, and pinned under `experiments/`, or it becomes a

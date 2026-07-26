@@ -305,14 +305,71 @@ code,
   height: 100%;
 }
 
-.browser h2 {
+/* One heading treatment, shared by plain headings and group disclosures. */
+.browser h2,
+.browser .group > summary {
   font-size: 13px;
   text-transform: uppercase;
   letter-spacing: 0.1em;
   color: var(--muted);
   border-bottom: 1px solid var(--border);
   padding-bottom: 6px;
+}
+
+.browser h2 {
   margin: 26px 0 0;
+}
+
+/* ---------- collapsible taxonomy groups (arbitrary depth) ---------- */
+
+.browser .group {
+  margin-top: 26px;
+}
+
+.browser .group > summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  user-select: none;
+  list-style: none;
+}
+
+.browser .group > summary::-webkit-details-marker {
+  display: none;
+}
+
+/* Text marker, never an icon font or an emoji. */
+.browser .group > summary::before {
+  content: '▸';
+  width: 10px;
+  color: var(--dim);
+}
+
+.browser .group[open] > summary::before {
+  content: '▾';
+}
+
+.browser .group > summary:hover,
+.browser .group > summary:hover::before {
+  color: var(--text);
+}
+
+.browser .group > summary:hover {
+  border-bottom-color: var(--border-strong);
+}
+
+.browser .group > summary .count {
+  color: var(--dim);
+  font-size: 11px;
+}
+
+/* Nesting reads as an indent plus a rule — never as a colour. */
+.browser .group .group {
+  margin-top: 14px;
+  margin-left: 10px;
+  padding-left: 12px;
+  border-left: 1px solid var(--border);
 }
 
 .cards {

@@ -45,8 +45,9 @@ npx vite preview --port 5199        # serve dist/ locally at /groundcover-lab/
   `base`; to deploy at the domain root, set it to `/`.
 - **What gets uploaded** (`tools/vite-plugin-static-deploy.ts` copies these into `dist/`):
   the JS/CSS bundle (~1MB), `mesh/baked/**` (~255MB of committed baked artifacts — without them a
-  visitor would have to re-bake from raw meshes in-browser), `experiments/*/thumbnail.png` +
-  `rating.json` (~9MB), `results/*.json` plus a generated `results/index.json`, and
+  visitor would have to re-bake from raw meshes in-browser), `experiments/**/thumbnail.png` +
+  `rating.json` (~9MB, found by walking the experiment tree at any depth),
+  `results/*.json` plus a generated `results/index.json`, and
   `mesh/raw/*/manifest.json`. `goldens/` is never uploaded (nothing fetches it at runtime).
 - **Raw source meshes are OFF by default.** They are ~357MB (poa-pratensis alone is 229MB) and only
   the `#/mesh/<id>` inspector and reference renders need them. Build with `GC_DEPLOY_MESHES=1` to

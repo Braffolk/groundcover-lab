@@ -208,7 +208,7 @@ export function defineMaterial<S extends ParamSchema>(
 export interface RegistryEntry {
   id: string
   /**
-   * Repo-relative directory, e.g. `experiments/001-billboard-smoke` or
+   * Repo-relative directory, e.g. `experiments/renderers/001-billboard-smoke` or
    * `experiments/materials/mosses/sphagnum/003-nd-fuzz`. Every per-experiment
    * asset URL derives from THIS, not from the id — the two stopped being the
    * same thing when experiments gained a hierarchy.

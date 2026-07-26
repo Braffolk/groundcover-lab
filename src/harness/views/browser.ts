@@ -1,4 +1,4 @@
-import { discoverExperiments, type RegistryEntry } from '../registry.ts'
+import { discoverExperiments, type ExperimentKind, type RegistryEntry } from '../registry.ts'
 import { meshCatalog, type MeshInfo } from '../../mesh/catalog.ts'
 import { fetchAllRatings, saveRating } from '../ratings.ts'
 import { balanceScore, loadPerfIndex } from '../scoring.ts'
@@ -10,6 +10,17 @@ import { button, el, formatCount, link, topbar, type View } from './shared.ts'
 type SortMode = 'id' | 'visual' | 'perf' | 'balance'
 const SORT_MODES: SortMode[] = ['id', 'visual', 'perf', 'balance']
 
+/**
+ * Where an experiment with no taxonomy (one dropped straight into
+ * `experiments/`) is filed. Every experiment lives under a kind root now, so
+ * this is a fallback rather than the normal path — but it means a stray folder
+ * shows up in the right place instead of inventing a nameless top-level group.
+ */
+const KIND_GROUP: Record<ExperimentKind, string> = { renderer: 'renderers', material: 'materials' }
+
+/** Top-level groups pinned ahead of alphabetical order; the rest sort by name. */
+const GROUP_ORDER = ['renderers', 'materials']
+
 interface CardRef {
   entry: RegistryEntry
   card: HTMLElement
@@ -18,7 +29,55 @@ interface CardRef {
   scoreLabel: HTMLElement
 }
 
-/** #/ — the experiment browser: rated, ranked, A/B-selectable cards + meshes. */
+/**
+ * One node of the taxonomy tree. Depth is whatever the directory layout says —
+ * `renderers` is one level, `materials/mosses/sphagnum` is three, and nothing
+ * here knows or cares which.
+ */
+interface GroupNode {
+  name: string
+  /** Slash-joined taxonomy path — the key collapse state round-trips under. */
+  key: string
+  children: Map<string, GroupNode>
+  /** Experiments filed directly at this level. */
+  entries: RegistryEntry[]
+}
+
+function emptyGroup(name: string, key: string): GroupNode {
+  return { name, key, children: new Map(), entries: [] }
+}
+
+/** Group entries by `taxonomy` (falling back to the kind's root), any depth. */
+function buildTree(entries: readonly RegistryEntry[]): GroupNode {
+  const root = emptyGroup('', '')
+  for (const entry of entries) {
+    const path = entry.taxonomy.length > 0 ? entry.taxonomy : [KIND_GROUP[entry.kind]]
+    let node = root
+    for (const name of path) {
+      let child = node.children.get(name)
+      if (!child) node.children.set(name, (child = emptyGroup(name, node.key ? `${node.key}/${name}` : name)))
+      node = child
+    }
+    node.entries.push(entry)
+  }
+  return root
+}
+
+function groupCount(node: GroupNode): number {
+  let n = node.entries.length
+  for (const child of node.children.values()) n += groupCount(child)
+  return n
+}
+
+function orderedChildren(node: GroupNode): GroupNode[] {
+  const rank = (name: string): number => {
+    const i = GROUP_ORDER.indexOf(name)
+    return i === -1 ? GROUP_ORDER.length : i
+  }
+  return [...node.children.values()].sort((a, b) => rank(a.name) - rank(b.name) || a.name.localeCompare(b.name))
+}
+
+/** #/ — the experiment browser: a collapsible tree of rated, ranked cards. */
 export async function browserView(root: HTMLElement): Promise<View> {
   const page = el('div', 'page')
   page.appendChild(topbar('experiments', [link('#/results', 'bench results')]))
@@ -29,14 +88,16 @@ export async function browserView(root: HTMLElement): Promise<View> {
   root.appendChild(page)
 
   const entries = await discoverExperiments()
-  const renderers = entries.filter((e) => e.manifest?.status !== 'reference')
+  const rendered = entries.filter((e) => e.manifest?.status !== 'reference')
   const references = entries.filter((e) => e.manifest?.status === 'reference')
   const [ratings, perf] = await Promise.all([
-    fetchAllRatings(renderers),
+    fetchAllRatings(rendered),
     loadPerfIndex(),
   ])
 
   // --- A/B selection (order matters: first = A, second = B) ---------------
+  // Keyed by id across every grid, so picking A in one group and B in another
+  // works exactly as it did when there was a single flat list.
   const selection: string[] = []
   const cards = new Map<string, CardRef>()
   const compareBar = el('div', 'compare-bar')
@@ -91,14 +152,30 @@ export async function browserView(root: HTMLElement): Promise<View> {
   })
   sortBar.append(...sortButtons)
   sortBar.appendChild(
-    el('span', 'hint', `· perf & balance from latest bench @ ${perf.context} · balance = √(visual × perf), absolute anchors`),
+    el('span', 'hint', `· sorts within each group · perf & balance from latest bench @ ${perf.context} · balance = √(visual × perf), absolute anchors`),
   )
   browser.appendChild(sortBar)
 
-  const grid = el('div', 'cards')
-  browser.appendChild(grid)
-  if (renderers.length === 0) {
-    browser.appendChild(el('div', 'hint', 'No experiments yet — run `npm run new -- <slug>` to scaffold one.'))
+  // --- collapse state, round-tripped through the URL like sort/stand/debug --
+  const closed = new Set((currentState().q.get('closed') ?? '').split(',').filter((s) => s.length > 0))
+  const writeClosed = (): void => {
+    updateQuery({ closed: closed.size > 0 ? [...closed].sort().join(',') : null })
+  }
+
+  /** A collapsible section: header with a text marker, a name and a count. */
+  const section = (name: string, key: string, count: number): HTMLDetailsElement => {
+    const details = el('details', 'group')
+    details.open = !closed.has(key)
+    const summary = el('summary')
+    summary.appendChild(el('span', 'label', name))
+    summary.appendChild(el('span', 'count', String(count)))
+    details.appendChild(summary)
+    details.addEventListener('toggle', () => {
+      if (details.open) closed.delete(key)
+      else closed.add(key)
+      writeClosed()
+    })
+    return details
   }
 
   const sortValue = (id: string): number | null => {
@@ -116,21 +193,6 @@ export async function browserView(root: HTMLElement): Promise<View> {
     }
   }
 
-  const applySort = (): void => {
-    for (const b of sortButtons) b.classList.toggle('primary', b.dataset['mode'] === sortMode)
-    const order = [...renderers].sort((a, b) => {
-      const [va, vb] = [sortValue(a.id), sortValue(b.id)]
-      if (va === null && vb === null) return a.id.localeCompare(b.id, undefined, { numeric: true })
-      if (va === null) return 1
-      if (vb === null) return -1
-      return va - vb || a.id.localeCompare(b.id, undefined, { numeric: true })
-    })
-    for (const entry of order) {
-      const ref = cards.get(entry.id)
-      if (ref) grid.appendChild(ref.card) // appendChild moves — reorders in place
-    }
-  }
-
   const scoreText = (id: string): string => {
     const ms = perf.byExperiment.get(id) ?? null
     const rating = ratings.get(id) ?? null
@@ -139,8 +201,30 @@ export async function browserView(root: HTMLElement): Promise<View> {
     return `${perfPart} · ${balPart}`
   }
 
-  for (const entry of renderers) {
-    const ref = experimentCard(entry, toggleSelect, entry.manifest ? {
+  // Every card grid on the page, each with the entries it owns. Sorting is
+  // per-grid: one comparator, applied inside each group independently, so a
+  // group's members never migrate out of their group.
+  const grids: { grid: HTMLElement; entries: readonly RegistryEntry[] }[] = []
+
+  const applySort = (): void => {
+    for (const b of sortButtons) b.classList.toggle('primary', b.dataset['mode'] === sortMode)
+    for (const { grid, entries: members } of grids) {
+      const order = [...members].sort((a, b) => {
+        const [va, vb] = [sortValue(a.id), sortValue(b.id)]
+        if (va === null && vb === null) return a.id.localeCompare(b.id, undefined, { numeric: true })
+        if (va === null) return 1
+        if (vb === null) return -1
+        return va - vb || a.id.localeCompare(b.id, undefined, { numeric: true })
+      })
+      for (const entry of order) {
+        const ref = cards.get(entry.id)
+        if (ref) grid.appendChild(ref.card) // appendChild moves — reorders in place
+      }
+    }
+  }
+
+  const makeCard = (entry: RegistryEntry, rated: boolean): CardRef => {
+    const ref = experimentCard(entry, toggleSelect, rated && entry.manifest ? {
       rating: ratings.get(entry.id) ?? null,
       onRate: (value) => {
         void saveRating(entry.dir, value)
@@ -155,35 +239,56 @@ export async function browserView(root: HTMLElement): Promise<View> {
           })
       },
     } : null)
-    ref.scoreLabel.textContent = entry.manifest ? scoreText(entry.id) : ''
+    ref.scoreLabel.textContent = entry.manifest && rated ? scoreText(entry.id) : ''
     cards.set(entry.id, ref)
-    grid.appendChild(ref.card)
+    return ref
   }
-  applySort()
+
+  const addGrid = (parent: HTMLElement, members: readonly RegistryEntry[], rated: boolean): void => {
+    const grid = el('div', 'cards')
+    parent.appendChild(grid)
+    for (const entry of members) grid.appendChild(makeCard(entry, rated).card)
+    grids.push({ grid, entries: members })
+  }
+
+  const emitGroup = (node: GroupNode, parent: HTMLElement): void => {
+    const details = section(node.name, node.key, groupCount(node))
+    parent.appendChild(details)
+    if (node.entries.length > 0) addGrid(details, node.entries, true)
+    for (const child of orderedChildren(node)) emitGroup(child, details)
+  }
+
+  const tree = buildTree(rendered)
+  // Only reachable if an experiment sits directly in experiments/ with no kind
+  // root above it — kept so such a folder still shows rather than vanishing.
+  if (tree.entries.length > 0) addGrid(browser, tree.entries, true)
+  for (const child of orderedChildren(tree)) emitGroup(child, browser)
+
+  if (entries.length === 0) {
+    browser.appendChild(el('div', 'hint', 'No experiments yet — run `npm run new -- <slug>` to scaffold one.'))
+  }
 
   if (references.length > 0) {
-    browser.appendChild(el('h2', undefined, 'references — ignore the stand'))
+    const details = section('references — ignore the stand', 'references', references.length)
+    browser.appendChild(details)
     if (!RAW_MESHES_AVAILABLE) {
-      browser.appendChild(
+      details.appendChild(
         el('div', 'hint', 'raw source meshes are not part of this deployment — references that render them cannot start here'),
       )
     }
-    const refGrid = el('div', 'cards')
-    browser.appendChild(refGrid)
-    for (const entry of references) {
-      const ref = experimentCard(entry, toggleSelect, null)
-      cards.set(entry.id, ref)
-      refGrid.appendChild(ref.card)
-    }
+    addGrid(details, references, false)
   }
 
   const meshes = meshCatalog.list()
   if (meshes.length > 0) {
-    browser.appendChild(el('h2', undefined, 'source meshes'))
+    const details = section('source meshes', 'meshes', meshes.length)
+    browser.appendChild(details)
     const meshGrid = el('div', 'cards')
-    browser.appendChild(meshGrid)
+    details.appendChild(meshGrid)
     for (const mesh of meshes) meshGrid.appendChild(meshCard(mesh))
   }
+
+  applySort()
 
   return { dispose: () => page.remove() }
 }
