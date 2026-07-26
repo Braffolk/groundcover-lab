@@ -33,10 +33,18 @@ It is hash-routed (`#/run/<id>`, `#/ab/...`, `#/bench/...`), so **no server rewr
 one `index.html` is enough.
 
 ```bash
-npx vite build                      # → dist/, ~267MB (base path /groundcover-lab/)
-GC_DEPLOY_MESHES=1 npx vite build   # → dist/, ~624MB (adds the raw GCMESH1 source meshes)
+npx vite build                      # → dist/, ~1.5GB (base path /groundcover-lab/)
+GC_DEPLOY_MESHES=1 npx vite build   # → dist/, larger still (adds the raw GCMESH1 source meshes)
 npx vite preview --port 5199        # serve dist/ locally at /groundcover-lab/
 ```
+
+> **The deploy has outgrown itself.** `mesh/baked/` is now ~1.4GB of committed
+> per-experiment artifacts, so a build is ~1.5GB — well past what is sensible to
+> upload. The options are the ones that have been open since the second round:
+> stop committing baked artifacts and regenerate them locally before a deploy,
+> move them to Git LFS, or deploy a curated subset. This needs a decision before
+> the lab is published anywhere.
+
 
 - **Base path.** Production builds are served under `/groundcover-lab/` (`base` in `vite.config.ts`);
   the dev server stays at `/`. Runtime asset URLs go through `assetUrl()` (`src/util/paths.ts`), which
