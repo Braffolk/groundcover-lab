@@ -1,0 +1,24 @@
+{
+  "seed": 2507,
+  "events": 7789,
+  "capitula": 7015,
+  "fascicles": 774,
+  "branchPackets": 166547,
+  "packetSamples": 1276142,
+  "eventsPerSquareMetre": 44155.32879818595,
+  "meanNominalCapitulumMm": 12.068239086349479,
+  "coverage": 0.9914233684539795,
+  "meanDepthLayers": 3.718672513961792,
+  "depthLayerFractions": [
+    0.9914233684539795,
+    0.9645633697509766,
+    0.9150276184082031,
+    0.8476581573486328
+  ],
+  "meanHeight": 0.4599397503150282,
+  "heightStdDev": 0.06606208862193917,
+  "meanGradient": 0.012543429171765194,
+  "p95Gradient": 0.025048923679060666,
+  "highGradientFraction": 0.014693260192871094,
+  "generationMs": 17318.917167
+}
