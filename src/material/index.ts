@@ -72,4 +72,21 @@ export {
   type MaterializationRecord,
 } from './report.ts'
 
-export { createMaterialExperiment, tilesPerMetre } from './runtime.ts'
+export { MATERIAL_SAMPLER_DESC, createMaterialExperiment, tilesPerMetre } from './runtime.ts'
+
+export {
+  BUNDLE_FORMAT,
+  exportMaterialBundle,
+  materialExportRefusal,
+  type MaterialBundle,
+  type MaterialBundleInput,
+} from './export.ts'
+
+export {
+  MAT_HOST_FIELDS,
+  MAT_HOST_SIZE,
+  PORTABLE_HOST_WGSL,
+  portableMaterialWgsl,
+  stripInclude,
+  type HostField,
+} from './portable.ts'

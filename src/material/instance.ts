@@ -47,6 +47,15 @@ export interface MaterialInstance {
   frame: { layout: GPUBindGroupLayout; bindGroup: GPUBindGroup }
   sampler: GPUSampler
   uniformBuffer: GPUBuffer
+  /**
+   * A COPY of the CPU-side staging array the uniform buffer was last written
+   * from — uv transform header first, then one f32 per param (see
+   * `uniformLayout`). The buffer itself has no COPY_SRC (it is a uniform), so
+   * this is the only way to see the exact bytes the shader is reading, which is
+   * what the portable export writes into its manifest as the default uniform
+   * block.
+   */
+  uniformFloats: () => Float32Array
   schema: ParamSchema
   /** Live values — the same object the params panel mutates. */
   values: ParamValues<ParamSchema>

@@ -57,6 +57,21 @@ import { validateCompilation, validateGeneratedMain, validateMaterial } from './
  * exactly the "stretched to fit the polygons" failure the metre convention
  * exists to prevent.
  */
+/**
+ * THE sampler every graph material binds at @group(1) @binding(1). One
+ * declaration, because the portable export has to state it in its manifest and
+ * a consumer that creates a different one gets a different picture — `repeat`
+ * in particular is not optional for a tiling material.
+ */
+export const MATERIAL_SAMPLER_DESC = {
+  addressModeU: 'repeat',
+  addressModeV: 'repeat',
+  magFilter: 'linear',
+  minFilter: 'linear',
+  mipmapFilter: 'linear',
+  maxAnisotropy: 16,
+} as const satisfies GPUSamplerDescriptor
+
 export function tilesPerMetre(mesh: PreviewMesh, periodM: number, scale = 1): number {
   const wanted = 1 / Math.max(periodM * scale, 1e-4)
   const period = mesh.uvPeriod[0] > 0 ? mesh.uvPeriod[0] : mesh.uvPeriod[1]
@@ -93,15 +108,7 @@ export async function createMaterialExperiment<S extends ParamSchema>(
   const layout = uniformLayout(def.params)
   const uniforms = new Float32Array(layout.size / 4)
 
-  const sampler = device.createSampler({
-    label: `${ctx.id}/material`,
-    addressModeU: 'repeat',
-    addressModeV: 'repeat',
-    magFilter: 'linear',
-    minFilter: 'linear',
-    mipmapFilter: 'linear',
-    maxAnisotropy: 16,
-  })
+  const sampler = device.createSampler({ label: `${ctx.id}/material`, ...MATERIAL_SAMPLER_DESC })
 
   const uniformBuffer = ctx.res.createBuffer(
     { label: `${ctx.id}/material/uniforms`, size: layout.size, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST },
@@ -380,6 +387,7 @@ export async function createMaterialExperiment<S extends ParamSchema>(
       frame: ctx.frame,
       sampler,
       uniformBuffer,
+      uniformFloats: () => uniforms.slice(),
       schema: def.params,
       values: ctx.params,
       resolved: b.resolved,

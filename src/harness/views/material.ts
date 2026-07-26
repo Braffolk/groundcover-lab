@@ -1,4 +1,5 @@
 import type { VramScope } from '../../gpu/resources.ts'
+import { exportMaterialBundle, materialExportRefusal } from '../../material/export.ts'
 import {
   chainStats,
   decodeTexel,
@@ -26,7 +27,7 @@ import { buildHash, makeDebouncedQueryWriter, type HashState } from '../../url/s
 import { Overlay } from '../../ui/overlay.ts'
 import { buildParamsPanel } from '../../ui/panel.ts'
 import { downloadBlob, imageDataToPngBlob } from '../capture.ts'
-import { LabApp } from '../loop.ts'
+import { DEPTH_FORMAT, LabApp } from '../loop.ts'
 import { paramsToQuery } from '../params.ts'
 import { findExperiment } from '../registry.ts'
 import {
@@ -188,9 +189,62 @@ export async function materialView(root: HTMLElement, state: HashState): Promise
       cleanups.push(() => panel.dispose())
 
       const toolbar = el('div', 'mat-toolbar')
+      const exportButton = button('export bundle', () => {
+        void runExport(exportButton)
+      })
+      exportButton.title =
+        'Download a self-contained ZIP: the generated shader with the lab bind group swapped for a small documented ' +
+        'host struct, every texture it samples as a PNG, the mip filters, and a manifest with the semantics, the ' +
+        'uniform layout and the uv contract.'
+
+      /**
+       * Everything the bundle needs that the material page already has. The
+       * button is present even for a material that CANNOT be exported (one with
+       * no graph): refusing by name where someone clicked is more use than a
+       * missing control they cannot ask about.
+       */
+      const runExport = async (btn: HTMLButtonElement): Promise<void> => {
+        const inst = materialInstance(id)
+        const rep = materialReport(id)
+        const refusal = materialExportRefusal(id, rep, inst)
+        if (refusal || !inst || !rep) {
+          overlay.toast(refusal ?? 'nothing to export', 'error', 12000)
+          return
+        }
+        btn.disabled = true
+        const label = btn.textContent
+        btn.textContent = 'exporting…'
+        try {
+          const bundle = await exportMaterialBundle({
+            instance: inst,
+            report: rep,
+            meta: {
+              title: manifest.title,
+              ...(manifest.description && { description: manifest.description }),
+              previewObject: currentPreviewObject(runningApp),
+              colorFormat: runningApp.gpu.format,
+              depthFormat: DEPTH_FORMAT,
+            },
+            exempt: (fn) => runningApp.tracker.exempt(fn),
+          })
+          downloadBlob(bundle.blob, bundle.filename)
+          overlay.toast(
+            `${bundle.filename} — ${bundle.files.length} files, ${bytesLabel(bundle.totalBytes)}`,
+            'info',
+            6000,
+          )
+        } catch (err) {
+          overlay.toast(err instanceof Error ? err.message : String(err), 'error', 12000)
+        } finally {
+          btn.disabled = false
+          btn.textContent = label
+        }
+      }
+
       toolbar.append(
         previewObjectPicker(runningApp),
         debugPicker(runningApp, state.q.get('debug')),
+        exportButton,
         button('bench', () => {
           location.hash = buildHash(['bench', id], { seed: String(seed), obj: currentPreviewObject(runningApp) })
         }),

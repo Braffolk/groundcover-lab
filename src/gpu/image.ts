@@ -73,7 +73,8 @@ const CRC_TABLE = (() => {
   return t
 })()
 
-function crc32(buf: Uint8Array): number {
+/** CRC-32 (IEEE, the PNG/ZIP polynomial). Exported because ZIP needs it too. */
+export function crc32(buf: Uint8Array): number {
   let c = 0xffffffff
   for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]!) & 0xff]! ^ (c >>> 8)
   return (c ^ 0xffffffff) >>> 0
@@ -102,7 +103,7 @@ function paeth(a: number, b: number, c: number): number {
  * is `Uint8Array<ArrayBufferLike>` (it might sit on a SharedArrayBuffer).
  * Narrow, copying only in the shared case.
  */
-function blobPart(bytes: Uint8Array): BlobPart {
+export function blobPart(bytes: Uint8Array): BlobPart {
   const buf = bytes.buffer
   return buf instanceof ArrayBuffer ? new Uint8Array(buf, bytes.byteOffset, bytes.byteLength) : new Uint8Array(bytes)
 }
