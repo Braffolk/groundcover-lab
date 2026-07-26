@@ -256,6 +256,41 @@ What changed on disk:
 - Species indices 3-5 are retired and must never be reused: the index goes into
   the GPU stand table and the catalog is append-only.
 
+## The materials system as built (2026-07-26)
+
+All phases of the approved plan except the deferred ones are done. What exists:
+
+- **Kinds + a tree.** `experiments/renderers/<nnn>-<slug>/` and
+  `experiments/materials/<class>/<subject>/<nnn>-<slug>/`; id = last path
+  segment; numbering restarts per branch; the browser renders the tree from
+  `entry.taxonomy` with collapse persisted in the URL.
+- **A pluggable `Stage`.** `StandStage` is the old behaviour byte for byte;
+  `MaterialStage` gives a studio backdrop, an orbit camera and harness-owned
+  preview geometry (sphere / plane / cube-edge / cylinder, uv in METRES of
+  surface). The `@group(0)` LAYOUT is frozen forever — only its contents vary —
+  which is why `light_surface()` and `debug_shade()` work verbatim in a material.
+- **A material = a channel graph + two authored WGSL stages.** Five frozen node
+  kinds; `meshCapture` deliberately absent. One declaration produces both
+  execution modes, so live-vs-materialized is a caching decision. The generator
+  emits the `debug_shade` call, which makes the debug views unskippable.
+- **`#/material/<id>`** — node graph, every intermediate texture with channel
+  isolation / mip slider / texel probe / per-level luma, generated WGSL,
+  validator report. Renders itself from the `MaterialDef`, so new materials are
+  inspectable for free.
+- **Portable export** — a ZIP that renders **bit-identically outside the lab**
+  (0 of 684,000 px differ), verified from a page importing nothing from here.
+- **Three materials**: `001-flat-maps` (hand-written, the pre-graph reference),
+  `002-graph-maps` (the same thing as a graph — pixel-identical), `003-nd-fuzz`
+  (the Uncharted 4 BRDF; the port needed no new node kind and no `src/` change).
+
+Known internal gaps, all recorded in the materials' NOTES rather than hidden:
+`parallaxOffset` cannot express a one-tap parallax shadow (`ViewUv.shadow` is
+never filled, `EvalCtx` has no tangent frame) and has no travel bound, so an
+author must set `limit` by hand; a node with two consumers is evaluated twice;
+and codegen binds a materialized node's inputs even though only the bake reads
+them, which is a dead binding plus wasted VRAM (the exporter strips them, the
+lab does not).
+
 ## Deferred to the end of the materials plan
 
 - **Silhouette POM is unresolved, and my analysis of it is contested.** After
