@@ -11,6 +11,8 @@
 // the peel input; hardware depth test then keeps the NEAREST surviving
 // fragment, i.e. the first surface beyond the separation threshold.
 
+#include "src/wgsl/gcmesh.wgsl"
+
 struct TileU {
   right: vec4f,      // xyz = ortho right axis, w = half width (m)
   up: vec4f,         // xyz = ortho up axis,    w = half height (m)
@@ -27,18 +29,6 @@ struct VOut {
   @location(0) color: vec3f,
   @location(1) normal: vec3f,
   @location(2) dlin: f32,   // linear depth in [0,1]: 0 = nearest to capture cam
-}
-
-// Standard octahedral normal decode (y up) — mirrors GcMesh.normalAt().
-fn oct_decode(e: vec2f) -> vec3f {
-  let y = 1.0 - abs(e.x) - abs(e.y);
-  var x = e.x;
-  var z = e.y;
-  if (y < 0.0) {
-    x = (1.0 - abs(e.y)) * sign(e.x);
-    z = (1.0 - abs(e.x)) * sign(e.y);
-  }
-  return normalize(vec3f(x, y, z));
 }
 
 fn sign_not_zero2(v: vec2f) -> vec2f {
@@ -68,8 +58,7 @@ fn vs(@location(0) a0: vec4<u32>, @location(1) a1: vec4<u32>) -> VOut {
   var o: VOut;
   o.pos = vec4f(cx, cy, dlin, 1.0);
   o.color = vec3f(f32(a0.w), f32(a1.x), f32(a1.y)) / 65535.0;
-  let e = vec2f(f32(a1.z), f32(a1.w)) / 65535.0 * 2.0 - 1.0;
-  o.normal = oct_decode(e);
+  o.normal = gcmesh_normal_decode_u16(a1.z, a1.w);
   o.dlin = dlin;
   return o;
 }

@@ -947,7 +947,12 @@ function writeLayer(
   }
 }
 
-/** Octahedral encode, y-primary — exact inverse of the decode in gcmesh.ts. */
+/**
+ * Octahedral encode, y-primary — this atlas's OWN convention, the exact inverse of
+ * oct_decode_patch() in patches.wgsl. Unrelated to the GCMESH1 source convention
+ * (src/wgsl/gcmesh.wgsl): what it encodes has already been decoded from the source
+ * and flipped toward the capture camera by the GPU bake.
+ */
 function octEncode(x: number, y: number, z: number): [number, number] {
   const s = Math.abs(x) + Math.abs(y) + Math.abs(z)
   let u: number

@@ -2,6 +2,8 @@
 // into one atlas tile per view. MRT: premultiplied albedo+coverage and
 // premultiplied plant-local normal (faceforwarded toward the view).
 
+#include "src/wgsl/gcmesh.wgsl"
+
 struct BakeView {
   center: vec3f,
   r_card: f32,
@@ -24,25 +26,12 @@ struct VOut {
   @location(1) nrm: vec3f,
 }
 
-fn oct_decode(e: vec2f) -> vec3f {
-  let u = e.x * 2.0 - 1.0;
-  let v = e.y * 2.0 - 1.0;
-  var x = u;
-  var z = v;
-  let y = 1.0 - abs(u) - abs(v);
-  if (y < 0.0) {
-    x = (1.0 - abs(v)) * sign(u);
-    z = (1.0 - abs(u)) * sign(v);
-  }
-  return normalize(vec3f(x, y, z));
-}
-
 @vertex
 fn vs(@location(0) q0: vec4<u32>, @location(1) q1: vec4<u32>) -> VOut {
   let qp = vec3f(vec3<u32>(q0.xyz)) / 65535.0;
   let pos = view_uni.bmin + qp * (view_uni.bmax - view_uni.bmin);
   let color = vec3f(f32(q0.w), f32(q1.x), f32(q1.y)) / 65535.0;
-  let n = oct_decode(vec2f(f32(q1.z), f32(q1.w)) / 65535.0);
+  let n = gcmesh_normal_decode_u16(q1.z, q1.w);
 
   let p = pos - view_uni.center;
   var out: VOut;

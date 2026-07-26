@@ -14,6 +14,8 @@
 // stage is three dot products and the runtime uses the identical convention.
 // No @group(0) frame include here — the bake is self-contained.
 
+#include "src/wgsl/gcmesh.wgsl"
+
 struct BakeView {
   au: vec4f,      // xyz: u axis (mesh frame, 1/extent folded in)
   av: vec4f,      // xyz: v axis
@@ -36,20 +38,10 @@ struct VOut {
   @location(3) ao_uvw: vec3f,
 }
 
-// Octahedral decode, y-primary — mirrors GcMesh.normalAt() in src/mesh/gcmesh.ts.
-fn oct_decode_mesh(e: vec2f) -> vec3f {
-  var x = e.x;
-  var z = e.y;
-  let y = 1.0 - abs(e.x) - abs(e.y);
-  if (y < 0.0) {
-    x = (1.0 - abs(e.y)) * select(-1.0, 1.0, e.x >= 0.0);
-    z = (1.0 - abs(e.x)) * select(-1.0, 1.0, e.y >= 0.0);
-  }
-  return normalize(vec3f(x, y, z));
-}
-
-// Octahedral encode, y-primary — exact inverse of the decode above and of
-// oct_decode_card() in cards.wgsl.
+// Octahedral encode, y-primary — this atlas's OWN convention, the exact inverse
+// of oct_decode_card() in cards.wgsl and of oct_decode_mip() in mipgen.wgsl.
+// Nothing to do with the GCMESH1 source convention (see gcmesh.wgsl): the vector
+// it encodes has already been decoded and flipped toward the capture axis.
 fn oct_encode_mesh(n: vec3f) -> vec2f {
   let s = abs(n.x) + abs(n.y) + abs(n.z);
   if (s < 1e-6) {
@@ -71,14 +63,13 @@ fn vs(@location(0) q_pos: vec4<u32>, @location(1) q_attr: vec4<u32>) -> VOut {
   // Vertex record: [x y z r] [g b octU octV], all u16 UNORM against bounds.
   let p = bake_view.b_min.xyz + (vec3f(vec3<u32>(q_pos.xyz)) / 65535.0) * bake_view.b_range.xyz;
   let color = vec3f(f32(q_pos.w), f32(q_attr.x), f32(q_attr.y)) / 65535.0;
-  let oct = (vec2f(f32(q_attr.z), f32(q_attr.w)) / 65535.0) * 2.0 - 1.0;
 
   let off = p - bake_view.centre.xyz;
   let u = dot(off, bake_view.au.xyz);
   let v = dot(off, bake_view.av.xyz);
   let f = dot(off, bake_view.af.xyz);
 
-  var n = oct_decode_mesh(oct);
+  var n = gcmesh_normal_decode_u16(q_attr.z, q_attr.w);
   if (dot(n, bake_view.af.xyz) < 0.0) {
     n = -n;
   }

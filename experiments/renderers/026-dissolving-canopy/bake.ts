@@ -1278,7 +1278,12 @@ function bakeCavityAo(aux: Uint8Array, tileM: number, spanM: number): void {
   for (let i = 0; i < N * N; i++) aux[i * 4 + 3] = out[i]!
 }
 
-/** Octahedral encode, y-primary — exact inverse of the decode in gcmesh.ts. */
+/**
+ * Octahedral encode, y-primary — this bake's OWN convention, the exact inverse of
+ * oct_decode_ds() in common.wgsl and oct_decode_mip() in mipgen.wgsl. Unrelated to
+ * the GCMESH1 source convention (src/wgsl/gcmesh.wgsl): what it encodes has already
+ * been decoded from the source and flipped toward the capture camera.
+ */
 export function octEncode(x: number, y: number, z: number): [number, number] {
   const s = Math.abs(x) + Math.abs(y) + Math.abs(z)
   let u: number

@@ -1,4 +1,5 @@
 #include "./frustum_math.wgsl"
+#include "src/wgsl/gcmesh.wgsl"
 
 // Bake stage 2: resample the ortho view G-buffers into the chord field.
 // One thread per chord texel: build the bin's chord (entry/exit points on the
@@ -131,7 +132,10 @@ fn cs(@builtin(global_invocation_id) gid: vec3<u32>) {
           acc_rgb += alb.rgb;
           acc_cov += 1.0;
           acc_t += clamp(dot(hit - e0, dir) / len, 0.0, 1.0);
-          acc_n += oct_nrm_decode(textureLoad(view_oct, texel, 0).xy * 2.0 - 1.0);
+          // view_oct passes the SOURCE vertex pair through unchanged (bake_views
+          // only requantizes it), so this is where the GCMESH1 convention applies.
+          let src_oct = textureLoad(view_oct, texel, 0).xy;
+          acc_n += gcmesh_normal_decode(src_oct.x, src_oct.y);
         }
         break;
       }

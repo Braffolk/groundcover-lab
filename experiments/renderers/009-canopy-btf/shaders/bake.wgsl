@@ -4,6 +4,8 @@
 // depth = 1 - y/topH so the fragment nearest the (infinitely far) viewer wins.
 // MRT: target0 = albedo (a=1 marks a hit), target1 = (y/topH, oct normal, 0).
 
+#include "src/wgsl/gcmesh.wgsl"
+
 struct BakeU {
   dir: vec4f,   // xyz: bin direction (surface -> viewer), y > 0
   bmin: vec4f,  // xyz: mesh bounds min, w: tile size T (m)
@@ -21,19 +23,9 @@ struct VOut {
   @location(2) hy: f32,
 }
 
-fn oct_decode16(e: vec2f) -> vec3f {
-  let u = e.x * 2.0 - 1.0;
-  let v = e.y * 2.0 - 1.0;
-  var x = u;
-  var z = v;
-  let y = 1.0 - abs(u) - abs(v);
-  if (y < 0.0) {
-    x = (1.0 - abs(v)) * sign(u);
-    z = (1.0 - abs(u)) * sign(v);
-  }
-  return normalize(vec3f(x, y, z));
-}
-
+// This experiment's OWN encoding for the attr target (y-derived), decoded by
+// oct_decode8() in canopy.wgsl and octDecode() in bake.ts — a matched triple,
+// unrelated to the GCMESH1 source convention.
 fn oct_encode(n: vec3f) -> vec2f {
   let s = abs(n.x) + abs(n.y) + abs(n.z);
   var x = n.x / s;
@@ -55,7 +47,6 @@ fn vs(
 ) -> VOut {
   let p = bu.bmin.xyz + (vec3f(vec3u(a.xyz)) / 65535.0) * (bu.bmax.xyz - bu.bmin.xyz);
   let color = vec3f(f32(a.w), f32(b.x), f32(b.y)) / 65535.0;
-  let oct = vec2f(f32(b.z), f32(b.w)) / 65535.0;
 
   let tr = inst[ii];
   let c = cos(tr.z);
@@ -63,7 +54,7 @@ fn vs(
   let ps = p * tr.w;
   let w = vec3f(c * ps.x + s * ps.z, ps.y, -s * ps.x + c * ps.z) + vec3f(tr.x, 0.0, tr.y);
 
-  let n0 = oct_decode16(oct);
+  let n0 = gcmesh_normal_decode_u16(b.z, b.w);
   let nr = vec3f(c * n0.x + s * n0.z, n0.y, -s * n0.x + c * n0.z);
 
   let T = bu.bmin.w;

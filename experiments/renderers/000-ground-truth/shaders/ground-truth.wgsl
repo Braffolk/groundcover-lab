@@ -1,6 +1,8 @@
 #include "src/wgsl/terrain.wgsl"
 #include "src/wgsl/wind.wgsl"
 #include "src/wgsl/lighting.wgsl"
+#include "src/wgsl/debug.wgsl"
+#include "src/wgsl/gcmesh.wgsl"
 
 struct Params {
   bounds_min: vec3f,
@@ -18,17 +20,6 @@ struct VOut {
   @location(0) color: vec3f,
   @location(1) normal: vec3f,
   @location(2) world: vec3f,
-}
-
-fn oct_decode(e: vec2f) -> vec3f {
-  let f = e * 2.0 - 1.0;
-  var n = vec3f(f.x, 1.0 - abs(f.x) - abs(f.y), f.y);
-  if (n.y < 0.0) {
-    let sx = select(-1.0, 1.0, f.x >= 0.0);
-    let sz = select(-1.0, 1.0, f.y >= 0.0);
-    n = vec3f((1.0 - abs(f.y)) * sx, n.y, (1.0 - abs(f.x)) * sz);
-  }
-  return normalize(n);
 }
 
 @vertex
@@ -56,7 +47,7 @@ fn vs_main(
   var out: VOut;
   out.pos = frame.view_proj * vec4f(world, 1.0);
   out.color = vec3f(f32(a0.w), f32(a1.x), f32(a1.y)) / 65535.0;
-  out.normal = oct_decode(vec2f(f32(a1.z), f32(a1.w)) / 65535.0);
+  out.normal = gcmesh_normal_decode_u16(a1.z, a1.w);
   out.world = world;
   return out;
 }
@@ -70,6 +61,9 @@ fn fs_main(in: VOut) -> @location(0) vec4f {
     n = -n;
   }
   var color = light_surface(in.color, n, in.world);
-  color = apply_fog(color, in.world);
-  return vec4f(color, 1.0);
+  // Fog only in the normal view — debug views stay unfogged and honest.
+  if (debug_mode() == DEBUG_OFF) {
+    color = apply_fog(color, in.world);
+  }
+  return vec4f(debug_shade(color, in.color, n, 1.0, in.world), 1.0);
 }

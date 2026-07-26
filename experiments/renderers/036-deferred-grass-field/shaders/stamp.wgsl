@@ -10,6 +10,8 @@
 // The plant is pre-rotated by a quantised yaw, so stage B can place any plant
 // of that yaw at any azimuth by rotating the stamp rect (see composite.wgsl).
 
+#include "src/wgsl/gcmesh.wgsl"
+
 struct StampCfg {
   // Sheared-ortho rect in the plant's local frame (metres, origin = plant).
   rect: vec4f,          // u0, u1, v0, v1
@@ -26,17 +28,6 @@ struct VOut {
   @location(0) albedo: vec3f,
   @location(1) normal: vec3f,
   @location(2) h01: f32,
-}
-
-fn oct_decode(u: f32, v: f32) -> vec3f {
-  var x = u;
-  var z = v;
-  let y = 1.0 - abs(u) - abs(v);
-  if (y < 0.0) {
-    x = (1.0 - abs(v)) * sign(u);
-    z = (1.0 - abs(u)) * sign(v);
-  }
-  return normalize(vec3f(x, y, z));
 }
 
 @vertex
@@ -64,7 +55,7 @@ fn vs(@location(0) a: vec4u, @location(1) b: vec4u) -> VOut {
   var out: VOut;
   out.pos = vec4f(ndc_x, ndc_y, depth, 1.0);
   out.albedo = vec3f(f32(a.w), f32(b.x), f32(b.y)) / 65535.0;
-  let n = oct_decode(f32(b.z) / 65535.0 * 2.0 - 1.0, f32(b.w) / 65535.0 * 2.0 - 1.0);
+  let n = gcmesh_normal_decode_u16(b.z, b.w);
   out.normal = vec3f(n.x * cy - n.z * sy, n.y, n.x * sy + n.z * cy);
   out.h01 = clamp(py * cfg.height.z, 0.0, 1.0);
   return out;

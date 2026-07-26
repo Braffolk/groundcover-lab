@@ -35,6 +35,9 @@ export {
 export {
   DEFAULT_PREVIEW_OBJECT,
   PREVIEW_OBJECTS,
+  PREVIEW_SHELL_FLOATS,
+  PREVIEW_SHELL_LAYOUT,
+  PREVIEW_SHELL_STRIDE,
   PREVIEW_VERTEX_FLOATS,
   PREVIEW_VERTEX_LAYOUT,
   PREVIEW_VERTEX_STRIDE,
@@ -43,6 +46,7 @@ export {
   type PreviewMesh,
   type PreviewObjectId,
   type PreviewScene,
+  type PreviewUvEdge,
 } from '../scene/preview.ts'
 
 /**
@@ -64,6 +68,9 @@ export {
   CHANNEL_COMPONENTS,
   DEFERRED_NODE_KINDS,
   MATERIALIZE_FORMAT,
+  PRISM_MAX_REFINE,
+  PRISM_MAX_SHADOW_STEPS,
+  PRISM_MAX_STEPS,
   MATERIAL_FIRST_TEXTURE_BINDING,
   MATERIAL_SAMPLER_BINDING,
   MATERIAL_UNIFORM_BINDING,
@@ -212,7 +219,17 @@ export {
   type ReadRgba8Options,
 } from '../gpu/image.ts'
 
-export { GcMesh, parseGcMesh, type GcMeshHeader } from '../mesh/gcmesh.ts'
+/**
+ * Source-mesh access. `decodeGcMeshNormal()` (and `GcMesh.normalAt()`, which
+ * calls it) is the ONLY sanctioned GCMESH1 normal decode in TS; its WGSL twin is
+ * `#include "src/wgsl/gcmesh.wgsl"` → `gcmesh_normal_decode_u16()`. The
+ * convention is not the textbook one (stored pair is (x, y), reconstructed
+ * component is z), so a hand-rolled copy is wrong roughly 100% of the time —
+ * that is exactly how 40 hand-rolled copies across 36 experiments (plus the
+ * harness's own mesh inspector) ended up y-derived. Every one is gone; keep it
+ * that way.
+ */
+export { GcMesh, parseGcMesh, decodeGcMeshNormal, type GcMeshHeader } from '../mesh/gcmesh.ts'
 export { MeshCatalog, type MeshInfo } from '../mesh/catalog.ts'
 
 export { bakedArtifact, commitBake, type BakeContext, type BakeExt } from '../bake/io.ts'

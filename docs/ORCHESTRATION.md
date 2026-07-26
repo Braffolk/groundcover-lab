@@ -125,46 +125,91 @@ recurring hazard, not the carpet specifics.
    "bit-identical twins" invariant was simply false for carpets. Now recorded as
    a deliberate non-fix in a `@deprecated` comment at both sites.
 2. ~~**`carpetScale()` is not exported from `@harness`.**~~ Same reason.
-4. **SETTLED (2026-07-26), and the shared decoder IS wrong.** Measured directly
-   against geometry, which needs no convention at all: decode the stored pair
-   three ways and compare each to the face normal computed from raw dequantized
-   POSITIONS, over 217,113 triangles sampled with a stride across the whole
-   calamagrostis mesh (a prefix would be one corner of one plant).
+4. **FIXED (2026-07-26).** The GCMESH1 octahedral source normal is **(x, y)
+   stored, z reconstructed, NOT negated**. `src/mesh/gcmesh.ts`
+   (`decodeGcMeshNormal`, which `normalAt` now calls) and its WGSL twin
+   `src/wgsl/gcmesh.wgsl` (`gcmesh_normal_decode` / `_u16`) are the only two
+   places it lives; **36 experiment ids** now read a source normal through one of
+   them (38 shader `#include`s + 4 TS call sites) and **40 hand-rolled y-derived
+   copies are gone** — 36 WGSL `oct_decode*` in experiment bakes, 4 in TS bakes,
+   and one in the harness's own mesh inspector, which is where "validated
+   visually" had been claimed. Re-measure with `tools/probe-oct-normal.ts
+   [species]`; all figures below reproduce exactly as of 2026-07-26.
+
+   AXIS — decode the stored pair three ways and compare to the face normal from
+   raw dequantized POSITIONS, which needs no convention at all, over 217,113
+   triangles strided across the whole mesh (a prefix is one corner of one plant):
 
    | derived axis | mean \|cos\| | mean cos | |
    |---|---|---|---|
    | x | 0.4225 | 0.0049 | |
-   | **y** | 0.5354 | −0.2683 | what `GcMesh.normalAt()` does |
-   | **z** | **0.7871** | −0.7309 | what 004-raycast-lut claimed |
+   | **y** | 0.5354 | −0.2683 | what `GcMesh.normalAt()` used to do |
+   | **z** | **0.7871** | −0.7309 | correct |
 
-   Z-derived wins decisively, independently reproducing 004's 0.75-vs-0.57. A
-   vertex normal is a smoothed average, so |cos| below 1 is expected even when
-   right; 0.79 against 0.54 is not ambiguous.
+   Z wins decisively, independently reproducing 004-raycast-lut's 0.75-vs-0.57,
+   and wins by more on the other two species (0.85 elymus, 0.94 poa). A vertex
+   normal is a smoothed average, so |cos| below 1 is expected even when right.
 
-   Note the SIGN: mean cos is −0.73, i.e. the decoded normal is antiparallel to
-   the face normal under a counter-clockwise winding assumption. Flip the
-   winding and it is +0.73. So a consumer needs the axis AND the sign, and this
-   repo has already been bitten once by winding (the terrain was inverted early
-   on).
+   SIGN — **do not take it from that mean signed cos, and this is the trap.** It
+   only means something if the CCW cross product points out of the surface, and:
+   the same figure is −0.73 on calamagrostis but **+0.71 on elymus and +0.89 on
+   poa**, so the three meshes are not wound alike; the signed-volume test that
+   would settle winding is invalid because all three are OPEN shells (translate
+   the mesh and the "volume" moves, by 330x on calamagrostis); and the
+   topmost-vertex-per-column test that appears to confirm it is near-random on
+   calamagrostis (mean |n.y| 0.08) and says the OPPOSITE on elymus, where it is
+   unambiguous (mean |n.y| 0.72, 93.5% facing up un-negated). A first pass
+   negated on that evidence and inverted every source normal in the repo.
 
-   **Deliberately NOT fixed unilaterally.** `normalAt` and its WGSL twin feed the
-   bakes of at least ten experiments; correcting it changes the appearance of
-   every one of them and invalidates committed artifacts. That is an owner
-   decision, not a background cleanup. Reproduce with
-   `scratchpad/oct-normal-test.ts`.
+   What settles it is occlusion, which assumes nothing about winding,
+   closedness or up: a surface has material on ONE side, so fire a 4 mm ray from
+   a vertex along +n and −n, skipping its own triangles. +n hits geometry 65% /
+   60% / 58% of the time versus −n's 77% / 93% / 69% (calamagrostis / elymus /
+   poa) and has the greater free space on all three. +n is outward. Visually the
+   same thing shows in the mesh inspector's single-sided `lit` mode: the tile's
+   own one-sided ground slab, which must face up, goes black when negated.
 
-   ~~OPEN QUESTION: the GCMESH1 octahedral normal convention may be wrong in
-   shared code.~~ Two independent agents measured this. `GcMesh.normalAt()`
-   (`src/mesh/gcmesh.ts`, commented "validated visually in the mesh inspector")
-   derives **Y** from the two stored components; `experiments/renderers/004-raycast-lut/
-   shaders/rayfield-common.wgsl` applies a y↔z swap and reports measuring the decoded
-   normals against face normals computed from raw vertex positions — mean |cos|
-   **0.75 for a z-derived reading vs 0.57 for the y-derived one**. If that holds,
-   every experiment using the shared decoder has subtly wrong normals, and
-   `mesh/README.md` documents only "octahedral normal U/V" without stating which.
-   The new `src/gpu/texture.ts` deliberately matched `gcmesh.ts` rather than
-   silently picking a side. Worth settling with a direct test: decode both ways
-   and compare against face normals over a large triangle sample.
+   Consequences that were part of the fix: `mesh/baked/**` was wiped except 004,
+   014, 025 and 034 (provably convention-independent), and `src/bake/io.ts` now
+   carries a `SHARED_BAKE_REV` in the OPFS cache key so a future shared-decoder
+   change invalidates every browser's cache instead of silently serving stale
+   bytes. An experiment's own `bakeVersion` cannot express a harness change.
+
+   VERIFIED VISUALLY, and this is the part worth keeping. The decisive picture is
+   `000-ground-truth`, which draws the raw mesh with real per-vertex normals and
+   no bake in between. Rendering it twice — once normally, once with the old
+   y-derived decode patched back in at `createShaderModule` so no file had to move
+   — and measuring `debug=normals` on the 112k pixels that differ: **mean |n.y|
+   0.60 -> 0.26**, and the share of plant pixels whose normal is near-horizontal
+   **46% -> 93%** (`cam=inside-plant`; from `carpet-close`, 52% -> 91%). A
+   near-vertical grass blade's face normal *must* be near-horizontal, and the old
+   decode had a quarter to a half of the canopy claiming it faced straight up or
+   straight down. In `debug=off` the old decode's blown-out yellow-green blades
+   and pitch-black neighbours become a coherent mid-green.
+   Fleet-wide, `debug=lighting` at `cam=grazing`: the share of plant pixels at a
+   light term of ~1.0 (blown out) fell in **36 of 40** renderers, often hugely —
+   037 98%->42%, 038 78%->30%, 006 33%->7%, 005 38%->11%, 017 15%->2%,
+   001 20%->5%. It ROSE in two, and that is a genuine finding rather than a
+   measurement artefact: **007-basis-opacity 49%->59%** and
+   **010-chord-frustum 52%->54%** (band means +14 and +13). Both AGGREGATE many
+   source normals into one vector, and correct near-horizontal normals from
+   two-sided foliage cancel far more completely than the old scrambled ones did —
+   so 010 hits its `length(n) < 1e-3 -> vec3f(0,1,0)` fallback much more often
+   (a degenerate normal answered with "fully lit"), and 007 never flips normals
+   toward the capture axis before its basis fit, unlike every other bake in the
+   repo. Written up in both NOTES; neither is a decode problem and neither was
+   fixed here, because both are method changes needing a rebake and their own
+   visual pass.
+   Bake staleness was closed on both sides and checked, not assumed. Disk: every
+   artifact was re-baked, and for one TS-decode bake (002) and one GPU-shader bake
+   (011) a forced re-bake with `mesh/baked` 404ed and OPFS empty reproduced the
+   committed files **byte-identically**. OPFS: seeding a cache with `r1__…` and
+   un-prefixed legacy entries and then loading an experiment evicts all of them
+   and leaves only `r2__…`. Note the gap this exposed — **`017-cached-clusters`
+   fetches `mesh/baked/` itself instead of going through `bakedArtifact()`**, so
+   it is outside `SHARED_BAKE_REV` entirely; it happens to be safe because it also
+   never populates OPFS, but a future shared-decoder bump will not reach anything
+   that hand-rolls that fetch.
 
 3. **The drawn ground is not the sampled ground.** STILL LIVE and still worth
    fixing — it has nothing to do with carpets. `basePass.ts` draws

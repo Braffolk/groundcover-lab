@@ -15,8 +15,8 @@ fn rf_sgn(x: f32) -> f32 {
   return select(-1.0, 1.0, x >= 0.0);
 }
 
-// Full-sphere octahedral direction <-> [0,1]^2. Same fold as the GCMESH1
-// normal encoding, so one decoder serves both directions and baked normals.
+// Full-sphere octahedral direction <-> [0,1]^2. Same FOLD as the GCMESH1 normal
+// encoding, but a different axis assignment and sign — see rf_mesh_normal().
 fn rf_oct_encode(d: vec3f) -> vec2f {
   let n = d / (abs(d.x) + abs(d.y) + abs(d.z));
   var e = n.xz;
@@ -36,23 +36,22 @@ fn rf_oct_decode(e: vec2f) -> vec3f {
 }
 
 /**
- * Baked MESH normal from the atlas' oct pair. GCMESH1 stores the standard
- * octahedral encoding — (u, v) = (n.x, n.y) with n.z derived as 1-|u|-|v| —
- * while rf_oct_decode() (which also serves the view directions, where the
- * encode/decode pair is self-consistent and the convention is free) derives the
- * Y component instead. The two differ by exactly a y<->z swap, verified against
- * face normals computed from raw vertex positions: mean |cos| to the geometric
- * normal is 0.75 for the (x,y)+z convention vs 0.57 for (x,z)+y (sphagnum,
- * 120k vertex samples).
+ * Baked MESH normal from the atlas' oct pair.
+ *
+ * The atlas holds the SOURCE pair, averaged and re-encoded by the bake's
+ * downsample with rf_oct_decode()/rf_oct_encode() — i.e. in rf's own (x,z)+y
+ * frame. GCMESH1's convention (src/wgsl/gcmesh.wgsl, measured) is (x,y)+z, so
+ * undoing the difference here is exactly one y<->z swap. A swap is a linear
+ * isometry, so it commutes with the bake's averaging: this is exact and needs
+ * no rebake.
+ *
+ * rf_oct_decode() itself stays as it is — it also decodes the view directions,
+ * where the encode/decode pair is self-consistent and the convention is free.
  *
  * Consequence of getting this wrong, for the record: a straight-down view of the
  * moss returned a mean normal of (0, 0.05, 0.97) — horizontal — instead of up,
  * so the mat lit as if every capitulum faced sideways, and the scatter's 90
  * degree tile rotations turned that into a hard chequerboard.
- *
- * The swap is an isometry, so it commutes with the bake's normal averaging and
- * needs no rebake: the atlas holds swap(true mean normal), and swapping back
- * here is exact.
  */
 fn rf_mesh_normal(e: vec2f) -> vec3f {
   let n = rf_oct_decode(e);

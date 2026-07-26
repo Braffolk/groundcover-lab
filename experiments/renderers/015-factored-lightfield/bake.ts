@@ -1,5 +1,5 @@
 import bakeShaderSrc from './shaders/bake.wgsl'
-import { bakedArtifact, commitBake, type ExperimentContext, type GcMesh } from '@harness'
+import { bakedArtifact, commitBake, decodeGcMeshNormal, type ExperimentContext, type GcMesh } from '@harness'
 import type { PARAMS } from './manifest.ts'
 
 /**
@@ -140,6 +140,7 @@ function bakeVolumes(mesh: GcMesh): Volumes {
   let acc = new Float32Array(n * ACC)
   const verts = mesh.vertices
   const count = mesh.header.vertexCount
+  const nrm: V3 = [0, 0, 0]
   let sumR = 0
   let sumG = 0
   let sumB = 0
@@ -154,24 +155,15 @@ function bakeVolumes(mesh: GcMesh): Volumes {
     const r = verts[b + 3]! / 65535
     const g = verts[b + 4]! / 65535
     const bl = verts[b + 5]! / 65535
-    // Octahedral normal decode (mirrors GcMesh.normalAt, allocation-free).
-    const ou = (verts[b + 6]! / 65535) * 2 - 1
-    const ov = (verts[b + 7]! / 65535) * 2 - 1
-    let nx = ou
-    let nz = ov
-    const nyRaw = 1 - Math.abs(ou) - Math.abs(ov)
-    if (nyRaw < 0) {
-      nx = (1 - Math.abs(ov)) * Math.sign(ou)
-      nz = (1 - Math.abs(ou)) * Math.sign(ov)
-    }
-    const nl = Math.hypot(nx, nyRaw, nz) || 1
+    // Source vertex normal — the shared decoder, allocation-free via `nrm`.
+    decodeGcMeshNormal(verts[b + 6]!, verts[b + 7]!, nrm)
     const lum = 0.299 * r + 0.587 * g + 0.114 * bl
     acc[o] = acc[o]! + r
     acc[o + 1] = acc[o + 1]! + g
     acc[o + 2] = acc[o + 2]! + bl
-    acc[o + 3] = acc[o + 3]! + nx / nl
-    acc[o + 4] = acc[o + 4]! + nyRaw / nl
-    acc[o + 5] = acc[o + 5]! + nz / nl
+    acc[o + 3] = acc[o + 3]! + nrm[0]
+    acc[o + 4] = acc[o + 4]! + nrm[1]
+    acc[o + 5] = acc[o + 5]! + nrm[2]
     acc[o + 6] = acc[o + 6]! + 1
     acc[o + 7] = acc[o + 7]! + lum
     acc[o + 8] = acc[o + 8]! + lum * lum

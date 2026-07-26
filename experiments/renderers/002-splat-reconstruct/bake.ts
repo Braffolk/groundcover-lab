@@ -1,4 +1,4 @@
-import type { GcMesh } from '@harness'
+import { decodeGcMeshNormal, type GcMesh } from '@harness'
 
 /**
  * Bake: source mesh (millions of tris) -> a few thousand anisotropic
@@ -203,6 +203,7 @@ export function bakeSpeciesSplats(mesh: GcMesh): ArrayBuffer {
   // --- One decoding pass accumulating all LOD levels -----------------------
   const acc = LOD_COUNTS.map((k) => new Float64Array(k * ACC_STRIDE))
   const step = Math.max(1, Math.floor(n / 2_000_000))
+  const nrm: [number, number, number] = [0, 0, 0]
   for (let r = 0; r < n; r += step) {
     const i = order[r]!
     const b = i * 8
@@ -212,20 +213,10 @@ export function bakeSpeciesSplats(mesh: GcMesh): ArrayBuffer {
     const cr = verts[b + 3]! / 65535
     const cg = verts[b + 4]! / 65535
     const cb = verts[b + 5]! / 65535
-    // Octahedral decode (y-up), matching GcMesh.normalAt.
-    const ou = (verts[b + 6]! / 65535) * 2 - 1
-    const ov = (verts[b + 7]! / 65535) * 2 - 1
-    let nx = ou
-    let nz = ov
-    let ny = 1 - Math.abs(ou) - Math.abs(ov)
-    if (ny < 0) {
-      nx = (1 - Math.abs(ov)) * (ou >= 0 ? 1 : -1)
-      nz = (1 - Math.abs(ou)) * (ov >= 0 ? 1 : -1)
-    }
-    const nl = Math.hypot(nx, ny, nz) || 1
-    nx /= nl
-    ny /= nl
-    nz /= nl
+    decodeGcMeshNormal(verts[b + 6]!, verts[b + 7]!, nrm)
+    const nx = nrm[0]
+    const ny = nrm[1]
+    const nz = nrm[2]
     const lum = 0.299 * cr + 0.587 * cg + 0.114 * cb
     for (let L = 0; L < LOD_LEVELS; L++) {
       const k = LOD_COUNTS[L]!

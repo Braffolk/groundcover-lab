@@ -318,6 +318,16 @@ needs no rebake. `debug=normals` at `carpet-close` is now green (up) with
 per-capitulum variation, and the chequerboard is gone from every view.
 Note this also affected all three grasses, so `default` lighting is fixed too.
 
+The swap was the whole of it, and one intermediate claim here was wrong: a first
+pass concluded from winding that the decode also had to be **negated**, and this
+file said so. `tools/probe-oct-normal.ts` settled it the other way — the meshes
+are open shells and are not even wound alike, so winding proves nothing, while a
+4 mm ray fired along ±n from sampled vertices finds material on the −n side on
+all three species. So **+n is outward and there is no negation**, and
+`rf_mesh_normal()` is a plain y↔z swap with no sign flip. The swap is an
+isometry, so it commutes with the bake's normal averaging and needs no rebake —
+which is why 004's committed atlas survived the repo-wide wipe.
+
 ### Normal-field LOD (the one deliberate cheat)
 
 A carpet texel is 2-5 mm, so past a few metres it is subpixel and the single

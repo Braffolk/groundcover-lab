@@ -17,6 +17,8 @@
 // the one CLOSEST to the capture camera — i.e. exactly the front surface whose
 // height the runtime warp needs.
 
+#include "src/wgsl/gcmesh.wgsl"
+
 struct BakeView {
   r_axis: vec4f, // xyz = R, w = ru
   v_axis: vec4f, // xyz = V, w = rv
@@ -34,31 +36,18 @@ struct VOut {
   @location(2) height: f32,
 }
 
-// Octahedral decode, y-primary — mirrors GcMesh.normalAt() in gcmesh.ts.
-fn oct_decode_mesh(e: vec2f) -> vec3f {
-  var x = e.x;
-  var z = e.y;
-  let y = 1.0 - abs(e.x) - abs(e.y);
-  if (y < 0.0) {
-    x = (1.0 - abs(e.y)) * select(-1.0, 1.0, e.x >= 0.0);
-    z = (1.0 - abs(e.x)) * select(-1.0, 1.0, e.y >= 0.0);
-  }
-  return normalize(vec3f(x, y, z));
-}
-
 @vertex
 fn vs(@location(0) q_pos: vec4<u32>, @location(1) q_attr: vec4<u32>) -> VOut {
   // Vertex record: [x y z r] [g b octU octV], all u16 UNORM against bounds.
   let p = bake_view.b_min.xyz + (vec3f(vec3<u32>(q_pos.xyz)) / 65535.0) * bake_view.b_range.xyz;
   let color = vec3f(f32(q_pos.w), f32(q_attr.x), f32(q_attr.y)) / 65535.0;
-  let oct = (vec2f(f32(q_attr.z), f32(q_attr.w)) / 65535.0) * 2.0 - 1.0;
 
   let off = p - bake_view.origin.xyz;
   let u = dot(off, bake_view.r_axis.xyz) / bake_view.r_axis.w;
   let v = -dot(off, bake_view.v_axis.xyz) / bake_view.v_axis.w;
   let s = clamp(0.5 + 0.5 * dot(off, bake_view.f_axis.xyz) / bake_view.f_axis.w, 0.0, 1.0);
 
-  var n = oct_decode_mesh(oct);
+  var n = gcmesh_normal_decode_u16(q_attr.z, q_attr.w);
   if (dot(n, bake_view.f_axis.xyz) < 0.0) {
     n = -n;
   }

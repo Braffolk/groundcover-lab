@@ -104,22 +104,6 @@ interface PointCloud {
   cb: Float32Array
 }
 
-function octDecode(u16u: number, u16v: number, out: [number, number, number]): void {
-  const u = (u16u / 65535) * 2 - 1
-  const v = (u16v / 65535) * 2 - 1
-  let x = u
-  let z = v
-  const y = 1 - Math.abs(u) - Math.abs(v)
-  if (y < 0) {
-    x = (1 - Math.abs(v)) * Math.sign(u)
-    z = (1 - Math.abs(u)) * Math.sign(v)
-  }
-  const len = Math.hypot(x, y, z) || 1
-  out[0] = x / len
-  out[1] = y / len
-  out[2] = z / len
-}
-
 /** Deterministic LCG so bakes are byte-reproducible. */
 function makeRng(seed: number): () => number {
   let s = seed >>> 0
@@ -225,9 +209,8 @@ function samplePoints(mesh: GcMesh, cx: number, cz: number): PointCloud {
       out.cb[i] = cb
     }
   }
-  // Silence the "unused" path: normals come from PCA, not the mesh, because a
+  // No vertex normals are read: they come from PCA, not the mesh, because a
   // two-sided thin blade averages its own normals to ~zero.
-  void octDecode
   return out
 }
 

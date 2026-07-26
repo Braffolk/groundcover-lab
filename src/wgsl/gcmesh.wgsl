@@ -5,14 +5,18 @@
 // lighting that looks plausible rather than broken, which is how the wrong
 // version survived for months:
 //
-//   the stored pair is (x, y), the RECONSTRUCTED component is Z, and the result
-//   is NEGATED.
+//   the stored pair is (x, y) and the RECONSTRUCTED component is Z, positive.
 //
-// Measured, not assumed — decoding three ways and comparing against face
+// Measured, not assumed. AXIS: decoding three ways and comparing against face
 // normals computed from raw dequantized POSITIONS over 217,113 triangles gives
-// mean |cos| 0.4225 (x-derived) / 0.5354 (y-derived) / 0.7871 (z-derived), and
-// two independent sign tests both say negate. See tools/probe-oct-normal.ts and
-// the "Harness bugs" section of docs/ORCHESTRATION.md.
+// mean |cos| 0.4225 (x-derived) / 0.5354 (y-derived) / 0.7871 (z-derived), and z
+// wins by more still on the other two species (0.85, 0.94). SIGN: not from the
+// winding — the meshes are open shells and are not even wound alike (mean signed
+// cos -0.73 / +0.71 / +0.89) — but from a 4mm ray fired along +n and -n from
+// every sampled vertex, skipping its own triangles. A surface has material on one
+// side only, and on all three meshes that side is -n, so +n is outward and there
+// is no negation. See tools/probe-oct-normal.ts and the "Harness bugs" section
+// of docs/ORCHESTRATION.md.
 //
 // This applies to SOURCE mesh normals only. A bake that encodes its own
 // octahedral normals and decodes them with its own matching pair is
@@ -29,7 +33,7 @@ fn gcmesh_normal_decode(u01: f32, v01: f32) -> vec3f {
     x = (1.0 - abs(v)) * select(-1.0, 1.0, u >= 0.0);
     y = (1.0 - abs(u)) * select(-1.0, 1.0, v >= 0.0);
   }
-  return -normalize(vec3f(x, y, z));
+  return normalize(vec3f(x, y, z));
 }
 
 /// Same, from the raw u16 pair as stored in the vertex record.

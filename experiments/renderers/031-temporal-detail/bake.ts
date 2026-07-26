@@ -680,7 +680,10 @@ function coverageBoxes(albedo: Uint8Array): TileBox[] {
   return out
 }
 
-/** Octahedral encode, y-primary — exact inverse of the decode in gcmesh.ts. */
+/**
+ * Octahedral encode, y-primary — this atlas's OWN convention, the exact inverse
+ * of `oct_decode` in mipgen.wgsl and `oct_decode_card` in cards.wgsl.
+ */
 function octEncode(x: number, y: number, z: number): [number, number] {
   const s = Math.abs(x) + Math.abs(y) + Math.abs(z)
   let u: number

@@ -843,7 +843,7 @@ function postProcess(bigAlb: Uint8Array, bigNrm: Uint8Array, bpr: number, layout
   }
 }
 
-/** Octahedral encode, y-primary — exact inverse of the decode in gcmesh.ts. */
+/** Octahedral encode, y-primary — exact inverse of `world_normal` in cards.wgsl. */
 function octEncode(x: number, y: number, z: number): [number, number] {
   const s = Math.abs(x) + Math.abs(y) + Math.abs(z)
   let u: number

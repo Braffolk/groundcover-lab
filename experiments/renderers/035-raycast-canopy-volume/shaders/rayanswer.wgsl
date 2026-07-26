@@ -114,7 +114,10 @@ fn march(e: vec2f, sdir: vec2f) -> MarchOut {
   return out;
 }
 
-/** Octahedral encode, y-primary — exact inverse of the gcmesh.ts decode. */
+/**
+ * Octahedral encode, y-primary — the ray table's OWN convention, matched by
+ * `oct_decode` in mipgen.wgsl and canopy.wgsl.
+ */
 fn oct_encode(n: vec3f) -> vec2f {
   let s = abs(n.x) + abs(n.y) + abs(n.z);
   if (s < 1.0e-6) { return vec2f(0.0); }

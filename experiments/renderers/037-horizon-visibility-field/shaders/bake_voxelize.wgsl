@@ -15,6 +15,8 @@
 // The tile is periodic: xz voxel coordinates wrap, so plants that cross the
 // tile edge come back in on the other side and the baked table tiles seamlessly.
 
+#include "src/wgsl/gcmesh.wgsl"
+
 struct VoxParams {
   dims: vec3u,          // (nx, ny, nz) — nx == nz == tile voxels, ny == height voxels
   tri_count: u32,
@@ -60,19 +62,11 @@ fn load_vertex(i: u32) -> Vtx {
   let w2 = verts[i * 3u + 2u];
   let q = vec3f(f32(w0 & 0xffffu), f32(w0 >> 16u), f32(w1 & 0xffffu)) / 65535.0;
   let c = vec3f(f32((w1 >> 16u) & 0xffu), f32((w1 >> 24u) & 0xffu), f32(w2 & 0xffu)) / 255.0;
-  let u = f32((w2 >> 8u) & 0xffu) / 255.0 * 2.0 - 1.0;
-  let v = f32((w2 >> 16u) & 0xffu) / 255.0 * 2.0 - 1.0;
-  var nx = u;
-  var nz = v;
-  let ny = 1.0 - abs(u) - abs(v);
-  if (ny < 0.0) {
-    nx = (1.0 - abs(v)) * select(-1.0, 1.0, u >= 0.0);
-    nz = (1.0 - abs(u)) * select(-1.0, 1.0, v >= 0.0);
-  }
   var out: Vtx;
   out.pos = vox.mesh_min + q * vox.mesh_extent;
   out.color = c;
-  out.normal = normalize(vec3f(nx, ny, nz));
+  // The repack kept the SOURCE octahedral pair, only requantized to 8 bits.
+  out.normal = gcmesh_normal_decode(f32((w2 >> 8u) & 0xffu) / 255.0, f32((w2 >> 16u) & 0xffu) / 255.0);
   return out;
 }
 

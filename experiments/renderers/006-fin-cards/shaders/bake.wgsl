@@ -12,6 +12,8 @@
 //
 // MRT: target0 = albedo(rgb) + coverage(a), target1 = mesh-local normal.
 
+#include "src/wgsl/gcmesh.wgsl"
+
 struct Tile {
   center: vec3f, inv_hu: f32,   // framing center; 1/half-extent along `right`
   right: vec3f, inv_hv: f32,    //                 1/half-extent along `up`
@@ -29,18 +31,6 @@ struct VOut {
   @location(2) mesh_y: f32,
 }
 
-// Standard octahedral normal decode — mirrors GcMesh.normalAt().
-fn oct_decode(e: vec2f) -> vec3f {
-  let y = 1.0 - abs(e.x) - abs(e.y);
-  var x = e.x;
-  var z = e.y;
-  if (y < 0.0) {
-    x = (1.0 - abs(e.y)) * sign(e.x);
-    z = (1.0 - abs(e.x)) * sign(e.y);
-  }
-  return normalize(vec3f(x, y, z));
-}
-
 @vertex
 fn vs(@location(0) a0: vec4<u32>, @location(1) a1: vec4<u32>) -> VOut {
   let q = vec3f(f32(a0.x), f32(a0.y), f32(a0.z)) / 65535.0;
@@ -55,8 +45,7 @@ fn vs(@location(0) a0: vec4<u32>, @location(1) a1: vec4<u32>) -> VOut {
   var o: VOut;
   o.pos = vec4f(cx, cy, cz, 1.0);
   o.color = vec3f(f32(a0.w), f32(a1.x), f32(a1.y)) / 65535.0;
-  let e = vec2f(f32(a1.z), f32(a1.w)) / 65535.0 * 2.0 - 1.0;
-  o.normal = oct_decode(e);
+  o.normal = gcmesh_normal_decode_u16(a1.z, a1.w);
   o.mesh_y = p.y;
   return o;
 }

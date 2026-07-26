@@ -79,7 +79,7 @@ fn hemioct_uv(d: vec3f) -> vec2f {
   return vec2f(n.x + n.z, n.z - n.x) * 0.5 + vec2f(0.5);
 }
 
-/** Octahedral normal decode, y-primary — matches GcMesh.normalAt(). */
+/** Octahedral normal decode, y-primary — matches this bake's own octEncode(). */
 fn oct_decode_y(e: vec2f) -> vec3f {
   var x = e.x;
   var z = e.y;

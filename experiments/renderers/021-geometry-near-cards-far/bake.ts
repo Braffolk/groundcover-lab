@@ -1074,7 +1074,7 @@ function processTile(
   return { albedo, nrmh, hLo, hMid, hHi }
 }
 
-/** Octahedral encode, y-primary — exact inverse of the decode in gcmesh.ts. */
+/** Octahedral encode, y-primary — exact inverse of `oct_decode_card` in plants.wgsl. */
 function octEncode(x: number, y: number, z: number): [number, number] {
   const s = Math.abs(x) + Math.abs(y) + Math.abs(z)
   let u: number

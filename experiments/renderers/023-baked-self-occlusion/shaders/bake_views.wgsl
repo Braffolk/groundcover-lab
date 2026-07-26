@@ -9,6 +9,8 @@
 //
 // No @group(0) frame include — the bake is self-contained.
 
+#include "src/wgsl/gcmesh.wgsl"
+
 struct ViewUni {
   r_axis: vec4f,   // xyz = tile right axis (plant-local), w = box centre x
   u_axis: vec4f,   // xyz = tile up axis, w = box centre y
@@ -27,24 +29,11 @@ struct VOut {
   @location(2) q_depth: f32,
 }
 
-// Octahedral decode, y-primary — mirrors GcMesh.normalAt().
-fn oct_decode_mesh(e: vec2f) -> vec3f {
-  var x = e.x;
-  var z = e.y;
-  let y = 1.0 - abs(e.x) - abs(e.y);
-  if (y < 0.0) {
-    x = (1.0 - abs(e.y)) * select(-1.0, 1.0, e.x >= 0.0);
-    z = (1.0 - abs(e.x)) * select(-1.0, 1.0, e.y >= 0.0);
-  }
-  return normalize(vec3f(x, y, z));
-}
-
 @vertex
 fn vs(@location(0) q_pos: vec4<u32>, @location(1) q_attr: vec4<u32>) -> VOut {
   // Vertex record: [x y z r] [g b octU octV], all u16 UNORM against bounds.
   let p = view_uni.b_min.xyz + (vec3f(vec3<u32>(q_pos.xyz)) / 65535.0) * view_uni.b_range.xyz;
   let color = vec3f(f32(q_pos.w), f32(q_attr.x), f32(q_attr.y)) / 65535.0;
-  let oct = (vec2f(f32(q_attr.z), f32(q_attr.w)) / 65535.0) * 2.0 - 1.0;
 
   let pl = p - view_uni.anchor.xyz;
   let xr = dot(pl, view_uni.r_axis.xyz);
@@ -52,7 +41,7 @@ fn vs(@location(0) q_pos: vec4<u32>, @location(1) q_attr: vec4<u32>) -> VOut {
   let dd = dot(pl, view_uni.b_axis.xyz);
   let q = clamp((view_uni.b_axis.w - dd) / view_uni.box.z, 0.0, 1.0);
 
-  var n = oct_decode_mesh(oct);
+  var n = gcmesh_normal_decode_u16(q_attr.z, q_attr.w);
   if (dot(n, view_uni.b_axis.xyz) < 0.0) {
     n = -n;
   }

@@ -1,4 +1,4 @@
-import type { GcMesh } from '@harness'
+import { decodeGcMeshNormal, type GcMesh } from '@harness'
 
 /**
  * Bake a GCMESH1 source mesh into a small 3D voxel volume ("SSV1"):
@@ -52,6 +52,12 @@ function chooseGrid(ext: [number, number, number]): [number, number, number] {
   return [64, 64, 64]
 }
 
+/**
+ * The artifact's OWN octahedral pair (tex1) — matched inverse of `octEncode`
+ * below, used only to read tex1 back in `buildAuxTexture`. Source-mesh vertex
+ * normals go through `decodeGcMeshNormal` instead; this convention is not that
+ * one and must not be used for them.
+ */
 function octDecode(u16u: number, u16v: number, out: [number, number, number]): void {
   const u = (u16u / 65535) * 2 - 1
   const v = (u16v / 65535) * 2 - 1
@@ -68,7 +74,7 @@ function octDecode(u16u: number, u16v: number, out: [number, number, number]): v
   out[2] = z / len
 }
 
-/** Standard octahedral encode — exact inverse family of GcMesh.normalAt. */
+/** Standard octahedral encode — exact inverse of `octDecode` above. */
 function octEncode(x: number, y: number, z: number): [number, number] {
   const l1 = Math.abs(x) + Math.abs(y) + Math.abs(z) || 1
   let px = x / l1
@@ -163,15 +169,15 @@ export function bakeVolume(mesh: GcMesh, tileSize: [number, number] | null): Vol
     const cr = (verts[i0 + 3]! + verts[i1 + 3]! + verts[i2 + 3]!) * q * (1 / 3)
     const cg = (verts[i0 + 4]! + verts[i1 + 4]! + verts[i2 + 4]!) * q * (1 / 3)
     const cb = (verts[i0 + 5]! + verts[i1 + 5]! + verts[i2 + 5]!) * q * (1 / 3)
-    octDecode(verts[i0 + 6]!, verts[i0 + 7]!, nrm)
+    decodeGcMeshNormal(verts[i0 + 6]!, verts[i0 + 7]!, nrm)
     let nvx = nrm[0]
     let nvy = nrm[1]
     let nvz = nrm[2]
-    octDecode(verts[i1 + 6]!, verts[i1 + 7]!, nrm)
+    decodeGcMeshNormal(verts[i1 + 6]!, verts[i1 + 7]!, nrm)
     nvx += nrm[0]
     nvy += nrm[1]
     nvz += nrm[2]
-    octDecode(verts[i2 + 6]!, verts[i2 + 7]!, nrm)
+    decodeGcMeshNormal(verts[i2 + 6]!, verts[i2 + 7]!, nrm)
     nvx += nrm[0]
     nvy += nrm[1]
     nvz += nrm[2]

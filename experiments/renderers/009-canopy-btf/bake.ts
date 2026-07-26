@@ -81,7 +81,11 @@ function hemioctDecode(ex: number, ey: number): V3 {
   return norm3([u, y, w])
 }
 
-/** Full-sphere octahedral decode — twin of GcMesh.normalAt(). */
+/**
+ * Full-sphere octahedral decode of THIS experiment's attr-target normals —
+ * the twin of octEncode() below and of oct_encode() in shaders/bake.wgsl, not of
+ * the GCMESH1 source convention (see src/wgsl/gcmesh.wgsl for that).
+ */
 function octDecode(u01: number, v01: number, out: V3): V3 {
   const u = u01 * 2 - 1
   const v = v01 * 2 - 1

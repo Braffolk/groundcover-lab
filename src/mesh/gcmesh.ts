@@ -48,41 +48,11 @@ export class GcMesh {
   }
 
   /**
-   * Octahedral decode for GCMESH1 source normals.
-   *
-   * The stored pair is (x, y) and the RECONSTRUCTED component is **z**, and the
-   * result is **negated**. Both facts were measured, not assumed, because this
-   * decoder was wrong for months in a way that looked merely "a bit off":
-   *
-   * - Axis: decoding three ways and comparing against face normals computed from
-   *   raw dequantized positions (which involve no convention at all), over
-   *   217,113 triangles sampled across the whole calamagrostis mesh, gives mean
-   *   |cos| of 0.4225 (x-derived), 0.5354 (y-derived — what this function used to
-   *   do) and 0.7871 (z-derived). A vertex normal is a smoothed average so |cos|
-   *   is well under 1 even when right; 0.79 against 0.54 is not ambiguous.
-   * - Sign: mean SIGNED cos against those face normals is -0.73, and separately,
-   *   the topmost vertex in each 4mm xz column — geometry that is by definition
-   *   seen from above and cannot be two-sided — decodes to mean n.y -0.088 with
-   *   only 33.7% facing up. Two independent tests, same answer.
-   *
-   * Re-run `tools/probe-oct-normal.ts` rather than trusting this comment.
+   * Octahedral decode for GCMESH1 source normals. See `decodeGcMeshNormal`.
    */
   normalAt(i: number, out: [number, number, number] = [0, 0, 0]): [number, number, number] {
     const base = i * 8 + 6
-    const u = (this.vertices[base]! / 65535) * 2 - 1
-    const v = (this.vertices[base + 1]! / 65535) * 2 - 1
-    let x = u
-    let y = v
-    const z = 1 - Math.abs(u) - Math.abs(v)
-    if (z < 0) {
-      x = (1 - Math.abs(v)) * Math.sign(u)
-      y = (1 - Math.abs(u)) * Math.sign(v)
-    }
-    const len = Math.hypot(x, y, z) || 1
-    out[0] = -x / len
-    out[1] = -y / len
-    out[2] = -z / len
-    return out
+    return decodeGcMeshNormal(this.vertices[base]!, this.vertices[base + 1]!, out)
   }
 
   /** Tightly-packed 3-per-triangle index array (pad u32 stripped), cached. */
@@ -99,6 +69,60 @@ export class GcMesh {
     }
     return this.packedIndices
   }
+}
+
+/**
+ * Decode one GCMESH1 octahedral normal from its two raw u16 components — the TS
+ * twin of `gcmesh_normal_decode_u16()` in src/wgsl/gcmesh.wgsl, and the single
+ * place the convention lives on this side. Allocation-free with `out`, so a bake
+ * looping over two million vertices can call it instead of copying the
+ * arithmetic. Copies are exactly how the wrong convention survived: **40** of
+ * them (36 WGSL `oct_decode*` in experiment bakes, one in the harness's own mesh
+ * inspector, and 4 in TS bakes), all y-derived, and not one would have been
+ * reached by fixing `normalAt` alone. 36 experiment ids read the source normal
+ * through this function or its WGSL twin now, and nothing else may.
+ *
+ * **The stored pair is (x, y) and the reconstructed component is z, positive.**
+ * Both halves were measured, and the sign took two attempts:
+ *
+ * - AXIS. Decode three ways and compare against face normals computed from raw
+ *   dequantized positions (no convention involved) over 217,113 triangles: mean
+ *   |cos| 0.4225 x-derived, 0.5354 y-derived (what this used to do), 0.7871
+ *   z-derived. On the other two species z-derived wins 0.85 and 0.94. A vertex
+ *   normal is a smoothed average, so |cos| stays under 1 even when right;
+ *   0.79 against 0.54 is not ambiguous.
+ * - SIGN. Do NOT take it from the winding: the mean SIGNED cos against those
+ *   face normals is -0.73 on calamagrostis but +0.71 on elymus and +0.89 on poa,
+ *   so the three meshes are not wound alike, and the signed-volume test that
+ *   would settle winding is meaningless here because all three are OPEN shells
+ *   (their signed volume moves when you translate the mesh). Settle it on
+ *   geometry instead: fire a 4 mm ray from a vertex along +n and -n, skipping
+ *   the triangles that touch it. A surface has material on one side only, so the
+ *   outward normal is the one with free space ahead. +n hits geometry 65/60/58%
+ *   of the time against -n's 77/93/69% (calamagrostis/elymus/poa), and has the
+ *   greater free space on every mesh. +n is outward — do not negate.
+ *
+ * Re-run `tools/probe-oct-normal.ts` rather than trusting this comment.
+ */
+export function decodeGcMeshNormal(
+  nu16: number,
+  nv16: number,
+  out: [number, number, number] = [0, 0, 0],
+): [number, number, number] {
+  const u = (nu16 / 65535) * 2 - 1
+  const v = (nv16 / 65535) * 2 - 1
+  let x = u
+  let y = v
+  const z = 1 - Math.abs(u) - Math.abs(v)
+  if (z < 0) {
+    x = (1 - Math.abs(v)) * Math.sign(u)
+    y = (1 - Math.abs(u)) * Math.sign(v)
+  }
+  const len = Math.hypot(x, y, z) || 1
+  out[0] = x / len
+  out[1] = y / len
+  out[2] = z / len
+  return out
 }
 
 export function parseGcMesh(buffer: ArrayBuffer): GcMesh {

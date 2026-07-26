@@ -18,6 +18,8 @@
 // texels whose surface is at or above its own height, so the terraced stack
 // reconstructs the cushion the flat card cannot express.
 
+#include "src/wgsl/gcmesh.wgsl"
+
 struct TileView {
   b_min: vec4f,   // mesh bounds min (dequantization)
   b_range: vec4f, // mesh bounds max - min
@@ -32,18 +34,6 @@ struct VOut {
   @location(2) height: f32,
 }
 
-// Octahedral decode, y-primary — mirrors GcMesh.normalAt() in src/mesh/gcmesh.ts.
-fn oct_decode_mesh(e: vec2f) -> vec3f {
-  var x = e.x;
-  var z = e.y;
-  let y = 1.0 - abs(e.x) - abs(e.y);
-  if (y < 0.0) {
-    x = (1.0 - abs(e.y)) * select(-1.0, 1.0, e.x >= 0.0);
-    z = (1.0 - abs(e.x)) * select(-1.0, 1.0, e.y >= 0.0);
-  }
-  return normalize(vec3f(x, y, z));
-}
-
 @vertex
 fn vs(
   @location(0) q_pos: vec4<u32>,
@@ -53,7 +43,6 @@ fn vs(
   // Vertex record: [x y z r] [g b octU octV], all u16 UNORM against bounds.
   let p0 = tile_view.b_min.xyz + (vec3f(vec3<u32>(q_pos.xyz)) / 65535.0) * tile_view.b_range.xyz;
   let color = vec3f(f32(q_pos.w), f32(q_attr.x), f32(q_attr.y)) / 65535.0;
-  let oct = (vec2f(f32(q_attr.z), f32(q_attr.w)) / 65535.0) * 2.0 - 1.0;
 
   let t = tile_view.info.x;
   let shift = vec2f(f32(ii % 3u), f32(ii / 3u)) - vec2f(1.0);
@@ -63,7 +52,7 @@ fn vs(
   let y1 = tile_view.info.z;
   let hn = clamp((p.y - y0) / max(y1 - y0, 1e-6), 0.0, 1.0);
 
-  var n = oct_decode_mesh(oct);
+  var n = gcmesh_normal_decode_u16(q_attr.z, q_attr.w);
   if (n.y < 0.0) {
     n = -n; // two-sided foliage, seen from straight above
   }

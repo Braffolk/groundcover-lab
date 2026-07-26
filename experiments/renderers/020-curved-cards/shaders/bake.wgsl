@@ -18,6 +18,8 @@
 //
 // No @group(0) frame include here — the bake is self-contained.
 
+#include "src/wgsl/gcmesh.wgsl"
+
 struct BakeView {
   right_axis: vec4f, // xyz: card U axis (world)
   up_axis: vec4f,    // xyz: card V axis for the top view
@@ -35,24 +37,11 @@ struct VOut {
   @location(1) nrm: vec3f,
 }
 
-// Octahedral decode, y-primary — mirrors GcMesh.normalAt() in src/mesh/gcmesh.ts.
-fn oct_decode_mesh(e: vec2f) -> vec3f {
-  var x = e.x;
-  var z = e.y;
-  let y = 1.0 - abs(e.x) - abs(e.y);
-  if (y < 0.0) {
-    x = (1.0 - abs(e.y)) * select(-1.0, 1.0, e.x >= 0.0);
-    z = (1.0 - abs(e.x)) * select(-1.0, 1.0, e.y >= 0.0);
-  }
-  return normalize(vec3f(x, y, z));
-}
-
 @vertex
 fn vs(@location(0) q_pos: vec4<u32>, @location(1) q_attr: vec4<u32>) -> VOut {
   // Vertex record: [x y z r] [g b octU octV], all u16 UNORM against bounds.
   let p = bake_view.b_min.xyz + (vec3f(vec3<u32>(q_pos.xyz)) / 65535.0) * bake_view.b_range.xyz;
   let color = vec3f(f32(q_pos.w), f32(q_attr.x), f32(q_attr.y)) / 65535.0;
-  let oct = (vec2f(f32(q_attr.z), f32(q_attr.w)) / 65535.0) * 2.0 - 1.0;
 
   let off = p - vec3f(bake_view.capture.x, 0.0, bake_view.capture.y);
   let r = bake_view.extent.x;
@@ -71,7 +60,7 @@ fn vs(@location(0) q_pos: vec4<u32>, @location(1) q_attr: vec4<u32>) -> VOut {
     d = 0.5 - 0.5 * (dot(off, bake_view.fwd_axis.xyz) / r);
   }
 
-  var n = oct_decode_mesh(oct);
+  var n = gcmesh_normal_decode_u16(q_attr.z, q_attr.w);
   let toward_cam = select(bake_view.fwd_axis.xyz, vec3f(0.0, 1.0, 0.0), is_top);
   if (dot(n, toward_cam) < 0.0) {
     n = -n;

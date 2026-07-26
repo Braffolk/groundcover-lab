@@ -473,3 +473,33 @@ flips from 1-ulp uv changes, no structure — see the diff image, pure speckle):
 - *Bake-time loops and per-ring view creation.* One submit per session; the
   24-tap loop in `fit.wgsl` IS the projection integral.
 - *The lighting-view blowout* (see above) — shared-model behaviour.
+
+### The GCMESH1 decode fix made this brighter too — same root cause as 010
+
+The shared GCMESH1 source-normal decode was corrected (stored pair is (x, y),
+derived component is **z**, not y — `src/wgsl/gcmesh.wgsl`), and `capture.wgsl`
+now uses it. 36 of 40 renderers got *less* blown out in `debug=lighting`; this
+one and `010-chord-frustum` got more. Measured on a fixed canopy band (rows
+400-680, `cam=grazing`, stand `default`, seed 42, det=1): pixels at a light term
+of ~1.0 rose **48.7% -> 59.1%** and the band mean **203.1 -> 216.6**.
+
+The decode is right; what it exposes is that `capture.wgsl` stores the mesh-frame
+normal **without flipping it toward the capture axis**:
+
+```wgsl
+o.normal = gcmesh_normal_decode_u16(a1.z, a1.w);      // vs
+o.normal = vec4f(normalize(i.normal) * 0.5 + 0.5, ...) // stored as-is
+```
+
+Every other bake in the repo does `if (dot(n, fwd) < 0.0) { n = -n; }` first,
+precisely because a thin blade's two faces store opposite vectors and anything
+that averages them — this method's basis fit across views, and any mip — lands
+near zero. Correct near-horizontal normals cancel more completely than the old
+scrambled ones did, so more texels resolve to a degenerate/near-up normal and
+read fully lit.
+
+Left as a finding rather than fixed: adding the hemisphere flip changes what the
+basis is fitted to, so it needs a rebake and its own visual pass. Note the
+pre-existing "lighting-view blowout" entry above was already at 48.7% before this
+change — this method was over-lit either way, and the decode fix moved it ~10
+points further, it did not create the problem.

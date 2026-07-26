@@ -1,3 +1,5 @@
+#include "src/wgsl/gcmesh.wgsl"
+
 // Offline (in-browser, once) UNROLLED bundle capture.
 //
 // One atlas tile per baked ribbon. The ribbon is a 5-node polyline in the
@@ -39,25 +41,12 @@ struct VOut {
   @location(1) nrm: vec3f, // already in the ribbon tangent frame
 }
 
-// Octahedral decode, y-primary — mirrors GcMesh.normalAt() in src/mesh/gcmesh.ts.
-fn oct_decode_mesh(e: vec2f) -> vec3f {
-  var x = e.x;
-  var z = e.y;
-  let y = 1.0 - abs(e.x) - abs(e.y);
-  if (y < 0.0) {
-    x = (1.0 - abs(e.y)) * select(-1.0, 1.0, e.x >= 0.0);
-    z = (1.0 - abs(e.x)) * select(-1.0, 1.0, e.y >= 0.0);
-  }
-  return normalize(vec3f(x, y, z));
-}
-
 @vertex
 fn vs(@location(0) q_pos: vec4<u32>, @location(1) q_attr: vec4<u32>) -> VOut {
   // Vertex record: [x y z r] [g b octU octV], all u16 UNORM against bounds.
   let p_mesh = tile.b_min.xyz + (vec3f(vec3<u32>(q_pos.xyz)) / 65535.0) * tile.b_range.xyz;
   let color = vec3f(f32(q_pos.w), f32(q_attr.x), f32(q_attr.y)) / 65535.0;
-  let oct = (vec2f(f32(q_attr.z), f32(q_attr.w)) / 65535.0) * 2.0 - 1.0;
-  let n_mesh = oct_decode_mesh(oct);
+  let n_mesh = gcmesh_normal_decode_u16(q_attr.z, q_attr.w);
   // Clump frame: horizontally centred on the capture centre, y unchanged.
   let p = p_mesh - vec3f(tile.capture.x, 0.0, tile.capture.y);
 

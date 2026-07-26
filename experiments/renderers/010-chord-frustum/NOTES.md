@@ -446,3 +446,37 @@ HUD numbers were contended all session, so no perf claims; bench on an idle GPU
   normals have to be filtered with distance. Verdict: it renders moss *decently*
   and honestly — better silhouette and depth than a card, worse texture — and the
   headroom that is left is a budget re-cut, not a rewrite.
+
+### The GCMESH1 decode fix made this brighter, and that is a real weakness here
+
+When the shared GCMESH1 source-normal decode was corrected (stored pair is
+(x, y), derived component is **z**, not y — `src/wgsl/gcmesh.wgsl`), 36 of the
+40 renderers got *less* blown out in `debug=lighting`. This one went the other
+way. Measured on a fixed canopy band (rows 400-680, `cam=grazing`, stand
+`default`, seed 42, det=1): pixels at a light term of ~1.0 rose **51.6% ->
+53.7%** and the band mean **207.7 -> 221.0**.
+
+The decode is not the problem — the aggregation downstream of it is. `gather.wgsl`
+sums decoded source normals over a chord and then does:
+
+```wgsl
+var n = acc_n / acc_cov;
+if (length(n) < 1e-3) { n = vec3f(0.0, 1.0, 0.0); }   // <- fires far more often now
+```
+
+A correctly decoded blade normal is near-HORIZONTAL, and a chord through
+two-sided foliage collects a set of those pointing every which way, so the sum
+cancels. With the old y-derived decode the normals were scattered differently and
+cancelled less; with the correct ones the `length(n) < 1e-3` fallback to straight
+up fires much more, and straight up under an elevated sun is fully lit. So the
+chord field is answering "I have no usable normal" with "fully lit" — which is
+the same family as the "octahedral normals are not mip-averageable" trap, one
+level up: real unit normals *are* linearly averageable, but a two-sided canopy
+averages to nothing.
+
+Not fixed here, because it is a method change and not a decode change. The
+prescribed fix is the handbook's: flip each normal into one hemisphere (around
+the view/chord axis, which `gather.wgsl` already has as `fwd`) BEFORE
+accumulating, so the set is coherent and the mean is meaningful; and make the
+degenerate fallback something honest (e.g. carry `length(n)` as a confidence and
+fall back toward ambient-only, never toward a fully lit up-normal).

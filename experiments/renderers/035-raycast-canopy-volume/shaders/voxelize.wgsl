@@ -1,3 +1,5 @@
+#include "src/wgsl/gcmesh.wgsl"
+
 // BAKE STAGE 1 — splat the stand's tile into a wrapping occupancy volume.
 //
 // The tile holds the REAL scatter plants of one stand entry inside an LxL
@@ -26,17 +28,6 @@ struct VoxInfo {
 @group(0) @binding(3) var<storage, read_write> occ: array<atomic<u32>>;
 @group(0) @binding(4) var<storage, read_write> coarse: array<atomic<u32>>;
 @group(0) @binding(5) var<storage, read_write> acc_n: array<atomic<i32>>;
-
-fn oct_decode(u: f32, v: f32) -> vec3f {
-  var x = u;
-  var z = v;
-  let y = 1.0 - abs(u) - abs(v);
-  if (y < 0.0) {
-    x = (1.0 - abs(v)) * select(-1.0, 1.0, u >= 0.0);
-    z = (1.0 - abs(u)) * select(-1.0, 1.0, v >= 0.0);
-  }
-  return normalize(vec3f(x, y, z));
-}
 
 fn wrap01(x: f32) -> f32 {
   return x - floor(x);
@@ -84,9 +75,7 @@ fn splat(@builtin(global_invocation_id) gid: vec3u) {
 
   // --- normal accumulation (1.5cm), every Nth vertex ----------------------
   if ((vi % vinfo.chunk.z) != 0u) { return; }
-  let ou = f32(rec.w & 0xffffu) / 65535.0 * 2.0 - 1.0;
-  let ov = f32(rec.w >> 16u) / 65535.0 * 2.0 - 1.0;
-  let nm = oct_decode(ou, ov);
+  let nm = gcmesh_normal_decode_u16(rec.w & 0xffffu, rec.w >> 16u);
   let nrot = vec3f(nm.x * c - nm.z * s, nm.y, nm.x * s + nm.z * c);
 
   let ax = min(u32(fx * f32(vinfo.adims.x)), vinfo.adims.x - 1u);

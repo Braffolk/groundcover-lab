@@ -1,4 +1,4 @@
-import type { GcMesh } from '@harness'
+import { decodeGcMeshNormal, type GcMesh } from '@harness'
 
 /**
  * Bake a GCMESH1 source mesh into a strand vector-displacement field ("VDF1").
@@ -72,22 +72,6 @@ interface PointCloud {
   nx: Float32Array
   ny: Float32Array
   nz: Float32Array
-}
-
-function octDecode(u16u: number, u16v: number, out: [number, number, number]): void {
-  const u = (u16u / 65535) * 2 - 1
-  const v = (u16v / 65535) * 2 - 1
-  let x = u
-  let z = v
-  const y = 1 - Math.abs(u) - Math.abs(v)
-  if (y < 0) {
-    x = (1 - Math.abs(v)) * Math.sign(u)
-    z = (1 - Math.abs(u)) * Math.sign(v)
-  }
-  const len = Math.hypot(x, y, z) || 1
-  out[0] = x / len
-  out[1] = y / len
-  out[2] = z / len
 }
 
 /** Deterministic LCG so bakes are reproducible. */
@@ -182,15 +166,15 @@ function samplePoints(mesh: GcMesh, cx: number, cz: number, target = POINT_TARGE
     const cr = (verts[i0 + 3]! + verts[i1 + 3]! + verts[i2 + 3]!) * q * (1 / 3)
     const cg = (verts[i0 + 4]! + verts[i1 + 4]! + verts[i2 + 4]!) * q * (1 / 3)
     const cb = (verts[i0 + 5]! + verts[i1 + 5]! + verts[i2 + 5]!) * q * (1 / 3)
-    octDecode(verts[i0 + 6]!, verts[i0 + 7]!, nrm)
+    decodeGcMeshNormal(verts[i0 + 6]!, verts[i0 + 7]!, nrm)
     let nvx = nrm[0]
     let nvy = nrm[1]
     let nvz = nrm[2]
-    octDecode(verts[i1 + 6]!, verts[i1 + 7]!, nrm)
+    decodeGcMeshNormal(verts[i1 + 6]!, verts[i1 + 7]!, nrm)
     nvx += nrm[0]
     nvy += nrm[1]
     nvz += nrm[2]
-    octDecode(verts[i2 + 6]!, verts[i2 + 7]!, nrm)
+    decodeGcMeshNormal(verts[i2 + 6]!, verts[i2 + 7]!, nrm)
     nvx += nrm[0]
     nvy += nrm[1]
     nvz += nrm[2]

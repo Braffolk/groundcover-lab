@@ -18,6 +18,8 @@
 // and rg/b stay plain linear quantities that a box filter may average (unlike
 // octahedral, which is not mip-averageable).
 
+#include "src/wgsl/gcmesh.wgsl"
+
 struct Capture {
   // xz of the tile square's min corner (mesh frame), 1/tile size, periodic step
   tile_min: vec2f, inv_tile: f32, period: f32,
@@ -33,18 +35,6 @@ struct VOut {
   @location(0) color: vec3f,
   @location(1) normal: vec3f,
   @location(2) h01: f32,
-}
-
-// Standard octahedral normal decode (y up) — mirrors GcMesh.normalAt().
-fn oct_decode(e: vec2f) -> vec3f {
-  let y = 1.0 - abs(e.x) - abs(e.y);
-  var x = e.x;
-  var z = e.y;
-  if (y < 0.0) {
-    x = (1.0 - abs(e.y)) * sign(e.x);
-    z = (1.0 - abs(e.x)) * sign(e.y);
-  }
-  return normalize(vec3f(x, y, z));
 }
 
 @vertex
@@ -66,8 +56,7 @@ fn vs(@builtin(instance_index) ii: u32, @location(0) a0: vec4<u32>, @location(1)
   // Depth: nearer the (above) camera = higher y = smaller z, depthCompare 'less'.
   o.pos = vec4f(u * 2.0 - 1.0, 1.0 - v * 2.0, 1.0 - h01, 1.0);
   o.color = vec3f(f32(a0.w), f32(a1.x), f32(a1.y)) / 65535.0;
-  let e = vec2f(f32(a1.z), f32(a1.w)) / 65535.0 * 2.0 - 1.0;
-  o.normal = oct_decode(e);
+  o.normal = gcmesh_normal_decode_u16(a1.z, a1.w);
   o.h01 = h01;
   return o;
 }

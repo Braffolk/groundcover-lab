@@ -15,6 +15,8 @@
 // bilinear-filter them and divide by the filtered coverage.
 // Self-contained: no @group(0) frame include.
 
+#include "src/wgsl/gcmesh.wgsl"
+
 struct Slice {
   axis_a: vec4f,  // xyz: ortho right (unit), w: ortho half-extent R (mesh units)
   axis_b: vec4f,  // xyz: ortho up (unit)
@@ -25,18 +27,8 @@ struct Slice {
 }
 @group(0) @binding(0) var<uniform> sl: Slice;
 
-// Octahedral decode, y-primary — mirrors GcMesh.normalAt() in src/mesh/gcmesh.ts.
-fn oct_decode_mesh(e: vec2f) -> vec3f {
-  var x = e.x;
-  var z = e.y;
-  let y = 1.0 - abs(e.x) - abs(e.y);
-  if (y < 0.0) {
-    x = (1.0 - abs(e.y)) * select(-1.0, 1.0, e.x >= 0.0);
-    z = (1.0 - abs(e.x)) * select(-1.0, 1.0, e.y >= 0.0);
-  }
-  return normalize(vec3f(x, y, z));
-}
-
+// This experiment's OWN encoding for the geom target — matched by the decode in
+// composite.wgsl; unrelated to the GCMESH1 source convention.
 fn oct_encode_mesh(n: vec3f) -> vec2f {
   let s = abs(n.x) + abs(n.y) + abs(n.z);
   if (s < 1e-6) {
@@ -65,7 +57,6 @@ fn vs(@location(0) qp: vec4<u32>, @location(1) qa: vec4<u32>) -> VOut {
   // Vertex record: [x y z r] [g b octU octV], u16 UNORM against the bounds.
   let p = sl.bmin.xyz + (vec3f(vec3<u32>(qp.xyz)) / 65535.0) * sl.bspan.xyz;
   let color = vec3f(f32(qp.w), f32(qa.x), f32(qa.y)) / 65535.0;
-  let oct = (vec2f(f32(qa.z), f32(qa.w)) / 65535.0) * 2.0 - 1.0;
 
   let off = p - sl.centre.xyz;
   let r = sl.axis_a.w;
@@ -74,7 +65,7 @@ fn vs(@location(0) qp: vec4<u32>, @location(1) qa: vec4<u32>) -> VOut {
   // depth grows along d, so 'less' keeps the FIRST hit along the ray.
   let w = dot(off, sl.dir.xyz) / (2.0 * r) + 0.5;
 
-  var n = oct_decode_mesh(oct);
+  var n = gcmesh_normal_decode_u16(qa.z, qa.w);
   if (dot(n, sl.dir.xyz) > 0.0) {
     n = -n;
   }

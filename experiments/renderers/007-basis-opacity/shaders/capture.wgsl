@@ -14,6 +14,8 @@
 // geometry that must reappear on the opposite edge. period = 0 with one
 // instance is the plain single-specimen capture.
 
+#include "src/wgsl/gcmesh.wgsl"
+
 struct Tile {
   center: vec3f, inv_r: f32,
   right: vec3f, _p0: f32,
@@ -30,18 +32,6 @@ struct VOut {
   @location(0) color: vec3f,
   @location(1) normal: vec3f,
   @location(2) store_depth: f32, // depth channel, already mapped to [0,1]
-}
-
-// Standard octahedral normal decode (y up) — mirrors GcMesh.normalAt().
-fn oct_decode_mesh(e: vec2f) -> vec3f {
-  let y = 1.0 - abs(e.x) - abs(e.y);
-  var x = e.x;
-  var z = e.y;
-  if (y < 0.0) {
-    x = (1.0 - abs(e.y)) * sign(e.x);
-    z = (1.0 - abs(e.x)) * sign(e.y);
-  }
-  return normalize(vec3f(x, y, z));
 }
 
 @vertex
@@ -62,8 +52,7 @@ fn vs(@builtin(instance_index) inst: u32, @location(0) a0: vec4<u32>, @location(
   var o: VOut;
   o.pos = vec4f(cx, cy, cz, 1.0);
   o.color = vec3f(f32(a0.w), f32(a1.x), f32(a1.y)) / 65535.0;
-  let e = vec2f(f32(a1.z), f32(a1.w)) / 65535.0 * 2.0 - 1.0;
-  o.normal = oct_decode_mesh(e);
+  o.normal = gcmesh_normal_decode_u16(a1.z, a1.w);
   o.store_depth = dot(rel, tile.fwd) * tile.depth_scale + tile.depth_bias;
   return o;
 }

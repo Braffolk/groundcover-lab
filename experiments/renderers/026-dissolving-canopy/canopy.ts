@@ -480,7 +480,10 @@ function orientUv(u: number, v: number, orient: number): [number, number] {
   return [a, b]
 }
 
-/** Decode the source normal and rotate it the way the imagery was rotated. */
+/**
+ * Decode a normal from the STAMPED TILE's own oct encoding (bake.ts octEncode — not
+ * the GCMESH1 source convention) and rotate it the way the imagery was rotated.
+ */
 function octDecodeOriented(u: number, v: number, orient: number): [number, number, number] {
   let x = u
   let z = v

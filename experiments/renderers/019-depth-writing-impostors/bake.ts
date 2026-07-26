@@ -928,7 +928,9 @@ function writeLevel(lv: Level, albedo: Uint8Array, geo: Uint8Array, base: number
   }
 }
 
-/** Octahedral decode, y-primary — mirrors oct_decode_mesh in bake.wgsl. */
+/** Octahedral decode, y-primary — inverse of oct_encode_mesh in bake.wgsl, i.e.
+ * this experiment's OWN atlas convention (the geo target it reads back), not the
+ * GCMESH1 source convention. */
 function octDecode(u: number, v: number, out: [number, number, number]): void {
   let x = u
   let z = v

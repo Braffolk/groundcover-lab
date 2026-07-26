@@ -140,8 +140,10 @@ fn chord_uv(bi: f32, bj: f32, dphi01: f32, mx01: f32) -> vec2f {
   return vec2f(u, v);
 }
 
-// Octahedral normal codec — the GCMESH1 convention (y primary axis),
-// matching GcMesh.normalAt(). e in [-1,1]^2.
+// This experiment's OWN octahedral codec (y primary axis), used for the chord
+// field's aggregate normals and for the view-direction grid — a matched pair
+// with oct_nrm_encode() below, NOT the GCMESH1 source convention (that lives in
+// src/wgsl/gcmesh.wgsl). e in [-1,1]^2.
 fn oct_nrm_decode(e: vec2f) -> vec3f {
   var x = e.x;
   var z = e.y;

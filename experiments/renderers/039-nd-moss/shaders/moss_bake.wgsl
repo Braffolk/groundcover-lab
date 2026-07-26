@@ -17,6 +17,8 @@
 //             heightmap the paper's parallax/AO stack wants.
 // No @group(0) frame include — the bake is self-contained.
 
+#include "src/wgsl/gcmesh.wgsl"
+
 struct BakeInfo {
   b_min: vec4f,   // mesh bounds min (dequantisation)
   b_range: vec4f, // bounds max - min
@@ -31,18 +33,6 @@ struct VOut {
   @location(2) height: f32,
 }
 
-// Octahedral decode, y-primary — mirrors GcMesh.normalAt() in src/mesh/gcmesh.ts.
-fn oct_decode_mesh(e: vec2f) -> vec3f {
-  var x = e.x;
-  var z = e.y;
-  let y = 1.0 - abs(e.x) - abs(e.y);
-  if (y < 0.0) {
-    x = (1.0 - abs(e.y)) * select(-1.0, 1.0, e.x >= 0.0);
-    z = (1.0 - abs(e.x)) * select(-1.0, 1.0, e.y >= 0.0);
-  }
-  return normalize(vec3f(x, y, z));
-}
-
 @vertex
 fn vs(
   @builtin(instance_index) ii: u32,
@@ -52,7 +42,6 @@ fn vs(
   // Vertex record: [x y z r] [g b octU octV], all u16 UNORM against bounds.
   let p = bake.b_min.xyz + (vec3f(vec3<u32>(q_pos.xyz)) / 65535.0) * bake.b_range.xyz;
   let color = vec3f(f32(q_pos.w), f32(q_attr.x), f32(q_attr.y)) / 65535.0;
-  let oct = (vec2f(f32(q_attr.z), f32(q_attr.w)) / 65535.0) * 2.0 - 1.0;
 
   let tile_m = bake.tile.x;
   let y0 = bake.tile.y;
@@ -65,7 +54,7 @@ fn vs(
   // Row 0 of the texture is v = 0, i.e. mesh-frame z = 0.
   let d = (y1 - p.y) / (y1 - y0);
 
-  var n = oct_decode_mesh(oct);
+  var n = gcmesh_normal_decode_u16(q_attr.z, q_attr.w);
   if (n.y < 0.0) {
     n = -n;
   }
