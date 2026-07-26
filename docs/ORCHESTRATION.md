@@ -38,11 +38,13 @@ context compaction). Facts and hard-won gotchas only — the rules that bind
   `git commit --amend` — no history rewrite needed.
 - `rating.json` is the OWNER'S verdict. Never create, edit or revert it, and
   never assume a modification to it is an agent's.
-- **OPEN DECISION: baked artifacts.** ~1.2 GB from round 2 plus ~234 MB from the
-  raycast round are deliberately uncommitted. Options: keep committing (repo
-  heads to several GB), gitignore `mesh/baked` and treat artifacts as
-  regenerable (but the static deploy then needs a local bake pass), or Git LFS.
-  Ask the owner before pushing large artifact sets.
+- **OPEN DECISION: baked artifacts.** `mesh/baked/` is ~1.4 GB committed and the
+  build is ~1.5 GB. Options: stop committing them and regenerate before a deploy,
+  Git LFS, or deploy a curated subset. Ask the owner before pushing large
+  artifact sets — nothing has been pushed since the pivot began.
+- `goldens/` is gitignored: a full capture is ~400 MB and regenerable with
+  `npm run capture:goldens`. Keep a before/after pair OUTSIDE the repo when
+  refactoring shared code.
 
 ## Project shape
 
@@ -64,12 +66,13 @@ context compaction). Facts and hard-won gotchas only — the rules that bind
   Any change that regresses the `default` stand is unacceptable.
 - Stands (harness-owned placement setups, `src/scene/stands.ts`): `default`
   (~557k, the standard), `calamagrostis-pure`, `close-quality`, `dense-mixed`,
-  `bog` (~1.13 M, mostly Sphagnum carpet), `scaling-100m` (~134 M, the
-  plant-count-independence test). Experiments are pure RENDERERS of a stand.
+  `scaling-100m` (~134 M, the plant-count-independence test). `bog` was deleted
+  with the moss meshes at the pivot. Renderers are pure RENDERERS of a stand;
+  materials have no stand at all.
 - Species: `calamagrostis-canescens` and `elymus-repens` are periodic community
-  TILES (0.52 / 0.62 m), `poa-pratensis` is a single specimen, and three
-  Sphagnum states are 0.18 m carpet tiles at ~19.8 M tris (~479 MB each, ~2 min
-  to bake one). Directory names misspell it "spaghnum"; ids match the dirs.
+  TILES (0.52 / 0.62 m) and `poa-pratensis` is a single specimen. The three
+  Sphagnum states were removed at the pivot and their indices (3-5) are retired,
+  never to be reused — the index goes into the GPU stand table.
 - Raw meshes are gitignored, so a fresh clone has no `.bin` files at all.
 
 ## Harness facts worth not rediscovering
@@ -79,10 +82,10 @@ context compaction). Facts and hard-won gotchas only — the rules that bind
   carpet_div, footprint_m, slope_align` + 1 pad, 12 floats. Two pads were spent
   on `footprint_m` and `slope_align`; adding more fields grows the stride (safe,
   but recompiles every shader).
-- **Carpet slots exceed the scatter budget.** A carpet has exactly
-  `carpetDiv²` slots per 4 m cell — 484 for the bog moss — deliberately over
-  `SCATTER_MAX_PER_CELL` (128), because div 22 is what puts a 0.18 m tile at
-  life size (scale 1.0101). Use `standEntrySlots(entry)`.
+- **Always size enumeration from `standEntrySlots(entry)`, never a hardcoded
+  `SCATTER_MAX_PER_CELL`.** This is the single most-repeated bug in the repo's
+  history: hardcoding 128 silently vanished ~74% of a carpet in nearly every
+  renderer. Carpets are deprecated, but the habit is what survives.
 - **`SCATTER_MAX_PER_CELL = 128` is load-bearing for density calibration**
   (`128 / (8 × 16 m²) = 1`). Changing it moves every existing stand's placement.
 - The wetness field and the whole scatter have **bit-identical TS and WGSL
@@ -93,11 +96,11 @@ context compaction). Facts and hard-won gotchas only — the rules that bind
   "y=2" is ~10 m up. Bookmarks are terrain-relative; always prefer them.
 - Global debug views (`debug_shade()`, URL `debug=albedo|normals|lighting|
   coverage|depth`) are mandatory for every renderer.
-- Static deploy: `npx vite build` under base `/groundcover-lab/`, ~267 MB dist.
-  WebGPU needs HTTPS, so an S3 *website* endpoint will not work — REST endpoint
-  over TLS or CloudFront. A `fetch` shim (`installAssetBaseShim`) still bridges
-  ~7 experiments that fetch `/mesh/baked/...` directly; converting them to
-  `assetUrl()` and deleting the shim is outstanding (task #12).
+- Static deploy: `npx vite build` under base `/groundcover-lab/`, now **~1.5 GB**
+  because `mesh/baked/` grew to ~1.4 GB — see the open decisions. WebGPU needs
+  HTTPS, so an S3 *website* endpoint will not work — REST endpoint over TLS or
+  CloudFront. The old `installAssetBaseShim()` fetch monkeypatch is GONE; every
+  asset URL now goes through `assetUrl()`.
 
 ## Harness bugs the moss fleet found
 
