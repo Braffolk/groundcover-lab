@@ -83,24 +83,41 @@ if (into === undefined) {
   fail(`--into must be a path under experiments/, got "${into}"`)
 }
 
-// --- numbering: one scan of the whole tree ---------------------------------
+// --- numbering: per BRANCH, with a whole-tree uniqueness check --------------
 
-function numbersInTree(dir: string): number[] {
-  const out: number[] = []
+/** Directory names anywhere under `dir`, recursively. */
+function namesInTree(dir: string): string[] {
+  const out: string[] = []
   for (const entry of readdirSync(dir, { withFileTypes: true })) {
     if (!entry.isDirectory() || entry.name.startsWith('.')) continue
-    const n = /^(\d{3})-/.exec(entry.name)?.[1]
-    if (n !== undefined) out.push(Number(n))
-    // `_template` is skipped by discovery but not by numbering: recursing into
-    // every directory is what keeps the sequence globally unique.
-    out.push(...numbersInTree(path.join(dir, entry.name)))
+    out.push(entry.name)
+    out.push(...namesInTree(path.join(dir, entry.name)))
   }
   return out
 }
 
-const numbers = numbersInTree(experimentsDir)
-const next = String(numbers.length > 0 ? Math.max(...numbers) + 1 : 1).padStart(3, '0')
-const id = `${next}-${slug}`
+const numberOf = (name: string): number | undefined => {
+  const n = /^(\d{3})-/.exec(name)?.[1]
+  return n === undefined ? undefined : Number(n)
+}
+
+// The sequence restarts in each branch, so a subject reads 001/002/003 rather
+// than inheriting the whole repo's count — the point of having a tree at all.
+// `_template` is skipped by discovery but NOT by numbering.
+const branchNumbers = existsSync(path.join(root, into))
+  ? namesInTree(path.join(root, into))
+      .map(numberOf)
+      .filter((n): n is number => n !== undefined)
+  : []
+let seq = branchNumbers.length > 0 ? Math.max(...branchNumbers) + 1 : 1
+
+// Ids stay unique across the WHOLE tree — they key ratings, bench results and
+// goldens, and the registry surfaces a collision as a broken card. Per-branch
+// numbering only collides when the number AND the slug match, so bump past it.
+const taken = new Set(namesInTree(experimentsDir))
+while (taken.has(`${String(seq).padStart(3, '0')}-${slug}`)) seq++
+
+const id = `${String(seq).padStart(3, '0')}-${slug}`
 const dir = path.join(root, into, id)
 
 if (existsSync(dir)) fail(`${path.relative(root, dir)} already exists`)
