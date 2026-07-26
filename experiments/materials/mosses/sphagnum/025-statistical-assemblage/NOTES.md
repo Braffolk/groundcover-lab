@@ -35,12 +35,12 @@ is not material-calibrated, but this experiment remains below it anyway.
 
 No source mesh bake. `author.ts` runs the deterministic TypeScript structural
 generator and writes `assets/descriptor.png` plus diagnostic captures. Seed 2507
-currently authors 7,747 structural events (6,966 capitula and 781 exposed
-fascicles), corresponding to 43,917 events/m² and a mean nominal capitulum width
+currently authors 7,664 structural events (6,890 capitula and 774 exposed
+fascicles), corresponding to 43,447 events/m² and a mean nominal capitulum width
 of 12.08 mm.
 
 The final raster has 100% causal coverage and no artificial zero-height pixels.
-Only 4,017 texels (0.096%) required leaf-contact closure, which converged in
+Only 4,640 texels (0.111%) required leaf-contact closure, which converged in
 three texel steps (about 0.62 mm) by extending the deepest adjacent real packet's
 surface id, age, pigment, and depth. This operation is bounded below a typical
 branch-leaf scale and cannot become a hidden substrate layer.
@@ -55,11 +55,11 @@ silhouettes; that is the separate prism track.
 
 ## Findings
 
-- Current depth overlap fractions are 100.0%, 99.41%, 98.10%, and 95.57% for
+- Current depth overlap fractions are 100.0%, 99.34%, 97.91%, and 95.17% for
   layers one through four. The lower cohorts therefore replace catastrophic POM
   wells with dark, low, branch-shaped biomass while retaining visible apertures.
-- Cushion state has 0.62 Pearson correlation with event baseline height and
-  0.30 with pigment. This is strong enough to form coherent microtopography but
+- Cushion state has 0.54 Pearson correlation with event baseline height and
+  0.26 with pigment. This is strong enough to form coherent microtopography but
   weak enough that red/ochre regions do not simply trace bump contours.
 - QA captures cover plane macro, sphere and cube at tileScale 1, and sphere and
   cube at tileScale 8 / reliefGain 2 / 2048 px. Raw height, albedo, normal, and

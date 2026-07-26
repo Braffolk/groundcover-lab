@@ -176,7 +176,8 @@ function periodicDelta(value: number, centre: number): number {
 }
 
 function cushionRaw(x: number, y: number, sites: CushionSite[], seed: number): number {
-  let union = 0
+  let primary = 0
+  let secondary = 0
   for (const site of sites) {
     const dx = periodicDelta(x, site.x)
     const dy = periodicDelta(y, site.y)
@@ -190,13 +191,23 @@ function cushionRaw(x: number, y: number, sites: CushionSite[], seed: number): n
     const radius = Math.hypot(localX / site.radiusX, localY / site.radiusY) / irregularBoundary
     if (radius >= 1) continue
     const inward = 1 - radius
-    const compact = inward * inward * (3 - 2 * inward)
+    // Quartic onset keeps neighbouring cushions distinct at their margins;
+    // the final factor softens the crest to avoid a pointed radial mound.
+    const compact = inward ** 4 * (5 - 4 * inward)
     const contribution = clamp01(compact * site.amplitude)
-    union = 1 - (1 - union) * (1 - contribution)
+    if (contribution > primary) {
+      secondary = primary
+      primary = contribution
+    } else if (contribution > secondary) {
+      secondary = contribution
+    }
   }
+  // Preserve one dominant cushion identity while allowing a subdued overlap
+  // shoulder where two real colonies interpenetrate.
+  const separatedUnion = primary + secondary * (1 - primary) * 0.24
   // A small shared environmental component lets the existing colour mosaic
   // anticipate cushion state without turning colour into a height lookup.
-  return clamp01(union + macroPigment(x, y, seed) * 0.055)
+  return clamp01(separatedUnion + macroPigment(x, y, seed) * 0.040)
 }
 
 function makeCushionModel(seed: number): CushionModel {
@@ -208,7 +219,7 @@ function makeCushionModel(seed: number): CushionModel {
       const index = gy * grid + gx
       const x = wrap((gx + 0.14 + unit(index, 41, seed) * 0.72) * spacing, TILE)
       const y = wrap((gy + 0.14 + unit(index, 43, seed) * 0.72) * spacing, TILE)
-      const radius = TILE * (0.135 + unit(index, 45, seed) * 0.080)
+      const radius = TILE * (0.125 + unit(index, 45, seed) * 0.065)
       const aspect = 0.68 + unit(index, 47, seed) * 0.58
       const localTone = macroPigment(x, y, seed)
       sites.push({
@@ -684,7 +695,7 @@ function makeEvents(seed: number): StructuralEvent[] {
       const cellForm = macroForm(cellX, cellY, seed)
       const cellElevation = macroElevation(cellX, cellY, seed)
       const cellCushion = cushionState(cellX, cellY, cushionModel, seed)
-      const acceptance = clamp01(0.28 + cellForm * 0.060 + cellElevation * 0.018 + cellCushion * 0.012)
+      const acceptance = clamp01(0.28 + cellForm * 0.060 + cellElevation * 0.018 + cellCushion * 0.035)
       for (let candidate = 0; candidate < CANDIDATES_PER_CELL; candidate++) {
         if (unit(cell * CANDIDATES_PER_CELL + candidate, 701, seed) > acceptance) continue
         const id = events.length
@@ -696,9 +707,9 @@ function makeEvents(seed: number): StructuralEvent[] {
         const cushionCoherence = smooth(clamp01((cushion + 0.15) / 1.35))
         const shootBaselineJitter = 0.065 * (1 - cushionCoherence * 0.38)
         const age = gaussianish(id, 731, seed)
-        const density = clamp01(0.55 - form * 0.10 + cushion * 0.060 + gaussianish(id, 741, seed) * 0.18)
+        const density = clamp01(0.55 - form * 0.10 + cushion * 0.085 + gaussianish(id, 741, seed) * 0.18)
         const openness = clamp01(
-          0.30 + form * 0.20 - cushion * 0.035 + gaussianish(id, 751, seed) * 0.21 - density * 0.05,
+          0.30 + form * 0.20 - cushion * 0.050 + gaussianish(id, 751, seed) * 0.21 - density * 0.05,
         )
         const verticality = clamp01(
           0.43 + density * 0.30 - openness * 0.26 + elevation * 0.10 + cushion * 0.050 +
@@ -718,7 +729,7 @@ function makeEvents(seed: number): StructuralEvent[] {
           size: Math.max(
             22,
             (25.0 + unit(id, 791, seed) * 23.0 + gaussianish(id, 795, seed) * 4.2 + density * 3.0) *
-              (1 - cushion * 0.022),
+              (1 - cushion * 0.030),
           ),
           openness,
           density,
