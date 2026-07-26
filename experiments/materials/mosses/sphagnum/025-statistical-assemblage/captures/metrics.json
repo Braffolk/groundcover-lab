@@ -3,22 +3,22 @@
   "events": 7789,
   "capitula": 7015,
   "fascicles": 774,
-  "branchPackets": 166547,
-  "packetSamples": 1276142,
+  "branchPackets": 301907,
+  "packetSamples": 1782920,
   "eventsPerSquareMetre": 44155.32879818595,
   "meanNominalCapitulumMm": 12.068239086349479,
-  "coverage": 0.9914233684539795,
-  "meanDepthLayers": 3.718672513961792,
+  "coverage": 0.9979572296142578,
+  "meanDepthLayers": 3.8825364112854004,
   "depthLayerFractions": [
-    0.9914233684539795,
-    0.9645633697509766,
-    0.9150276184082031,
-    0.8476581573486328
+    0.9979572296142578,
+    0.9887316226959229,
+    0.9669332504272461,
+    0.9289143085479736
   ],
-  "meanHeight": 0.4599397503150282,
-  "heightStdDev": 0.06606208862193917,
-  "meanGradient": 0.012543429171765194,
-  "p95Gradient": 0.025048923679060666,
-  "highGradientFraction": 0.014693260192871094,
-  "generationMs": 17318.917167
+  "meanHeight": 0.46982367687246057,
+  "heightStdDev": 0.10181034364180486,
+  "meanGradient": 0.026124318789803064,
+  "p95Gradient": 0.09518590998043053,
+  "highGradientFraction": 0.06045866012573242,
+  "generationMs": 17260.191959
 }

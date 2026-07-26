@@ -224,7 +224,9 @@ function splatEllipse(
       const across = (-px * sine + py * cosine) / acrossRadius
       const r2 = along * along + across * across
       if (r2 >= 1) continue
-      const profile = Math.pow(1 - r2, 0.62)
+      // A superelliptic dome: nearly level around the crown, then an
+      // accelerating descent into a deliberately lower edge altitude.
+      const profile = Math.sqrt(1 - r2 * r2)
       const x = raster.periodic ? wrap(sourceX, raster.width) : sourceX
       insertSurface(raster, y * raster.width + x, floorZ + crownHeight * profile, surface, tissue, pigment)
     }
@@ -266,21 +268,21 @@ function renderPacket(
 ): void {
   const surface = counters.nextSurface++
   counters.branchPackets++
-  const samples = Math.max(4, Math.ceil(length / 4.2))
+  const samples = Math.max(4, Math.ceil(length / 5.0))
   const step = length / samples
-  const bands = Math.max(3, Math.round(length / (4.4 + 0.8 * event.openness)))
-  const phase = unit(event.id * 43 + packetIndex, 201, seed)
   for (let sample = 0; sample <= samples; sample++) {
     counters.packetSamples++
-    const t = sample / samples
+    const sampleKey = event.id * 131 + packetIndex * 17 + sample
+    const jitter = sample === 0 || sample === samples ? 0 : (unit(sampleKey, 201, seed) - 0.5) * 0.46
+    const t = clamp01((sample + jitter) / samples)
     const point = packetPoint(event, angle, startRadius, length, bend, t)
-    const leafPulse = 0.5 + 0.5 * Math.cos((t * bands + phase) * TAU)
+    const localVariation = unit(sampleKey, 211, seed)
     const taper = Math.sqrt(Math.max(0.08, 1 - Math.pow(t, 2.7)))
-    const localHalfWidth = halfWidth * taper * (0.87 + leafPulse * 0.13)
-    const axialArch = (0.010 + event.verticality * 0.010) * Math.sin(t * Math.PI) -
-      (0.008 + event.verticality * 0.025) * t
-    const microRise = leafPulse * 0.011
-    const crown = (0.055 + event.density * 0.022 + event.verticality * 0.035) * (0.97 - 0.15 * t)
+    const localHalfWidth = halfWidth * taper * (0.88 + localVariation * 0.18)
+    const axialArch = (0.014 + event.verticality * 0.018) * Math.sin(t * Math.PI) -
+      (0.018 + event.verticality * 0.045) * t
+    const microRise = (localVariation - 0.5) * 0.007
+    const crown = (0.071 + event.density * 0.028 + event.verticality * 0.050) * (0.98 - 0.18 * t)
     const peakZ = event.baseZ + zOffset + axialArch + microRise
     const floorZ = peakZ - crown
     const buriedAge = Math.max(0, -zOffset)
@@ -290,8 +292,8 @@ function renderPacket(
       raster,
       point.x,
       point.y,
-      Math.max(1.25, step * 0.74),
-      Math.max(0.92, localHalfWidth),
+      Math.max(1.5, step * (1.18 + unit(sampleKey, 221, seed) * 0.22)),
+      Math.max(0.92, localHalfWidth * 0.82),
       point.tangent,
       floorZ,
       crown,
@@ -299,16 +301,45 @@ function renderPacket(
       freshness,
       localPigment,
     )
+
+    // Sphagnum branch leaves are imbricate hoods around a continuous branch,
+    // not evenly spaced transverse ribs. A sparse, one-sided spiral sample
+    // perturbs the silhouette and height without becoming a fern ladder.
+    if (sample > 0 && sample < samples && unit(sampleKey, 231, seed) < 0.72) {
+      const side = unit(sampleKey, 241, seed) < 0.5 ? -1 : 1
+      const leafAngle = point.tangent + side * (0.42 + unit(sampleKey, 251, seed) * 0.54)
+      const sideOffset = side * localHalfWidth * (0.24 + unit(sampleKey, 261, seed) * 0.22)
+      const forwardOffset = localHalfWidth * (0.05 + unit(sampleKey, 271, seed) * 0.16)
+      const leafX = point.x - Math.sin(point.tangent) * sideOffset + Math.cos(point.tangent) * forwardOffset
+      const leafY = point.y + Math.cos(point.tangent) * sideOffset + Math.sin(point.tangent) * forwardOffset
+      const leafAlong = localHalfWidth * (0.66 + unit(sampleKey, 281, seed) * 0.52)
+      const leafAcross = localHalfWidth * (0.30 + unit(sampleKey, 291, seed) * 0.17)
+      const leafCrown = crown * (0.58 + unit(sampleKey, 301, seed) * 0.18)
+      splatEllipse(
+        raster,
+        leafX,
+        leafY,
+        Math.max(1.15, leafAlong),
+        Math.max(0.78, leafAcross),
+        leafAngle,
+        peakZ - leafCrown * 0.82,
+        leafCrown,
+        surface,
+        clamp01(freshness + 0.025),
+        localPigment,
+      )
+    }
   }
 }
 
 function renderCapitulum(raster: Raster, event: StructuralEvent, seed: number, counters: Counters): void {
   counters.capitula++
-  const branchCount = Math.max(10, Math.min(17, Math.round(11.2 + event.density * 4.2 - event.openness * 1.0)))
+  const branchCount = Math.max(7, Math.min(11, Math.round(7.0 + event.density * 3.0 + event.openness * 1.4)))
   const weights = new Float32Array(branchCount)
   let weightSum = 0
   for (let branch = 0; branch < branchCount; branch++) {
-    const weight = 0.68 + unit(event.id * 19 + branch, 301, seed) * 0.72
+    const gapMode = unit(event.id * 19 + branch, 321, seed)
+    const weight = 0.52 + Math.pow(gapMode, 1.35) * 1.02
     weights[branch] = weight
     weightSum += weight
   }
@@ -317,46 +348,131 @@ function renderCapitulum(raster: Raster, event: StructuralEvent, seed: number, c
   for (let branch = 0; branch < branchCount; branch++) {
     const angleFraction = (cumulative + weights[branch]! * 0.5) / weightSum
     cumulative += weights[branch]!
-    const directionalBias = event.asymmetry * Math.cos(angleFraction * TAU - event.phase) * 0.13
+    const directionalBias = event.asymmetry * Math.cos(angleFraction * TAU - event.phase) * 0.22
     const angle = event.phase + angleFraction * TAU + directionalBias
-    const randomLength = 0.66 + unit(event.id * 23 + branch, 331, seed) * 0.52
-    const length = event.size * randomLength * (0.62 + event.openness * 0.45)
-    const halfWidth = event.size * (0.140 + event.density * 0.048) *
+    const randomLength = 0.65 + unit(event.id * 23 + branch, 331, seed) * 0.46
+    const length = event.size * randomLength * (0.60 + event.openness * 0.35)
+    const halfWidth = event.size * (0.095 + event.density * 0.038) *
       (0.84 + unit(event.id * 29 + branch, 351, seed) * 0.28)
     const bend = (event.curvature * 0.08 + unit(event.id * 31 + branch, 371, seed) * 0.18 - 0.09) * length
-    const startRadius = event.size * (0.055 + event.density * 0.040) + unit(event.id + branch, 391, seed) * 0.55
+    const startRadius = event.size * (0.038 + event.density * 0.026) + unit(event.id + branch, 391, seed) * 0.45
     const zOffset = 0.008 + event.verticality * 0.050 +
       (unit(event.id * 37 + branch, 411, seed) - 0.5) * 0.046
     renderPacket(raster, event, angle, length, halfWidth, startRadius, bend, zOffset, seed, branch, counters)
   }
 
-  // Young compact packets fill the capitulum without introducing a disc or a
-  // hidden substrate. They are branches from the same continuously ranked event.
-  const innerCount = 6 + Math.round(event.density * 3)
+  // Young hooded leaves form an irregular raised blossom. They remain
+  // individually height-resolved instead of becoming either a central disc or
+  // another set of miniature radial arms.
+  const innerCount = 13 + Math.round(event.density * 7 + event.verticality * 2)
+  const goldenAngle = Math.PI * (3 - Math.sqrt(5))
   for (let inner = 0; inner < innerCount; inner++) {
-    const angle = event.phase + (inner / innerCount) * TAU + (unit(event.id * 41 + inner, 431, seed) - 0.5) * 0.65
-    const length = event.size * (0.22 + unit(event.id + inner, 451, seed) * 0.22)
-    const halfWidth = event.size * (0.150 + event.density * 0.052)
-    const bend = (unit(event.id * 43 + inner, 471, seed) - 0.5) * length * 0.12
-    const innerRise = 0.034 + event.verticality * 0.060 +
-      (unit(event.id * 47 + inner, 477, seed) - 0.5) * 0.018
-    renderPacket(raster, event, angle, length, halfWidth, 0.3, bend, innerRise, seed, 32 + inner, counters)
+    const leafKey = event.id * 97 + inner
+    const order = (inner + 0.5) / innerCount
+    const radialNorm = Math.pow(order, 0.72)
+    const radial = 0.035 + radialNorm * 0.305 * (0.90 + event.density * 0.13)
+    const radialAngle = event.phase + inner * goldenAngle +
+      (unit(leafKey, 441, seed) - 0.5) * (0.16 + event.openness * 0.10)
+    const leafAngle = radialAngle + (unit(leafKey, 451, seed) - 0.5) * 0.38
+    const cx = event.x + Math.cos(radialAngle) * event.size * radial
+    const cy = event.y + Math.sin(radialAngle) * event.size * radial
+    const leafAlong = event.size * (0.075 + radialNorm * 0.095 + unit(leafKey, 461, seed) * 0.035)
+    const leafAcross = leafAlong * (0.34 + unit(leafKey, 471, seed) * 0.17)
+    const nonlinearFall = Math.pow(radialNorm, 2.4)
+    const innerRise = 0.085 + event.verticality * 0.135 -
+      (0.055 + event.verticality * 0.070) * nonlinearFall +
+      (unit(leafKey, 481, seed) - 0.5) * 0.014
+    const crown = 0.065 + event.density * 0.025 + event.verticality * 0.040
+    const surface = counters.nextSurface++
+    counters.branchPackets++
+    counters.packetSamples++
+    splatEllipse(
+      raster,
+      cx,
+      cy,
+      leafAlong,
+      leafAcross,
+      leafAngle,
+      event.baseZ + innerRise - crown,
+      crown,
+      surface,
+      clamp01(event.vitality * 0.68 + (1 - radial) * 0.24 + 0.09),
+      clamp01(event.pigment - 0.055 * (1 - radial)),
+    )
   }
 
-  // A Sphagnum shoot does not end at the visible capitulum. Spreading and
-  // pendent branches descend through a continuous range of lower heights.
-  // They are distinct occluding packets, not a synthetic under-layer, and are
-  // seen only through openings left by the crowded upper canopy.
-  const lowerCount = 2 + (unit(event.id, 481, seed) > 0.56 ? 1 : 0)
-  for (let lower = 0; lower < lowerCount; lower++) {
-    const angle = event.phase + (lower + 0.35) / lowerCount * TAU +
-      (unit(event.id * 67 + lower, 483, seed) - 0.5) * 0.62
-    const length = event.size * (1.02 + unit(event.id * 71 + lower, 485, seed) * 0.72)
-    const halfWidth = event.size * (0.070 + event.density * 0.030) *
-      (0.86 + unit(event.id + lower, 487, seed) * 0.26)
-    const bend = (event.curvature * 0.15 + unit(event.id * 73 + lower, 489, seed) * 0.28 - 0.14) * length
-    const zOffset = -0.060 - event.verticality * 0.040 - unit(event.id * 79 + lower, 491, seed) * 0.090
-    renderPacket(raster, event, angle, length, halfWidth, 0.4, bend, zOffset, seed, 48 + lower, counters)
+  // The approved capitulum is only the shoot apex. Below it, successive
+  // fascicles continue down the same stem: typically two or three spreading
+  // branches plus one or two slender pendent branches. Model several such
+  // cohorts at continuously descending heights so a canopy opening reveals
+  // older plant structure rather than an artificial zero-height floor.
+  const lowerTierCount = 4
+  for (let tier = 0; tier < lowerTierCount; tier++) {
+    const tierKey = event.id * 83 + tier
+    const isCollapsedTier = tier === lowerTierCount - 1
+    const tierPhase = event.phase + (tier + 1) * goldenAngle +
+      (unit(tierKey, 483, seed) - 0.5) * 0.42
+    const tierDepth = 0.058 + tier * (0.052 + event.verticality * 0.010) +
+      unit(tierKey, 485, seed) * 0.034
+
+    const spreadingCount = isCollapsedTier ? 3 : 2 + (unit(tierKey, 487, seed) > 0.58 ? 1 : 0)
+    for (let spreading = 0; spreading < spreadingCount; spreading++) {
+      const branchKey = tierKey * 5 + spreading
+      const angle = tierPhase + spreading / spreadingCount * TAU +
+        (unit(branchKey, 489, seed) - 0.5) * 0.58
+      const length = event.size * (isCollapsedTier ? 1.22 : 1) * (
+        1.04 + tier * 0.075 + unit(branchKey, 491, seed) * 0.66
+      )
+      const halfWidth = event.size * (0.066 + event.density * 0.029) *
+        (0.84 + unit(branchKey, 493, seed) * 0.30) * (isCollapsedTier ? 1.34 : 1)
+      const bend = (
+        event.curvature * 0.15 + unit(branchKey, 495, seed) * 0.30 - 0.15
+      ) * length
+      const zOffset = -tierDepth - event.verticality * 0.022 -
+        unit(branchKey, 497, seed) * (0.036 + tier * 0.006)
+      renderPacket(
+        raster,
+        event,
+        angle,
+        length,
+        halfWidth,
+        event.size * 0.018,
+        bend,
+        zOffset,
+        seed,
+        64 + tier * 8 + spreading,
+        counters,
+      )
+    }
+
+    // Pendent branches hug the stem in three dimensions. Their top-down
+    // projection is therefore shorter and narrower than a spreading branch,
+    // but it supplies real low tissue near the centre of an open capitulum.
+    const pendentCount = 1 + (unit(tierKey, 499, seed) > 0.63 ? 1 : 0)
+    for (let pendent = 0; pendent < pendentCount; pendent++) {
+      const branchKey = tierKey * 7 + pendent
+      const angle = tierPhase + (pendent + 0.37) / pendentCount * TAU +
+        (unit(branchKey, 501, seed) - 0.5) * 0.74
+      const length = event.size * (0.40 + tier * 0.035 + unit(branchKey, 503, seed) * 0.38)
+      const halfWidth = event.size * (0.046 + event.density * 0.022) *
+        (0.84 + unit(branchKey, 505, seed) * 0.26)
+      const bend = (event.curvature * 0.10 + unit(branchKey, 507, seed) * 0.22 - 0.11) * length
+      const zOffset = -tierDepth - 0.026 - event.verticality * 0.030 -
+        unit(branchKey, 509, seed) * (0.040 + tier * 0.008)
+      renderPacket(
+        raster,
+        event,
+        angle,
+        length,
+        halfWidth,
+        event.size * 0.010,
+        bend,
+        zOffset,
+        seed,
+        96 + tier * 4 + pendent,
+        counters,
+      )
+    }
   }
 }
 

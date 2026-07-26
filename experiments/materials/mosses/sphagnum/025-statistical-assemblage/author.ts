@@ -22,6 +22,10 @@ const result = generateAssemblage(2507)
 const neutral = neutralRgba(result.height, TILE, 35)
 const albedo = albedoRgba(result.descriptor)
 const shaded = shadedRgba(albedo, neutral, result.ao)
+const coverageMask = new Float32Array(result.depthCount.length)
+for (let pixel = 0; pixel < coverageMask.length; pixel++) {
+  coverageMask[pixel] = result.depthCount[pixel]! > 0 ? 1 : 0
+}
 const centre = (TILE - 768) >> 1
 const atlas = generateShapeAtlas(2507)
 
@@ -40,6 +44,7 @@ await Promise.all([
   writeFile(path.join(output, 'raw-height.png'), await encodeRgbaPng(TILE, TILE, scalarRgba(result.height))),
   writeFile(path.join(output, 'raw-ao.png'), await encodeRgbaPng(TILE, TILE, scalarRgba(result.ao))),
   writeFile(path.join(output, 'depth-count.png'), await encodeRgbaPng(TILE, TILE, depthCountRgba(result.depthCount))),
+  writeFile(path.join(output, 'coverage-mask.png'), await encodeRgbaPng(TILE, TILE, scalarRgba(coverageMask))),
   writeFile(path.join(output, 'raw-albedo.png'), await encodeRgbaPng(TILE, TILE, albedo)),
   writeFile(path.join(output, 'neutral.png'), await encodeRgbaPng(TILE, TILE, neutral)),
   writeFile(path.join(output, 'shaded.png'), await encodeRgbaPng(TILE, TILE, shaded)),
