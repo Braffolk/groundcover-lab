@@ -185,6 +185,7 @@ export async function abView(root: HTMLElement, state: HashState): Promise<View>
       vram: () => app.vramReport(),
       gpuTimingAvailable: app.gpu.hasTimestamps,
       contended: true,
+      unbudgeted: isMaterial,
       extraLines: () => {
         const lines = [isMaterial ? previewSummary(app) : choice.summary]
         if (compositor.mode === 'flicker') lines.push(`showing ${compositor.side === 0 ? 'A' : 'B'} — Space to swap`)

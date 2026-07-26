@@ -12,6 +12,13 @@ export interface HudOptions {
   /** timestamp-query missing — GPU rows replaced by a notice. */
   gpuTimingAvailable: boolean
   extraLines?: () => string[]
+  /**
+   * Show usage WITHOUT a budget. A material has no species and no meaningful
+   * 25MB bar — that figure was calibrated for one plant species' baked
+   * representation — but its memory still matters and must stay visible, so the
+   * rows become plain byte readouts instead of ratios against a wrong limit.
+   */
+  unbudgeted?: boolean
 }
 
 /** Live stats HUD — GPU per-pass percentiles, CPU frame time, VRAM budget bars. */
@@ -63,6 +70,10 @@ export class Hud {
     const species = Object.entries(vram.bySpecies)
     rows.push(`<div class="section">vram ${(vram.totalBytes / MB).toFixed(1)}MB total</div>`)
     for (const [id, bytes] of species) {
+      if (this.opts.unbudgeted) {
+        rows.push(`<div>${id} <span class="muted">${(bytes / MB).toFixed(1)}MB</span></div>`)
+        continue
+      }
       const frac = bytes / SPECIES_BUDGET_BYTES
       const cls = frac > 1 ? 'over' : frac > 0.8 ? 'warn' : ''
       rows.push(

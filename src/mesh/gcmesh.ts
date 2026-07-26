@@ -47,22 +47,41 @@ export class GcMesh {
     return out
   }
 
-  /** Standard octahedral decode (validated visually in the mesh inspector). */
+  /**
+   * Octahedral decode for GCMESH1 source normals.
+   *
+   * The stored pair is (x, y) and the RECONSTRUCTED component is **z**, and the
+   * result is **negated**. Both facts were measured, not assumed, because this
+   * decoder was wrong for months in a way that looked merely "a bit off":
+   *
+   * - Axis: decoding three ways and comparing against face normals computed from
+   *   raw dequantized positions (which involve no convention at all), over
+   *   217,113 triangles sampled across the whole calamagrostis mesh, gives mean
+   *   |cos| of 0.4225 (x-derived), 0.5354 (y-derived — what this function used to
+   *   do) and 0.7871 (z-derived). A vertex normal is a smoothed average so |cos|
+   *   is well under 1 even when right; 0.79 against 0.54 is not ambiguous.
+   * - Sign: mean SIGNED cos against those face normals is -0.73, and separately,
+   *   the topmost vertex in each 4mm xz column — geometry that is by definition
+   *   seen from above and cannot be two-sided — decodes to mean n.y -0.088 with
+   *   only 33.7% facing up. Two independent tests, same answer.
+   *
+   * Re-run `tools/probe-oct-normal.ts` rather than trusting this comment.
+   */
   normalAt(i: number, out: [number, number, number] = [0, 0, 0]): [number, number, number] {
     const base = i * 8 + 6
     const u = (this.vertices[base]! / 65535) * 2 - 1
     const v = (this.vertices[base + 1]! / 65535) * 2 - 1
     let x = u
-    let z = v
-    const y = 1 - Math.abs(u) - Math.abs(v)
-    if (y < 0) {
+    let y = v
+    const z = 1 - Math.abs(u) - Math.abs(v)
+    if (z < 0) {
       x = (1 - Math.abs(v)) * Math.sign(u)
-      z = (1 - Math.abs(u)) * Math.sign(v)
+      y = (1 - Math.abs(u)) * Math.sign(v)
     }
     const len = Math.hypot(x, y, z) || 1
-    out[0] = x / len
-    out[1] = y / len
-    out[2] = z / len
+    out[0] = -x / len
+    out[1] = -y / len
+    out[2] = -z / len
     return out
   }
 

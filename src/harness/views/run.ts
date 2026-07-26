@@ -121,6 +121,9 @@ export async function runView(root: HTMLElement, state: HashState): Promise<View
       stats: app.stats,
       vram: () => app.vramReport(),
       gpuTimingAvailable: app.gpu.hasTimestamps,
+      // A material has no species, so the 25MB/species bar would be a limit
+      // invented for something else. Usage stays visible; the budget does not.
+      unbudgeted: isMaterial,
       extraLines: () =>
         isMaterial
           ? [previewSummary(app)]

@@ -38,10 +38,12 @@ context compaction). Facts and hard-won gotchas only — the rules that bind
   `git commit --amend` — no history rewrite needed.
 - `rating.json` is the OWNER'S verdict. Never create, edit or revert it, and
   never assume a modification to it is an agent's.
-- **OPEN DECISION: baked artifacts.** `mesh/baked/` is ~1.4 GB committed and the
-  build is ~1.5 GB. Options: stop committing them and regenerate before a deploy,
-  Git LFS, or deploy a curated subset. Ask the owner before pushing large
-  artifact sets — nothing has been pushed since the pivot began.
+- **Baked artifacts are gitignored (settled 2026-07-26).** `mesh/baked/**/*.bin`
+  and `*.png` are ignored, matching the raw meshes. 419 MB across 33 files had
+  been committed by accident and was untracked; it remains in history, so `.git`
+  is ~360 MB until someone decides a rewrite is worth it. Note for anyone
+  quoting sizes: `du` on `mesh/baked` measures DISK, which includes ~1 GB of
+  untracked artifacts — do not report it as "committed" (I did, and was wrong).
 - `goldens/` is gitignored: a full capture is ~400 MB and regenerable with
   `npm run capture:goldens`. Keep a before/after pair OUTSIDE the repo when
   refactoring shared code.
