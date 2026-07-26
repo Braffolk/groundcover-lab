@@ -7,6 +7,7 @@ import {
   depthCountRgba,
   downsample,
   generateAssemblage,
+  generateCushionPreview,
   generateShapeAtlas,
   neutralRgba,
   scalarRgba,
@@ -28,6 +29,8 @@ for (let pixel = 0; pixel < coverageMask.length; pixel++) {
 }
 const centre = (TILE - 768) >> 1
 const atlas = generateShapeAtlas(2507)
+const cushionPreviewWidth = 512
+const cushionPreview = generateCushionPreview(2507, cushionPreviewWidth)
 
 let mip = result.height
 let mipWidth = TILE
@@ -45,6 +48,10 @@ await Promise.all([
   writeFile(path.join(output, 'raw-ao.png'), await encodeRgbaPng(TILE, TILE, scalarRgba(result.ao))),
   writeFile(path.join(output, 'depth-count.png'), await encodeRgbaPng(TILE, TILE, depthCountRgba(result.depthCount))),
   writeFile(path.join(output, 'coverage-mask.png'), await encodeRgbaPng(TILE, TILE, scalarRgba(coverageMask))),
+  writeFile(
+    path.join(output, 'cushion-field.png'),
+    await encodeRgbaPng(cushionPreviewWidth, cushionPreviewWidth, scalarRgba(cushionPreview)),
+  ),
   writeFile(path.join(output, 'raw-albedo.png'), await encodeRgbaPng(TILE, TILE, albedo)),
   writeFile(path.join(output, 'neutral.png'), await encodeRgbaPng(TILE, TILE, neutral)),
   writeFile(path.join(output, 'shaded.png'), await encodeRgbaPng(TILE, TILE, shaded)),

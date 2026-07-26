@@ -38,11 +38,12 @@ async function runner(
   obj: 'sphere' | 'cube-edge' | 'plane',
   tileScale: 1 | 8,
   reliefGain: 1.2 | 2,
-  cam: 'three-quarter' | 'macro' = 'three-quarter',
+  cam: 'three-quarter' | 'macro' | 'grazing' = 'three-quarter',
+  pomSteps: 36 | 56 = 36,
 ) {
   const url = `${base}/#/run/${id}?det=1&t=2&cam=${cam}&obj=${obj}` +
     `&p.texPx=2048&p.tileScale=${tileScale}&p.reliefGain=${reliefGain}` +
-    '&p.normalStrength=0.92&p.microShadow=1&p.stateVariation=0.72'
+    `&p.normalStrength=0.92&p.microShadow=1&p.stateVariation=0.72&p.pomSteps=${pomSteps}`
   await page.goto(url, { waitUntil: 'domcontentloaded' })
   const elapsedMs = await waitForReport(page)
   const toasts = await page.locator('.toast').allTextContents()
@@ -62,6 +63,8 @@ const runCaptures = [
   await runner('qa-sphere-scale8-gain2', 'sphere', 8, 2, 'macro'),
   await runner('qa-cube-scale1', 'cube-edge', 1, 1.2),
   await runner('qa-cube-scale8-gain2', 'cube-edge', 8, 2, 'macro'),
+  await runner('qa-plane-scale8-gain2-grazing-steps36', 'plane', 8, 2, 'grazing', 36),
+  await runner('qa-plane-scale8-gain2-grazing-steps56', 'plane', 8, 2, 'grazing', 56),
 ]
 
 await page.goto(
