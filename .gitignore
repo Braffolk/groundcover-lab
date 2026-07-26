@@ -25,3 +25,12 @@ mesh/baked/008-relief-tap/views-v1-g5t256-poa-pratensis.bin
 # excluded from the static deploy for the same reason. Keep a before/after pair
 # outside the repo when refactoring shared code, and diff those.
 goldens/
+
+# Baked artifacts are REGENERABLE and must not be committed. Every experiment
+# bakes its own from the raw meshes on first run (in-browser, OPFS-cached), and
+# `commitBake` only writes them here so a local session can skip the wait. 419MB
+# of them had been committed by accident across 11 experiments; the raw meshes
+# they derive from were already ignored, which is the correct treatment for both.
+# A deploy that needs them must bake locally first.
+mesh/baked/**/*.bin
+mesh/baked/**/*.png
