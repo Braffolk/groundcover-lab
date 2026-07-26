@@ -99,8 +99,17 @@ just as mandatory**. What differs:
   iterates. Anything a node depends on that is NOT visible as `u.p.<name>` in
   the generated text must be added to the key by hand; a `variantBlend`
   selector is exactly this case.
-- Validation errors throw at `create()` and surface as "Failed to start"; the
-  full report is data on `globalThis.__materialReports`.
+- Validation errors throw at `create()` and surface as "Failed to start" — but
+  the report is still published, so a material that fails validation explains
+  itself in the inspector rather than only dying. It is also data on
+  `globalThis.__materialReports`.
+- **Inspect it at `#/material/<id>`** — the node graph with real dependency
+  edges, every intermediate texture with channel isolation, a mip slider, a texel
+  probe and per-level stored luma, the generated WGSL, and the validator report.
+  This is the debugging surface: "which node produced this" and "is the stored
+  luma flat across levels" are answered by looking, not by adding print
+  statements. It renders itself from your `MaterialDef`, so you get it for free
+  and cannot fail to provide it.
 
 ### What the stage gives you
 
