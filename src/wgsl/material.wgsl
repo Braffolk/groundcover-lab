@@ -128,6 +128,14 @@ struct Surface {
   opacity: f32,
   emissive: vec3f,
   sheen: vec3f,
+  /// Colour of light that came back OUT of the material's interior — the tint
+  /// for wrapped/subsurface diffuse and for any bounce term added back where
+  /// occlusion goes dark. Distinct from `sheen` (the surface-fibre tint at the
+  /// tips) and from `emissive` (light the material generates by itself): a
+  /// fuzzy material needs BOTH tints, and the first port of the Uncharted 4
+  /// moss had to smuggle this one through `emissive`, which was a lie in the
+  /// shader that nobody reading `Surface` could have caught.
+  subsurface: vec3f,
   thickness: f32,
 };
 
@@ -142,6 +150,7 @@ fn mat_surface_default(g: Geo) -> Surface {
   s.opacity = 1.0;
   s.emissive = vec3f(0.0);
   s.sheen = vec3f(0.0);
+  s.subsurface = vec3f(0.0);
   s.thickness = 0.0;
   return s;
 }
